@@ -176,9 +176,11 @@ class Repository:
             if not owned or str(owned['WorkerEpoch']).lower()!=str(self.epoch).lower():
                 raise RuntimeError('Worker epoch lost')
             db.execute("""INSERT scheduler.MachineTelemetry(
-                SiteId,MachineId,CpuPercent,MemoryPercent,DiskPercent,DiskFreeBytes,DiskTotalBytes)
-                VALUES(1,1,?,?,?,?,?)""",metrics['cpu_percent'],metrics['memory_percent'],
-                metrics['disk_percent'],metrics['disk_free_bytes'],metrics['disk_total_bytes'])
+                SiteId,MachineId,CpuPercent,MemoryPercent,DiskPercent,DiskFreeBytes,DiskTotalBytes,
+                PokerControllerVersion,PDecisionVersion)
+                VALUES(1,1,?,?,?,?,?,?,?)""",metrics['cpu_percent'],metrics['memory_percent'],
+                metrics['disk_percent'],metrics['disk_free_bytes'],metrics['disk_total_bytes'],
+                metrics.get('poker_controller_version'),metrics.get('pdecision_version'))
             db.execute("DELETE scheduler.MachineTelemetry WHERE MachineId=1 AND SampledUtc<DATEADD(day,-90,SYSUTCDATETIME())")
 
     def prepare_schedule(self,start,end,target,high_only):
