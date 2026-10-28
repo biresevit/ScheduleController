@@ -54,6 +54,32 @@ def test_expired_run_it_twice_offer_does_not_fail_table(monkeypatch):
     asyncio.run(session.respond_run_it_twice(42,False,2))
 
 
+def test_restart_adopts_an_existing_seat_without_buying_in(monkeypatch):
+    import schedule_controller.pilot as module
+    class FakeBot:
+        async def process(self,state): pass
+    monkeypatch.setattr(module,'Bot',lambda *args,**kwargs:FakeBot())
+    state={'s':[{'f':1}]}
+    client=SimpleNamespace(tables={},states={42:state},join=AsyncMock(),hero_seat=lambda value:0)
+    session=Session.__new__(Session)
+    session.client=client;session.decision=object();session.bots={};session.queues={};session.workers={}
+    async def exercise():
+        assert await session.adopt(42,{'i':42,'n':'Existing table'})=='sitting_out'
+        client.join.assert_awaited_once_with(42)
+        assert 42 in session.bots and 42 in session.workers
+        session.workers[42].cancel()
+        await asyncio.gather(session.workers[42],return_exceptions=True)
+    asyncio.run(exercise())
+
+
+def test_restart_closes_an_absent_seat_without_starting_a_worker():
+    client=SimpleNamespace(tables={},states={42:{'s':[]}},join=AsyncMock(),hero_seat=lambda value:None)
+    session=Session.__new__(Session)
+    session.client=client;session.decision=object();session.bots={};session.queues={};session.workers={}
+    assert asyncio.run(session.adopt(42,{'i':42,'n':'Old table'})) is None
+    assert session.workers=={}
+
+
 def test_idle_session_reconnects_with_same_username(monkeypatch):
     import schedule_controller.pilot as module
     made=[]

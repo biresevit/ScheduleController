@@ -1,7 +1,7 @@
 """SQL journal and telemetry for the explicitly bounded single-PC demo pilot.
 
-This is not the distributed queue consumer. It refuses existing open entries and
-uses a machine epoch so an old process cannot overwrite a replacement worker.
+This is not the distributed queue consumer. It fences every worker with a machine
+epoch and reconciles existing seats before a replacement worker becomes ready.
 """
 from contextlib import contextmanager
 from datetime import datetime,timedelta,timezone
@@ -73,24 +73,74 @@ class Repository:
             db.execute('UPDATE backoffice.MachineMetadata SET HostName=?,LastAgentUtc=SYSUTCDATETIME(),Version=Version+1 WHERE MachineId=1',socket.gethostname())
 
     def start_cloud_worker(self):
-        """Register this process as the sole command worker for Machine 1.
-
-        Recovery of seats owned by another epoch is intentionally not guessed.
-        A replacement worker starts only from a clean journal until explicit
-        reconciliation support is added.
-        """
+        """Fence the old epoch and return every entry that needs live reconciliation."""
         with self.transaction() as db:
             machine=db.one('SELECT * FROM scheduler.MachineAssignment WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=1 AND MachineId=1')
             if not machine: raise RuntimeError('Machine assignment not found')
             cutoff=datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(seconds=90)
             if machine['LastHeartbeatUtc'] and machine['IsReady'] and machine['LastHeartbeatUtc']>cutoff:
                 raise RuntimeError('Machine has a live worker')
-            if db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=1 AND IsOpen=1'):
-                raise RuntimeError('Open entries require reconciliation before starting the cloud worker')
-            db.execute("""UPDATE scheduler.MachineAssignment SET IsReady=1,IsEnabled=1,
+            entries=db.rows("""SELECT e.EntryId,e.BotAccountId,b.Username,e.TableId,e.Status,e.BuyInAmount,
+                    e.CreatedUtc,e.SeatedUtc,e.LastConfirmedUtc,e.SessionId,s.StartedUtc,s.PlannedEndUtc
+                FROM scheduler.Entry e WITH(UPDLOCK,HOLDLOCK)
+                JOIN dbo.BotAccount b ON b.BotAccountId=e.BotAccountId
+                LEFT JOIN scheduler.AccountSession s ON s.SessionId=e.SessionId
+                WHERE e.SiteId=1 AND e.MachineId=1 AND e.IsOpen=1 ORDER BY e.BotAccountId,e.TableId""")
+            # Commands claimed by the dead epoch can never safely be replayed.
+            # The Azure planner will create fresh leave/join commands after the
+            # observed seats have been adopted or closed.
+            db.execute("""UPDATE c SET Status='cancelled',IsOpen=0,ResultCode='worker_restarted',
+                    ClaimToken=NULL,ClaimUntilUtc=NULL,UpdatedUtc=SYSUTCDATETIME()
+                FROM scheduler.Command c JOIN scheduler.Entry e ON e.EntryId=c.EntryId
+                WHERE e.SiteId=1 AND e.MachineId=1 AND e.IsOpen=1 AND c.IsOpen=1""")
+            db.execute("UPDATE scheduler.Entry SET Status='uncertain' WHERE SiteId=1 AND MachineId=1 AND IsOpen=1")
+            db.execute("""UPDATE scheduler.AccountLease SET RequiresReconciliation=1,
+                LeaseUntilUtc=DATEADD(second,90,SYSUTCDATETIME()) WHERE SiteId=1 AND MachineId=1""")
+            db.execute("""UPDATE scheduler.MachineAssignment SET IsReady=0,IsEnabled=1,
                 WorkerEpoch=?,LastHeartbeatUtc=SYSUTCDATETIME(),ControllerVersion='poker-controller-cloud-worker-0.1',
                 DecisionUrl='http://127.0.0.1:5005' WHERE MachineId=1 AND SiteId=1""",self.epoch)
             db.execute('UPDATE backoffice.MachineMetadata SET HostName=?,LastAgentUtc=SYSUTCDATETIME(),Version=Version+1 WHERE MachineId=1',socket.gethostname())
+            return entries
+
+    def adopt_reconciled_entry(self,entry_id,status):
+        if status not in ('seated','sitting_out'):
+            raise ValueError('Invalid adopted entry status')
+        with self.transaction() as db:
+            entry=db.one("""SELECT EntryId,BotAccountId,SessionId FROM scheduler.Entry WITH(UPDLOCK,HOLDLOCK)
+                WHERE SiteId=1 AND MachineId=1 AND EntryId=? AND IsOpen=1 AND Status='uncertain'""",entry_id)
+            if not entry: raise RuntimeError('Expected one uncertain entry to adopt')
+            db.execute("""UPDATE scheduler.Entry SET WorkerEpoch=?,Status=?,LastConfirmedUtc=SYSUTCDATETIME()
+                WHERE EntryId=?""",self.epoch,status,entry_id)
+            db.execute("""UPDATE scheduler.AccountLease SET WorkerEpoch=?,LeaseToken=?,
+                LeaseUntilUtc=DATEADD(second,90,SYSUTCDATETIME()),LastConfirmedUtc=SYSUTCDATETIME(),RequiresReconciliation=0
+                WHERE SiteId=1 AND BotAccountId=?""",self.epoch,str(uuid.uuid4()),entry['BotAccountId'])
+            if entry['SessionId']:
+                db.execute("UPDATE scheduler.AccountSession SET WorkerEpoch=? WHERE SessionId=? AND IsOpen=1",self.epoch,entry['SessionId'])
+
+    def close_reconciled_entry(self,entry_id):
+        with self.transaction() as db:
+            entry=db.one("""SELECT EntryId,BotAccountId,SessionId FROM scheduler.Entry WITH(UPDLOCK,HOLDLOCK)
+                WHERE SiteId=1 AND MachineId=1 AND EntryId=? AND IsOpen=1 AND Status='uncertain'""",entry_id)
+            if not entry: raise RuntimeError('Expected one uncertain entry to close')
+            db.execute("""UPDATE scheduler.Entry SET Status='closed',IsOpen=0,ClosedUtc=SYSUTCDATETIME(),
+                LastConfirmedUtc=SYSUTCDATETIME() WHERE EntryId=?""",entry_id)
+            remaining=db.one("SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=1 AND BotAccountId=? AND IsOpen=1",entry['BotAccountId'])
+            if not remaining:
+                if entry['SessionId']:
+                    db.execute("""UPDATE scheduler.AccountSession SET ActualEndUtc=SYSUTCDATETIME(),IsOpen=0,
+                        EndReason='reconciled_absent' WHERE SessionId=? AND IsOpen=1""",entry['SessionId'])
+                db.execute("DELETE scheduler.AccountLease WHERE SiteId=1 AND BotAccountId=?",entry['BotAccountId'])
+
+    def finish_cloud_worker_reconciliation(self):
+        with self.transaction() as db:
+            machine=db.one("SELECT WorkerEpoch FROM scheduler.MachineAssignment WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=1 AND MachineId=1")
+            if not machine or str(machine['WorkerEpoch']).lower()!=str(self.epoch).lower():
+                raise RuntimeError('Worker epoch lost during reconciliation')
+            if db.one("""SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=1 AND MachineId=1
+                    AND IsOpen=1 AND (Status='uncertain' OR WorkerEpoch<>?)""",self.epoch):
+                raise RuntimeError('Entry reconciliation is incomplete')
+            db.execute("""UPDATE scheduler.MachineAssignment SET IsReady=1,LastHeartbeatUtc=SYSUTCDATETIME()
+                WHERE SiteId=1 AND MachineId=1 AND WorkerEpoch=?""",self.epoch)
 
     def claim_due(self, limit=10):
         """Atomically claim due Azure-planned commands for this worker epoch."""

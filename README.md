@@ -18,10 +18,11 @@ The first environment is **Nenad / Evenbet**, with eight verified demo accounts.
 
 ## Remaining implementation
 
-1. Restart reconciliation for seats owned by a dead worker epoch; the first production worker intentionally refuses ambiguous open entries.
-2. Durable secret/credential references instead of the current authorized demo-account convention.
-3. Coordinated in-session breaks and longer multi-account load testing.
-4. Cloud-side Evenbet lobby observation; currently lobby scanning is part of PokerController while planning is fully in Azure.
+1. Durable secret/credential references instead of the current authorized demo-account convention.
+2. Coordinated in-session breaks and longer multi-account load testing.
+3. Cloud-side Evenbet lobby observation; currently lobby scanning is part of PokerController while planning is fully in Azure.
+
+On restart, the worker fences the stale machine epoch, logs in only affected accounts, proves every prior table seat against Evenbet, adopts seats that still exist and closes only confirmed-absent entries. The machine remains unavailable to the scheduler until reconciliation is complete.
 
 Nenad/Evenbet scheduling remains disabled until PDecision and the PokerController worker are online. Enabling a schedule without a ready machine creates no joins.
 

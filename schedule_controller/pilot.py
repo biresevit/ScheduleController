@@ -213,6 +213,20 @@ class Session:
         self.queues[tid].put_nowait(copy.deepcopy(self.client.states[tid]))
         return amount
 
+    async def adopt(self,tid,info):
+        """Attach workers to a seat proven to exist after a controller restart."""
+        self.client.tables[tid]=info
+        await self.client.join(tid)
+        state=self.client.states.get(tid,{})
+        hero=self.client.hero_seat(state)
+        if hero is None:
+            return None
+        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True)
+        self.queues[tid]=asyncio.Queue(maxsize=1)
+        self.workers[tid]=asyncio.create_task(self.worker(tid))
+        self.queues[tid].put_nowait(copy.deepcopy(state))
+        return 'sitting_out' if state['s'][hero].get('f',0)&1 else 'seated'
+
     async def remove(self,tid,finish=True):
         await self.ready.wait()
         for task in list(self.rit_tasks):
@@ -525,9 +539,11 @@ class Pilot:
         await self.configuration()
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
         try:
-            await asyncio.to_thread(self.repo.start_cloud_worker)
+            recovery=await asyncio.to_thread(self.repo.start_cloud_worker)
+            await self.reconcile_cloud_entries(recovery)
+            await asyncio.to_thread(self.repo.finish_cloud_worker_reconciliation)
             self.started=True
-            log.info('Cloud worker ready; entry capacity is enforced by the Azure scheduler')
+            log.info('Cloud worker ready after reconciling %s prior entries; entry capacity is enforced by the Azure scheduler',len(recovery))
             await self.refresh();await self.publish()
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
             next_claim=next_live_view=0.0
@@ -561,6 +577,34 @@ class Pilot:
             self.clients.clear()
             await self.decision.close()
             log.info('Cloud worker stopped. Status: %s',self.output/'status.json')
+
+    async def reconcile_cloud_entries(self,rows):
+        """Prove old-epoch seats against Evenbet before making this worker ready."""
+        grouped={}
+        for row in rows:
+            grouped.setdefault(row['BotAccountId'],[]).append(row)
+        for aid,entries in grouped.items():
+            session=await self.session_for(aid)
+            await session.client.list_tables()
+            lobby={int(t['i']):t for t in session.client.tables.values()}
+            for row in entries:
+                tid=int(row['TableId'])
+                info=lobby.get(tid) or session.client.tables.get(tid) or {'i':tid,'n':str(tid)}
+                status=await session.adopt(tid,info)
+                if status is None:
+                    await asyncio.to_thread(self.repo.close_reconciled_entry,row['EntryId'])
+                    log.info('Restart reconciliation confirmed absent: %s / %s',row['Username'],tid)
+                    continue
+                await asyncio.to_thread(self.repo.adopt_reconciled_entry,row['EntryId'],status)
+                eid=str(row['EntryId'])
+                self.entries[eid]={'id':eid,'account':aid,'table':str(row['TableId']),'status':status,
+                    'buy_in':row['BuyInAmount'],'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),
+                    'confirmed':now(),'session':str(row['SessionId']) if row['SessionId'] else None,'commands':[]}
+                if row['SessionId'] and not any(str(s['id'])==str(row['SessionId']) for s in self.sessions):
+                    self.sessions.append({'id':str(row['SessionId']),'account':aid,
+                        'start':aware(row['StartedUtc']),'end':aware(row['PlannedEndUtc'])})
+                log.info('Restart reconciliation adopted seat: %s / %s (%s)',row['Username'],tid,status)
+            await self.close_session_if_idle(aid)
 
     async def run(self):
         await self.decision.require_evenbet_hand_history()
