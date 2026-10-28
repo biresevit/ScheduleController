@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "schedule-controller"
+version = "0.1.0"
+description = "Customer-scoped poker schedule planning and database migrations"
+requires-python = ">=3.11"
+dependencies = ["tzdata>=2025.2", "azure-storage-blob>=12.24,<13"]
+
+[project.optional-dependencies]
+db = ["pyodbc>=5,<6"]
+test = ["pytest>=8"]
+
+[project.scripts]
+schedule-db = "schedule_controller.database:main"
+
+[tool.setuptools.packages.find]
+include = ["schedule_controller*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
