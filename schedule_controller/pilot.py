@@ -566,13 +566,17 @@ class Pilot:
                 try: await asyncio.to_thread(self.repo.stop_cloud_worker)
                 except Exception: log.exception('Could not mark cloud worker offline')
                 await asyncio.gather(*self.jobs.values(),return_exceptions=True)
-                for e in list(self.entries.values()):
-                    if e['status'] in ('seated','sitting_out','joining','draining'):
-                        self.start_leave(e)
-                while any(not job.done() for job in self.jobs.values()):
-                    await asyncio.sleep(1)
-                try: await self.refresh();await self.publish(ready=False)
-                except Exception: log.exception('Final cloud-worker telemetry failed')
+                if getattr(self.args,'leave_on_exit',False):
+                    log.info('Explicit leave-on-exit requested; draining active poker entries')
+                    for e in list(self.entries.values()):
+                        if e['status'] in ('seated','sitting_out','joining','draining'):
+                            self.start_leave(e)
+                    while any(not job.done() for job in self.jobs.values()):
+                        await asyncio.sleep(1)
+                    try: await self.refresh();await self.publish(ready=False)
+                    except Exception: log.exception('Final cloud-worker telemetry failed')
+                else:
+                    log.info('Preserving active poker seats for restart reconciliation')
             for c in list(self.clients.values()): await c.close()
             self.clients.clear()
             await self.decision.close()
@@ -693,6 +697,8 @@ def main():
     p.add_argument('--high-only',action='store_true',help='Explicitly authorized temporary high-tier pilot')
     p.add_argument('--probe',action='store_true',help='Read-only login/table probe; no seats or SQL changes')
     p.add_argument('--cloud-worker',action='store_true',help='Execute Azure-planned commands; never plan locally')
+    p.add_argument('--leave-on-exit',action='store_true',
+                   help='Cloud worker leaves every table on shutdown instead of preserving seats for restart')
     p.add_argument('--output',default='artifacts/live-pilot')
     args=p.parse_args()
     if not 1<=args.target<=30 or not 1<=args.capacity<=30:
