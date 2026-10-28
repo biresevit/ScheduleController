@@ -166,3 +166,25 @@ def test_56_target_45_seated_creates_only_three_gradual_joins():
     assert all(a.kind == "join" for a in result.actions)
     assert sum(result.remaining_deficits.values()) == 8
     assert [a.not_before for a in result.actions] == [NOW + timedelta(seconds=n) for n in (20, 40, 60)]
+
+
+def test_target_reduction_creates_only_bounded_gradual_leaves():
+    accounts=[Account(n,1,"low") for n in range(1,26)]
+    tables=[Table(str(n),1,D(".1"),6,1,NOW,observed_accounts=frozenset({n})) for n in range(1,26)]
+    entries=[Entry(str(n),n,1,str(n)) for n in range(1,26)]
+    result=plan(SETTINGS,NOW,15,accounts,[Machine(1,1,30,NOW)],tables,entries,random.Random(3))
+    assert len(result.actions)==3
+    assert all(action.kind=="leave" for action in result.actions)
+    assert [action.not_before for action in result.actions]==[NOW+timedelta(seconds=n) for n in (20,40,60)]
+
+
+def test_expired_session_rotates_through_same_leave_pacing_budget():
+    expired=Account(1,1,"low",session_end=NOW-timedelta(seconds=1))
+    accounts=[expired,Account(2,1,"low")]
+    tables=[Table(name,1,D(".1"),6,1,NOW,observed_accounts=frozenset({1})) for name in ("a","b","c")]
+    entries=[Entry(name,1,1,name) for name in ("a","b","c")]
+    settings=replace(SETTINGS,max_leaves=2)
+    result=plan(settings,NOW,3,accounts,[Machine(1,1,6,NOW)],tables,entries,random.Random(3))
+    assert [action.kind for action in result.actions]==["leave","leave"]
+    assert [action.not_before for action in result.actions]==[NOW+timedelta(seconds=20),NOW+timedelta(seconds=40)]
+    assert result.reasons==["expired_sessions_draining"]

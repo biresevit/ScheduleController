@@ -159,22 +159,49 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     table_tier = {t.id: next((b.tier for b in settings.bands if b.contains(t.big_blind)), None)
                   for t in supported.values()}
     due_leave = max(now, next_leave or now)
+    planned_departures = Counter()
+    planned_entry_ids = set()
+
+    def schedule_departure(e: Entry) -> bool:
+        nonlocal due_leave
+        if len(planned_entry_ids) >= settings.max_leaves:
+            return False
+        if e.status != "reserved" and e.machine not in ready:
+            return False
+        candidate_due = due_leave + timedelta(seconds=rng.randint(settings.min_gap, settings.max_gap))
+        if candidate_due >= now + timedelta(seconds=horizon_seconds):
+            return False
+        due_leave = candidate_due
+        result.actions.append(Action("cancel_join" if e.status == "reserved" else "leave",
+                                     e.account, e.machine, e.table, due_leave, e.id))
+        result.next_leave = due_leave
+        planned_entry_ids.add(e.id)
+        planned_departures[acc[e.account].tier] += 1
+        return True
+
+    # Session rotation is independent of the occupancy target. Expired accounts
+    # leave through the same bounded, randomly spaced mechanism as a target
+    # reduction; replacements are considered only after departures confirm.
+    expired = sorted((e for e in active if e.status in ("reserved", "seated", "sitting_out")
+                      and acc[e.account].session_end is not None
+                      and now >= acc[e.account].session_end.astimezone(timezone.utc)),
+                     key=lambda e: (acc[e.account].session_end, e.status != "reserved", e.account, e.id))
+    for e in expired:
+        if len(planned_entry_ids) >= settings.max_leaves:
+            break
+        schedule_departure(e)
+    if planned_entry_ids:
+        result.reasons.append("expired_sessions_draining")
+
     for tier in TIERS:
-        excess = max(0, current[tier] - desired[tier] - draining[tier])
+        excess = max(0, current[tier] - desired[tier] - draining[tier] - planned_departures[tier])
         candidates = sorted((e for e in active if acc[e.account].tier == tier and e.status in
-                             ("reserved", "seated", "sitting_out")),
+                             ("reserved", "seated", "sitting_out") and e.id not in planned_entry_ids),
                             key=lambda e: (e.status != "reserved", -acc[e.account].played_seconds, e.id))
         for e in candidates[:excess]:
-            if sum(a.kind != "join" for a in result.actions) >= settings.max_leaves:
+            if len(planned_entry_ids) >= settings.max_leaves:
                 break
-            if e.status != "reserved" and e.machine not in ready:
-                continue
-            due_leave += timedelta(seconds=rng.randint(settings.min_gap, settings.max_gap))
-            if due_leave >= now + timedelta(seconds=horizon_seconds):
-                break
-            result.actions.append(Action("cancel_join" if e.status == "reserved" else "leave",
-                                         e.account, e.machine, e.table, due_leave, e.id))
-            result.next_leave = due_leave
+            schedule_departure(e)
             # Leave capacity is retained until confirmation. Do not replace in this pass.
 
     due_join = max(now, next_join or now)
