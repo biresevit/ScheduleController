@@ -162,13 +162,17 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     planned_departures = Counter()
     planned_entry_ids = set()
 
+    def random_gap() -> timedelta:
+        """Return human-paced jitter without aligning actions to whole seconds."""
+        return timedelta(milliseconds=rng.randint(settings.min_gap * 1000, settings.max_gap * 1000))
+
     def schedule_departure(e: Entry) -> bool:
         nonlocal due_leave
         if len(planned_entry_ids) >= settings.max_leaves:
             return False
         if e.status != "reserved" and e.machine not in ready:
             return False
-        candidate_due = due_leave + timedelta(seconds=rng.randint(settings.min_gap, settings.max_gap))
+        candidate_due = due_leave + random_gap()
         if candidate_due >= now + timedelta(seconds=horizon_seconds):
             return False
         due_leave = candidate_due
@@ -250,7 +254,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
             capacity=max(1,m.capacity-machine_count[m.id])
             return population*capacity/spread
         a,t,m=rng.choices(choices,weights=[table_weight(o) for o in choices],k=1)[0]
-        due_join += timedelta(seconds=rng.randint(settings.min_gap, settings.max_gap))
+        due_join += random_gap()
         if due_join >= now + timedelta(seconds=horizon_seconds):
             break
         result.actions.append(Action("join", a.id, m.id, t.id, due_join,

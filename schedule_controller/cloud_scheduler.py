@@ -118,9 +118,11 @@ class CloudScheduler:
                 observed_accounts=frozenset(observed.get(t["TableId"],()))) for t in table_rows]
             entry_rows = db.rows("SELECT * FROM scheduler.Entry WHERE SiteId=? AND IsOpen=1", site_id)
             entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"]) for e in entry_rows]
+            max_actions = max(site["MaxJoinsPerTick"], site["MaxLeavesPerTick"], 1)
+            planning_horizon = max(120, site["MaxJoinGapSeconds"] * max_actions + 30)
             settings = Settings(site_id, bands, site["CurrencyCode"], site["MaxJoinsPerTick"], site["MaxLeavesPerTick"],
                 site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"], tick_seconds=30,
-                planning_horizon_seconds=120, heartbeat_seconds=site["HeartbeatTimeoutSeconds"],
+                planning_horizon_seconds=planning_horizon, heartbeat_seconds=site["HeartbeatTimeoutSeconds"],
                 freshness_seconds=site["TableFreshnessSeconds"])
             rng = random.Random(f"{self.seed}:{site_id}:{stamp:%Y%m%d%H%M%S}")
             result = plan(settings, stamp, target, accounts, machines, tables, entries, rng,
