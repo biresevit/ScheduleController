@@ -170,6 +170,17 @@ class Repository:
             db.execute("""UPDATE scheduler.MachineAssignment SET IsReady=0,LastHeartbeatUtc=SYSUTCDATETIME()
                 WHERE SiteId=1 AND MachineId=1 AND WorkerEpoch=?""",self.epoch)
 
+    def publish_machine_telemetry(self,metrics):
+        with self.transaction() as db:
+            owned=db.one('SELECT WorkerEpoch FROM scheduler.MachineAssignment WHERE SiteId=1 AND MachineId=1')
+            if not owned or str(owned['WorkerEpoch']).lower()!=str(self.epoch).lower():
+                raise RuntimeError('Worker epoch lost')
+            db.execute("""INSERT scheduler.MachineTelemetry(
+                SiteId,MachineId,CpuPercent,MemoryPercent,DiskPercent,DiskFreeBytes,DiskTotalBytes)
+                VALUES(1,1,?,?,?,?,?)""",metrics['cpu_percent'],metrics['memory_percent'],
+                metrics['disk_percent'],metrics['disk_free_bytes'],metrics['disk_total_bytes'])
+            db.execute("DELETE scheduler.MachineTelemetry WHERE MachineId=1 AND SampledUtc<DATEADD(day,-90,SYSUTCDATETIME())")
+
     def prepare_schedule(self,start,end,target,high_only):
         from zoneinfo import ZoneInfo
         saved=self.configuration()

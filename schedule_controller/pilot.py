@@ -546,7 +546,7 @@ class Pilot:
             log.info('Cloud worker ready after reconciling %s prior entries; entry capacity is enforced by the Azure scheduler',len(recovery))
             await self.refresh();await self.publish()
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
-            next_claim=next_live_view=0.0
+            next_claim=next_live_view=next_telemetry=0.0
             while (not self.args.seconds or now()<self.end) and not (self.output/'stop').exists():
                 tick=time.monotonic()
                 if tick>=next_refresh:
@@ -560,6 +560,13 @@ class Pilot:
                 if tick>=next_live_view:
                     active_requests=await self.publish_live_views()
                     next_live_view=tick+(1 if active_requests else 2)
+                if tick>=next_telemetry and getattr(self.args,'telemetry_provider',None):
+                    try:
+                        metrics=await asyncio.to_thread(self.args.telemetry_provider)
+                        await asyncio.to_thread(self.repo.publish_machine_telemetry,metrics)
+                    except Exception:
+                        log.exception('Could not publish machine resource telemetry')
+                    next_telemetry=tick+300
                 await asyncio.sleep(.25)
         finally:
             if self.started:
