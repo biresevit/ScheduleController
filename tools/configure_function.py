@@ -50,6 +50,7 @@ def main():
             "scheduler.AccountSession":"SELECT,INSERT,UPDATE","scheduler.Entry":"SELECT,INSERT,UPDATE",
             "scheduler.Command":"SELECT,INSERT,UPDATE","scheduler.Outbox":"SELECT,INSERT,UPDATE"}
         for table,rights in grants.items(): c.execute(f"GRANT {rights} ON OBJECT::{table} TO [{username}]")
+        c.execute("GRANT EXECUTE ON OBJECT::scheduler.ExpireOfflineMachines TO [poker_scheduler_app]")
         conn.commit()
     except BaseException:
         conn.rollback();raise

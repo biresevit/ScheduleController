@@ -496,7 +496,7 @@ class Pilot:
             try:
                 if c: await c.remove(tid,finish=False)
                 self.accrue();e.update(status='failed',closed=now());self.accrue()
-                cmd.update(status='failed',result=type(exc).__name__)
+                cmd.update(status='failed',result=type(exc).__name__,result_text=str(exc)[:1000] if isinstance(exc,ValueError) else None)
             except Exception:
                 e['status']='uncertain';cmd.update(status='uncertain',result='cleanup_unconfirmed')
                 c.failures[tid]='cleanup_unconfirmed'
@@ -538,6 +538,7 @@ class Pilot:
         await self.decision.require_evenbet_hand_history()
         await self.configuration()
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
+        chat_task=None
         try:
             recovery=await asyncio.to_thread(self.repo.start_cloud_worker)
             await self.reconcile_cloud_entries(recovery)
@@ -545,6 +546,8 @@ class Pilot:
             self.started=True
             log.info('Cloud worker ready after reconciling %s prior entries; entry capacity is enforced by the Azure scheduler',len(recovery))
             await self.refresh();await self.publish()
+            from .chat_worker import run_chat
+            chat_task=asyncio.create_task(run_chat(self))
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
             next_claim=next_live_view=next_telemetry=0.0
             while (not self.args.seconds or now()<self.end) and not (self.output/'stop').exists():
@@ -569,6 +572,9 @@ class Pilot:
                     next_telemetry=tick+300
                 await asyncio.sleep(.25)
         finally:
+            if chat_task:
+                chat_task.cancel()
+                await asyncio.gather(chat_task,return_exceptions=True)
             if self.started:
                 try: await asyncio.to_thread(self.repo.stop_cloud_worker)
                 except Exception: log.exception('Could not mark cloud worker offline')

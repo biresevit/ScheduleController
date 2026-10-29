@@ -188,3 +188,17 @@ def test_expired_session_rotates_through_same_leave_pacing_budget():
     assert [action.kind for action in result.actions]==["leave","leave"]
     assert [action.not_before for action in result.actions]==[NOW+timedelta(seconds=20),NOW+timedelta(seconds=40)]
     assert result.reasons==["expired_sessions_draining"]
+
+
+def test_future_action_is_not_followed_by_distant_queue_or_resampled_gap():
+    settings=replace(SETTINGS,tick_seconds=30,planning_horizon_seconds=900,min_gap=45,max_gap=285)
+    result=plan(settings,NOW,10,[Account(n,1,"low") for n in range(1,11)],
+                [Machine(1,1,30,NOW)],[Table(str(n),1,D(".1"),6,0,NOW) for n in range(10)],[],random.Random(7))
+    assert len(result.actions)==1
+    # While the first action is still more than one tick away, no additional
+    # commands are queued and its stored timing is retained.
+    if result.next_join>NOW+timedelta(seconds=30):
+        repeated=plan(settings,NOW,10,[Account(n,1,"low") for n in range(1,11)],
+                      [Machine(1,1,30,NOW)],[Table(str(n),1,D(".1"),6,0,NOW) for n in range(10)],[],
+                      random.Random(99),next_join=result.next_join)
+        assert not repeated.actions and repeated.next_join==result.next_join

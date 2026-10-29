@@ -23,11 +23,11 @@ def simulate(config: dict, bands=None, currency="DEMO") -> dict:
     target = bounded("target", 56, 0, 200)
     current = bounded("current", 20, 0, 200)
     horizon = bounded("horizon_minutes", 120, 1, 240) * 60
-    tick = bounded("tick_seconds", 120, 60, 600)
+    tick = bounded("tick_seconds", 30, 30, 600)
     first_tick = bounded("first_tick_seconds", 0, 0, 600)
     max_joins = bounded("max_joins", 3, 1, 20)
-    min_gap = bounded("min_gap_seconds", 20, 1, 300)
-    max_gap = bounded("max_gap_seconds", 60, min_gap, 600)
+    min_gap = bounded("min_gap_seconds", 45, 1, 300)
+    max_gap = bounded("max_gap_seconds", 285, min_gap, 600)
     machine_total = bounded("machine_count", 4, 1, 8)
     capacity = bounded("machine_capacity", 20, 1, 100)
     account_total = bounded("account_count", 90, 3, 300)
@@ -54,7 +54,8 @@ def simulate(config: dict, bands=None, currency="DEMO") -> dict:
         raise ValueError("Start time does not exist in this timezone because of daylight saving")
     rng = random.Random(seed)
     settings = Settings(1, bands, currency=currency, max_joins=max_joins, max_leaves=max_joins,
-                        min_gap=min_gap, max_gap=max_gap, tick_seconds=tick)
+                        min_gap=min_gap, max_gap=max_gap, tick_seconds=tick,
+                        planning_horizon_seconds=max_gap*max_joins+tick)
     accounts = {n: Account(n, 1, TIERS[(n-1) % 3], frequency=TIERS[(n // 3) % 3],
                           max_minutes=(120, 240, 360)[(n // 9) % 3], max_tables=max_tables,
                           synthetic=True, credentials_ready=False) for n in range(1, account_total+1)}
@@ -195,15 +196,8 @@ def simulate(config: dict, bands=None, currency="DEMO") -> dict:
             if sessions.get(aid) is not expected:
                 continue
             emit(seconds, "session_end", account=aid, detail="Planned session ended; finishing current hands")
-            for eid, entry in list(active.items()):
-                if entry.account != aid:
-                    continue
-                if entry.status in ("reserved", "joining"):
-                    del active[eid]
-                    emit(seconds, "cancel_join", account=aid, table=entry.table, detail="Session ended before seating")
-                else:
-                    active[eid] = replace(entry, status="draining")
-                    push(seconds + leave_delay, "leave_confirm", eid)
+            # The shared planner paces the expired account's departures on
+            # subsequent ticks, just as the live cloud scheduler does.
         elif kind == "join":
             if data in active and active[data].status == "reserved":
                 active[data] = replace(active[data], status="joining")

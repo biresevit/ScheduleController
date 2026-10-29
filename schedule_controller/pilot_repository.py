@@ -29,7 +29,10 @@ class DB:
     def execute(self,sql,*args): self.c.execute(sql,*args)
 
 
-class Repository:
+from .chat_repository import ChatRepository
+
+
+class Repository(ChatRepository):
     def __init__(self,epoch): self.epoch=epoch
     @contextmanager
     def transaction(self):
@@ -179,7 +182,8 @@ class Repository:
                 SiteId,MachineId,CpuPercent,MemoryPercent,DiskPercent,DiskFreeBytes,DiskTotalBytes,
                 ActiveEntries,PokerControllerVersion,PDecisionVersion)
                 VALUES(1,1,?,?,?,?,?,(SELECT COUNT(*) FROM scheduler.Entry
-                    WHERE SiteId=1 AND MachineId=1 AND IsOpen=1),?,?)""",metrics['cpu_percent'],metrics['memory_percent'],
+                    WHERE SiteId=1 AND MachineId=1 AND IsOpen=1
+                      AND Status IN ('seated','sitting_out','draining')),?,?)""",metrics['cpu_percent'],metrics['memory_percent'],
                 metrics['disk_percent'],metrics['disk_free_bytes'],metrics['disk_total_bytes'],
                 metrics.get('poker_controller_version'),metrics.get('pdecision_version'))
             db.execute("DELETE scheduler.MachineTelemetry WHERE MachineId=1 AND SampledUtc<DATEADD(day,-90,SYSUTCDATETIME())")
@@ -294,7 +298,7 @@ class Repository:
                     is_open=cmd['status'] in ('pending','claimed','uncertain')
                     if not db.one('SELECT CommandId FROM scheduler.Command WHERE CommandId=?',cmd['id']):
                         db.execute("INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc) VALUES(?,1,?,1,?,?,?,?,?,'{}',?,?)",cmd['id'],e['id'],self.epoch,cmd['kind'],cmd['status'],is_open,cmd['version'],utc(cmd['due']),utc(cmd['due']+timedelta(minutes=3)))
-                    db.execute('UPDATE scheduler.Command SET Status=?,IsOpen=?,ResultCode=?,UpdatedUtc=SYSUTCDATETIME() WHERE CommandId=?',cmd['status'],is_open,cmd.get('result'),cmd['id'])
+                    db.execute('UPDATE scheduler.Command SET Status=?,IsOpen=?,ResultCode=?,ResultText=?,UpdatedUtc=SYSUTCDATETIME() WHERE CommandId=?',cmd['status'],is_open,cmd.get('result'),cmd.get('result_text'),cmd['id'])
             active_accounts={e['account'] for e in entries if e['status'] not in ('closed','failed')}
             for aid in active_accounts:
                 if not db.one('SELECT BotAccountId FROM scheduler.AccountLease WHERE BotAccountId=?',aid):

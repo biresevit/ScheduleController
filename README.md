@@ -40,6 +40,8 @@ python -m venv .venv
 
 The Function App `poker-schedule-controller` is in resource group `poker-backoffice`, uses Flex Consumption (512 MB, maximum two instances), and fires every 30 seconds. It has a dedicated least-privilege SQL user and no poker credentials. Application Insights records each tick. With the site disabled, a healthy tick reports `Scheduler tick completed: []`.
 
+Machine activity expires after three minutes without a heartbeat, including when site scheduling is disabled. The timer closes entries and account sessions at the heartbeat deadline, expires outstanding commands, and fences the old worker epoch. Account leases require live reconciliation before reuse. Customer-scoped backoffice reads also perform this cleanup so running counts and historical charts agree.
+
 The same app runs `hand_history_results_tick` at seconds 15 and 45. It has read-only access to the hand-history container and write access only to `reporting.HandProcessing` and `reporting.HandPlayerResult`. It never opens poker connections. Failed parses are retained with bounded error text and retried at most five times; reporting excludes incomplete and historical bot-only hands.
 
 Only these processes run on the poker machine:
@@ -92,3 +94,9 @@ Remove-Item Env:SCHEDULE_SQL_TEST
 ```
 
 The first migration and Nenad seed were validated against Azure SQL in rollback transactions before application. Unit coverage includes the 56/45 scenario, repeated triggers, duplicate seat prevention, unknown observations, category/currency boundaries, synthetic blocking, empty-table starts, full seat usage, capacity, daily preference fallback, DST, profile defaults, and buy-in feasibility. See [VALIDATION.md](VALIDATION.md) for the recorded result.
+
+### Traffic pacing
+
+Nenad / Evenbet uses 45?285 second gaps for joins and leaves. The planner mixes short gaps and longer pauses using a beta distribution, and queues the next change only once the previous change is within one scheduler tick. Ten-entry increases or decreases typically take about 30 minutes; this is a stochastic target rather than a completion deadline. Availability, failed joins, cooldowns and finishing hands can extend it. Existing queued commands keep their due times. Other sites keep their configured gap limits.
+
+The simulator uses the same gap distribution and 30-second scheduler ticks. Session-expiry departures also pass through the planner's pacing instead of leaving all tables at once.

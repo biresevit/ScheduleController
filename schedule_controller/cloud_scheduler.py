@@ -57,6 +57,7 @@ class CloudScheduler:
     def tick_all(self, stamp=None):
         stamp = (stamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
         with self.transaction() as db:
+            db.execute("EXEC scheduler.ExpireOfflineMachines")
             sites = [r["SiteId"] for r in db.rows("SELECT SiteId FROM scheduler.Site WHERE SchedulingEnabled=1")]
         results = []
         for site_id in sites:
@@ -116,8 +117,11 @@ class CloudScheduler:
             tables = [Table(t["TableId"], site_id, t["BigBlind"], t["MaxSeats"], t["OccupiedSeats"], aware(t["ObservedUtc"]),
                 currency=t["CurrencyCode"], game=t["GameType"], open=bool(t["IsOpen"]),
                 observed_accounts=frozenset(observed.get(t["TableId"],()))) for t in table_rows]
-            entry_rows = db.rows("SELECT * FROM scheduler.Entry WHERE SiteId=? AND IsOpen=1", site_id)
-            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"]) for e in entry_rows]
+            entry_rows = db.rows("""SELECT e.*,CASE WHEN EXISTS(SELECT 1 FROM scheduler.Command c
+                WHERE c.EntryId=e.EntryId AND c.Kind='leave' AND c.IsOpen=1)
+                THEN 'draining' ELSE e.Status END AS PlanningStatus
+                FROM scheduler.Entry e WHERE e.SiteId=? AND e.IsOpen=1""", site_id)
+            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["PlanningStatus"]) for e in entry_rows]
             max_actions = max(site["MaxJoinsPerTick"], site["MaxLeavesPerTick"], 1)
             planning_horizon = max(120, site["MaxJoinGapSeconds"] * max_actions + 30)
             settings = Settings(site_id, bands, site["CurrencyCode"], site["MaxJoinsPerTick"], site["MaxLeavesPerTick"],

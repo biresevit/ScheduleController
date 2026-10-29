@@ -163,14 +163,20 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     planned_entry_ids = set()
 
     def random_gap() -> timedelta:
-        """Return human-paced jitter without aligning actions to whole seconds."""
-        return timedelta(milliseconds=rng.randint(settings.min_gap * 1000, settings.max_gap * 1000))
+        """Mix short gaps and longer pauses instead of a uniform cadence."""
+        fraction=rng.betavariate(.65,.65) if settings.min_gap!=settings.max_gap else 0
+        return timedelta(milliseconds=round(1000*(settings.min_gap+fraction*(settings.max_gap-settings.min_gap))))
 
     def schedule_departure(e: Entry) -> bool:
         nonlocal due_leave
         if len(planned_entry_ids) >= settings.max_leaves:
             return False
         if e.status != "reserved" and e.machine not in ready:
+            return False
+        # Keep at most one tick of the previous action queued before drawing
+        # another gap. This avoids filling the distant horizon with a burst or
+        # repeatedly discarding long gaps until a shorter one fits.
+        if due_leave>now+timedelta(seconds=settings.tick_seconds):
             return False
         candidate_due = due_leave + random_gap()
         if candidate_due >= now + timedelta(seconds=horizon_seconds):
@@ -210,6 +216,8 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
 
     due_join = max(now, next_join or now)
     for _ in range(settings.max_joins):
+        if due_join>now+timedelta(seconds=settings.tick_seconds):
+            break
         options = []
         for a in acc.values():
             if (not (a.enabled or simulation and a.synthetic) or a.synthetic and not simulation

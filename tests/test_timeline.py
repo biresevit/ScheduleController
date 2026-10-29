@@ -12,7 +12,8 @@ LOW_ONLY = [Band("low", Decimal(".02"), Decimal(".5"), 10000),
 def test_timeline_reaches_56_from_20_and_is_reproducible():
     config = {"target": 56, "current": 20, "horizon_minutes": 60, "seed": 7,
               "initial_remaining_min_minutes": 240, "initial_remaining_max_minutes": 240,
-              "session_min_minutes": 240, "session_max_minutes": 240}
+              "session_min_minutes": 240, "session_max_minutes": 240,
+              "min_gap_seconds":20,"max_gap_seconds":60}
     result = simulate(config)
     assert result == simulate(config)
     assert result["joins"] == 36 and result["departures"] == 0
@@ -30,7 +31,7 @@ def test_one_session_ends_all_its_entries_then_scheduler_replaces_them():
     left = [e for e in result["events"] if e["kind"] == "left"]
     assert len(left) == 2
     assert left[0]["account"] == left[1]["account"]
-    assert {e["seconds"] for e in left} == {70}
+    assert [e["seconds"] for e in left] == [90,110]
     assert result["joins"] == 2 and result["final_entries"] == 2
     assert result["sessions"][0]["actual_end_at"] is not None
     assert result["sessions"][0]["initial_entries"] == 2
@@ -80,9 +81,29 @@ def test_daily_playtime_resets_at_site_midnight(monkeypatch):
     timeline.simulate({"start_local":"2026-10-27T23:59","current":1,"target":1,"horizon_minutes":5,
         "existing_sessions":[{"stake":"low","entries":1,"started_minutes_ago":30,"ends_after_minutes":60}]}, LOW_ONLY)
     assert observations[0][1]==1800
-    assert observations[1][1]==60
+    assert observations[2][1]==0
 
 
 def test_empty_explicit_session_list_does_not_generate_fake_existing_entries():
     with pytest.raises(ValueError,match="sum"):
         simulate({"current":20,"existing_sessions":[]})
+
+
+@pytest.mark.parametrize("current,target",[(0,10),(10,0)])
+def test_ten_entry_changes_take_about_half_an_hour_with_varied_gaps(current,target):
+    from statistics import mean
+    durations=[]
+    for seed in range(30):
+        result=simulate({"current":current,"target":target,"seed":seed,"horizon_minutes":60,
+                         "session_min_minutes":240,"session_max_minutes":240,
+                         "initial_remaining_min_minutes":240,"initial_remaining_max_minutes":240})
+        assert result["first_reached_seconds"] is not None
+        durations.append(result["first_reached_seconds"]/60)
+        changes=[e["seconds"] for e in result["events"] if e["kind"] in ("joined","left")]
+        gaps=[b-a for a,b in zip([0]+changes,changes)]
+        assert len(changes)==10
+        assert min(gaps)>=45
+        assert len(set(gaps))>=5
+    assert 25<mean(durations)<35
+    assert max(durations)-min(durations)>5
+    assert min(durations)>15 and max(durations)<50
