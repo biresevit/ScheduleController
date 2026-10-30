@@ -360,10 +360,13 @@ class Pilot:
                 await candidate.client.list_tables()
                 lobby=list(candidate.client.tables.values())
                 info={t['i']:t for t in lobby if t['i'] in TABLE_IDS and t.get('g') in (72,79) and t.get('p') in (80,85)}
-                for tid in info:
+                # Subscribe to every table concurrently instead of one at a time; a lobby
+                # scan has nothing to gain from pacing itself like real table play does.
+                async def join_table(tid):
                     version=candidate.client.state_versions.get(tid,0)
                     await candidate.client.join(tid)
                     await candidate.client.wait_state(tid,lambda s,tid=tid,version=version: candidate.client.state_versions.get(tid,0)>version)
+                await asyncio.gather(*(join_table(tid) for tid in info))
                 observer=candidate
                 self.info=info
                 break
