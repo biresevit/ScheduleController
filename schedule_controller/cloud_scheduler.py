@@ -147,15 +147,28 @@ class CloudScheduler:
             if "reconciliation_cooldown" in result.reasons:
                 return {"site_id": site_id, "target": target, "status": "cooldown", "actions": 0}
             created = 0
+            any_join_proposed = False
+            last_successful_join_due = None
             for action in result.actions:
                 if action.kind == "join":
-                    if self._create_join(db, site, action, policy_by_id[action.account], machine_by_id[action.machine], rng): created += 1
+                    any_join_proposed = True
+                    if self._create_join(db, site, action, policy_by_id[action.account], machine_by_id[action.machine], rng):
+                        created += 1
+                        last_successful_join_due = action.not_before
                 elif action.kind == "leave":
                     if self._create_leave(db, site, action, machine_by_id[action.machine]): created += 1
                 elif action.kind == "cancel_join":
                     if self._cancel_join(db, action): created += 1
+            next_join = result.next_join
+            if any_join_proposed:
+                # A proposed join that failed to actually create (stale lease,
+                # machine not ready, etc.) must not cost the site a wasted
+                # min/max pacing gap. Only a confirmed join advances the anchor;
+                # otherwise fall back to the pre-tick value so the next tick
+                # retries with a fresh candidate immediately instead of waiting.
+                next_join = last_successful_join_due if last_successful_join_due is not None else aware(site["NextJoinUtc"])
             db.execute("UPDATE scheduler.Site SET NextJoinUtc=?,NextLeaveUtc=?,LastReconciledUtc=?,UpdatedUtc=SYSUTCDATETIME() WHERE SiteId=? AND ConfigVersion=?",
-                result.next_join, result.next_leave, stamp.replace(tzinfo=None), site_id, site["ConfigVersion"])
+                next_join, result.next_leave, stamp.replace(tzinfo=None), site_id, site["ConfigVersion"])
             return {"site_id": site_id, "target": target, "status": "planned", "actions": created,
                     "reasons": result.reasons, "deficits": result.remaining_deficits}
 
