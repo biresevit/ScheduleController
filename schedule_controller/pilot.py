@@ -23,6 +23,7 @@ from poker_controller.client import EvenBetClient,Settings as ClientSettings
 from poker_controller.bot import Bot
 from poker_controller.decision import PDecision
 from poker_controller.state import cards
+from poker_controller.transport import ProtocolError
 from .planner import Account,Entry,Machine,Settings,Table,plan
 from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
@@ -41,8 +42,9 @@ def aware(value):
 
 
 class Session:
-    def __init__(self,policy,decision,rng=None):
+    def __init__(self,policy,decision,rng=None,repo=None):
         self.policy=policy
+        self.repo=repo
         self.client=EvenBetClient(ClientSettings(username=policy['Username']))
         self.decision=decision
         self.rng=rng or random.Random()
@@ -56,7 +58,16 @@ class Session:
         self.rit_tasks=set()
         self.ready=asyncio.Event()
         self.ready.set()
-        self.client.connection.listeners.append(self.stamp)
+        self.attach_observer(self.client,self.observed)
+
+    def attach_observer(self,client,observed):
+        # Reconnect candidates must not refresh timestamps on an older client's
+        # cached seats. Each connection owns its own observation clock.
+        def receive(message):
+            if message.get('t')=='GameState':
+                state=message.get('gameState',message.get('GameState',{}))
+                if state.get('ti'):observed[state['ti']]=now()
+        client.connection.listeners.append(receive)
 
     def stamp(self,message):
         if message.get('t')=='GameState':
@@ -116,7 +127,8 @@ class Session:
             try:
                 await self.client.close()
                 self.client=EvenBetClient(ClientSettings(username=self.policy['Username']))
-                self.client.connection.listeners.append(self.stamp)
+                self.observed={}
+                self.attach_observer(self.client,self.observed)
                 await asyncio.sleep(delay)
                 await self.client.open()
                 log.info('Idle login reconnected: %s',self.policy['Username'])
@@ -129,40 +141,47 @@ class Session:
         return False
 
     async def reconnect_active(self):
-        """Reconnect and prove every locally managed seat still exists."""
-        old=self.client
-        table_ids=list(self.queues)
-        table_info=copy.deepcopy(old.tables)
+        """Reconnect surviving seats; a departed table cannot reject the rest."""
+        old=self.client;table_ids=list(self.queues);table_info=copy.deepcopy(old.tables)
         for delay in (1,3,10):
             candidate=None
             try:
                 await asyncio.sleep(delay)
                 candidate=EvenBetClient(ClientSettings(username=self.policy['Username']))
-                candidate.connection.listeners.append(self.stamp)
-                await candidate.open()
+                observed={};self.attach_observer(candidate,observed)
+                await candidate.open();present=[]
                 for tid in table_ids:
-                    if tid in table_info:
-                        candidate.tables[tid]=table_info[tid]
+                    if tid in table_info:candidate.tables[tid]=table_info[tid]
                     await candidate.join(tid)
-                    if candidate.hero_seat(candidate.states[tid]) is None:
-                        raise RuntimeError(f'Seat {tid} is absent after reconnect')
-                self.client=candidate
+                    hero=candidate.hero_seat(candidate.states[tid])
+                    if hero is not None:
+                        try:
+                            if candidate.states[tid]['s'][hero].get('f',0)&1:await candidate.return_from_away(tid)
+                            await candidate.player_command(tid,10)
+                        except ProtocolError:
+                            log.warning('Resume command not accepted for %s / %s; retaining observed seat for reconciliation',self.policy['Username'],tid)
+                        present.append(tid)
+                tasks=list(self.workers.values())
+                for task in tasks:task.cancel()
+                await asyncio.gather(*tasks,return_exceptions=True)
+                self.client=candidate;self.observed=observed;self.workers={};self.queues={}
                 for tid in table_ids:
-                    self.bots[tid].client=candidate
-                    q=self.queues[tid]
-                    if q.full(): q.get_nowait();q.task_done()
-                    q.put_nowait(copy.deepcopy(candidate.states[tid]))
+                    if tid not in present:self.bots.pop(tid,None)
+                    self.failures.pop(tid,None)
+                self.failures.pop(-1,None)
+                for tid in present:
+                    self.bots[tid].client=candidate;self.queues[tid]=asyncio.Queue(maxsize=1)
+                    self.queues[tid].put_nowait(copy.deepcopy(candidate.states[tid]))
+                    self.workers[tid]=asyncio.create_task(self.worker(tid))
                 await old.close()
-                log.info('Active login reconnected: %s (%s tables)',
-                         self.policy['Username'],len(table_ids))
+                log.info('Active login reconnected: %s (%s surviving, %s absent tables)',self.policy['Username'],len(present),len(table_ids)-len(present))
                 return True
             except asyncio.CancelledError:
-                if candidate: await candidate.close()
+                if candidate:await candidate.close()
                 raise
             except Exception as exc:
-                log.warning('Active reconnect attempt failed for %s: %s',
-                            self.policy['Username'],type(exc).__name__)
-                if candidate: await candidate.close()
+                log.warning('Active reconnect attempt failed for %s: %s',self.policy['Username'],type(exc).__name__)
+                if candidate:await candidate.close()
         return False
 
     async def respond_run_it_twice(self,tid,accept,delay):
@@ -203,15 +222,23 @@ class Session:
             raise RuntimeError('Unexpected existing seat requires reconciliation')
         limits=await self.client.buy_in_range(tid)
         minimum=Decimal(limits['minAmount'])/100; maximum=Decimal(limits['maxAmount'])/100
-        amount=choose_buy_in(json.loads(self.policy['BuyInPolicyJson']),Decimal(info['bb'])/100,
-                             minimum,maximum,maximum,rng)
+        bb=Decimal(info['bb'])/100
+        try:
+            amount=choose_buy_in(json.loads(self.policy['BuyInPolicyJson']),bb,minimum,maximum,maximum,rng)
+        except ValueError as error:
+            raise ValueError(f'{error}. Server buy-in range: {minimum}?{maximum} chips; big blind: {bb}.') from error
         post=rng.random()<float(self.policy['PostBbChance'])
         await self.client.sit(tid,str(amount),wait_big_blind=not post)
-        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True)
+        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid))
         self.queues[tid]=asyncio.Queue(maxsize=1)
         self.workers[tid]=asyncio.create_task(self.worker(tid))
         self.queues[tid].put_nowait(copy.deepcopy(self.client.states[tid]))
         return amount
+
+    def table_control(self,tid):
+        if not self.repo:return None
+        from .manual_worker import ManualBridge
+        return ManualBridge(self.repo,self.policy['BotAccountId'],tid)
 
     async def adopt(self,tid,info):
         """Attach workers to a seat proven to exist after a controller restart."""
@@ -221,7 +248,15 @@ class Session:
         hero=self.client.hero_seat(state)
         if hero is None:
             return None
-        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True)
+        try:
+            if state['s'][hero].get('f',0)&1:await self.client.return_from_away(tid)
+            await self.client.player_command(tid,10)
+        except ProtocolError:
+            log.warning('Resume command not accepted for %s / %s; retaining observed seat for reconciliation',self.policy['Username'],tid)
+        state=self.client.states.get(tid,state)
+        hero=self.client.hero_seat(state)
+        if hero is None:return None
+        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid))
         self.queues[tid]=asyncio.Queue(maxsize=1)
         self.workers[tid]=asyncio.create_task(self.worker(tid))
         self.queues[tid].put_nowait(copy.deepcopy(state))
@@ -256,7 +291,7 @@ class Session:
 
 class Pilot:
     def __init__(self,args):
-        self.args=args;self.epoch=guid();self.repo=Repository(self.epoch);self.rng=random.Random(args.seed)
+        self.args=args;self.epoch=guid();self.repo=Repository(self.epoch,getattr(args,'site_id',1),getattr(args,'machine_id',1));self.rng=random.Random(args.seed)
         self.clients={};self.entries={};self.sessions=[];self.accounting={};self.intervals=[];self.sequence=0
         self.info={};self.tables=[];self.seats={};self.pending=[];self.jobs={};self.errors=[]
         self.next_join=self.next_leave=self.last_plan=None;self.saved=None;self.started=False
@@ -281,7 +316,7 @@ class Pilot:
             existing=self.clients.get(aid)
             if existing:
                 return existing
-            session=Session(self.policies[aid],self.decision,self.rng)
+            session=Session(self.policies[aid],self.decision,self.rng,repo=self.repo)
             await session.open('play task')
             self.clients[aid]=session
             return session
@@ -305,10 +340,17 @@ class Pilot:
         # A single account socket must never be a controller-wide dependency.
         candidates=sorted(self.clients.values(),key=lambda c: bool(c.failures or c.client.connection.failure))
         if not any(not c.failures and not c.client.connection.failure for c in candidates):
-            scan_account=next((aid for aid in self.policies if aid not in self.clients),None)
+            scan_account=await asyncio.to_thread(self.repo.claim_observer)
+            if scan_account is not None and scan_account not in self.policies:
+                await asyncio.to_thread(self.repo.release_observer,scan_account)
+                await self.configuration()
+                scan_account=await asyncio.to_thread(self.repo.claim_observer)
             if scan_account is not None:
                 temporary=Session(self.policies[scan_account],self.decision,self.rng)
-                await temporary.open('lobby scan')
+                try:await temporary.open('lobby scan')
+                except BaseException:
+                    await asyncio.to_thread(self.repo.release_observer,scan_account)
+                    raise
                 candidates.append(temporary)
         for candidate in candidates:
             try:
@@ -331,18 +373,23 @@ class Pilot:
                             candidate.policy['Username'],type(exc).__name__)
         if observer is None:
             if temporary: await temporary.close()
+            if temporary:await asyncio.to_thread(self.repo.release_observer,temporary.policy['BotAccountId'])
+            if not candidates:
+                self.info={};self.tables=[];self.seats={}
+                return
             raise RuntimeError('No healthy lobby observer') from last_error
         observer_states=copy.deepcopy(observer.client.states)
         observer_observed=dict(observer.observed)
         if temporary:
             await temporary.close()
+            await asyncio.to_thread(self.repo.release_observer,temporary.policy['BotAccountId'])
             log.info('Logout confirmed after lobby scan: %s',temporary.policy['Username'])
         stamp=now(); native={c.client.player_id:aid for aid,c in self.clients.items()}
         self.tables=[];self.seats={}
         for tid,info in self.info.items():
             state=observer_states.get(tid,{})
             stamp_state=observer_observed.get(tid)
-            if not stamp_state: continue
+            if not stamp_state or len(state.get('s',[]))!=int(info['mp']): continue
             live=[(i,s) for i,s in enumerate(state.get('s',[])) if s and not s.get('f',0)&128]
             self.tables.append({'id':str(tid),'name':info['n'],'game':{72:'NLH',79:'PLO4',88:'PLO5'}[info['g']],
                 'table_type':'RING',
@@ -351,15 +398,38 @@ class Pilot:
             self.seats[str(tid)]=[{'seat':i,'native_id':str(s.get('i','')),'name':s.get('dn') or s.get('n',''),
                 'account':native.get(s.get('i')),'stack':Decimal(s.get('c',0))/100,'bet':Decimal(s.get('b',0))/100,
                 'in_game':bool(s.get('d')),'away':bool(s.get('f',0)&1),'hand':str(state.get('gi','')),'observed':stamp_state} for i,s in live]
-        # Seat confirmations come from the owning authenticated connection.
-        for e in self.entries.values():
-            if e['status'] in ('seated','sitting_out','draining'):
-                c=self.clients.get(e['account'])
-                if not c: continue
-                st=c.client.states.get(int(e['table']),{}); h=c.client.hero_seat(st)
-                if h is not None:
-                    e['confirmed']=c.observed.get(int(e['table']),e.get('confirmed'))
-                    if e['status']!='draining': e['status']='sitting_out' if st['s'][h].get('f',0)&1 else 'seated'
+        await self.reconcile_observed_entries()
+
+    async def reconcile_observed_entries(self):
+        """Close only seats absent in a complete fresh snapshot newer than the journal."""
+        stamp=now();tables={t['id']:t for t in self.tables};closed_accounts=set()
+        for entry in list(self.entries.values()):
+            if entry['status'] not in ('seated','sitting_out','draining','uncertain'):continue
+            if any(not task.done() for key,task in self.jobs.items() if key==entry['id'] or (isinstance(key,tuple) and entry['id'] in key)):continue
+            table=tables.get(entry['table']);players=self.seats.get(entry['table'])
+            observed=table.get('snapshot') if table else None
+            if not observed or observed<stamp-timedelta(seconds=60) or players is None or len(players)!=table['occupied']:continue
+            policy=self.policies[entry['account']];connection=self.clients.get(entry['account'])
+            native=str(connection.client.player_id) if connection else None
+            present=any(p.get('account')==entry['account'] or (p.get('name') or '').casefold()==policy['Username'].casefold() or (native and p.get('native_id')==native) for p in players)
+            if present:
+                if entry['status']!='uncertain' and (not entry.get('confirmed') or observed>entry['confirmed']):entry['confirmed']=observed
+                continue
+            last=entry.get('confirmed') or entry.get('seated') or entry['created']
+            if observed<=last:continue
+            self.accrue();entry.update(status='closed',closed=observed)
+            for command in entry.get('commands',[]):
+                if command['status'] in ('pending','claimed','uncertain'):
+                    command.update(status='succeeded' if command['kind']=='leave' else 'cancelled',result='reconciled_absent',result_text='A fresh complete table snapshot confirms the bot is no longer seated.')
+            closed_accounts.add(entry['account'])
+            log.info('Live reconciliation confirmed absent: %s / %s',policy['Username'],entry['table'])
+        for account in closed_accounts:
+            if not any(e['account']==account and e['status'] not in ('closed','failed') for e in self.entries.values()):
+                for session in self.sessions:
+                    if session['account']==account and not session.get('closed'):session.update(closed=max(session['start'],stamp),reason='reconciled_absent')
+            try:await self.close_session_if_idle(account)
+            except Exception:log.exception('Could not close reconciled idle account')
+        if closed_accounts:self.accrue()
 
     def accrue(self):
         stamp=now()
@@ -379,7 +449,7 @@ class Pilot:
                 next_join=self.next_join,next_leave=self.next_leave,last_plan=self.last_plan)
             await self.publish_live_views()
             done={s['id'] for s in spans};self.intervals=[s for s in self.intervals if s['id'] not in done]
-            summary={'at':now().isoformat(),'epoch':self.epoch,'target':self.args.target,
+            summary={'controller_version':getattr(self.args,'controller_version',None),'at':now().isoformat(),'epoch':self.epoch,'target':self.args.target,
                 'entries':Counter(e['status'] for e in self.entries.values()),
                 'accounts':{p['Username']:sum(e['account']==a and e['status'] in ('seated','sitting_out','draining') for e in self.entries.values()) for a,p in self.policies.items()},
                 'actions':sum(b.actions for c in self.clients.values() for b in c.bots.values()),'errors':self.errors,
@@ -417,6 +487,10 @@ class Pilot:
                     'stack':seat.get('c',0)/100,'bet':seat.get('b',0)/100,'in_game':bool(seat.get('d')),
                     'sitting_out':bool(seat.get('f',0)&1),'hero':index==hero,
                     'cards':cards(seat.get('d')) if index==hero else []})
+            from poker_controller.manual import options
+            bot=session.bots.get(tid)
+            payload['manual']=options(state,hero,bot.mapper if bot else None)
+            payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
             await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
         return len(requests)
 
@@ -538,7 +612,7 @@ class Pilot:
         await self.decision.require_evenbet_hand_history()
         await self.configuration()
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
-        chat_task=None
+        chat_task=manual_task=None
         try:
             recovery=await asyncio.to_thread(self.repo.start_cloud_worker)
             await self.reconcile_cloud_entries(recovery)
@@ -548,6 +622,8 @@ class Pilot:
             await self.refresh();await self.publish()
             from .chat_worker import run_chat
             chat_task=asyncio.create_task(run_chat(self))
+            from .manual_worker import run_manual
+            manual_task=asyncio.create_task(run_manual(self))
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
             next_claim=next_live_view=next_telemetry=0.0
             while (not self.args.seconds or now()<self.end) and not (self.output/'stop').exists():
@@ -572,6 +648,9 @@ class Pilot:
                     next_telemetry=tick+300
                 await asyncio.sleep(.25)
         finally:
+            if manual_task:
+                manual_task.cancel()
+                await asyncio.gather(manual_task,return_exceptions=True)
             if chat_task:
                 chat_task.cancel()
                 await asyncio.gather(chat_task,return_exceptions=True)

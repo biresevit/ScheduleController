@@ -57,8 +57,10 @@ class CloudScheduler:
     def tick_all(self, stamp=None):
         stamp = (stamp or datetime.now(timezone.utc)).astimezone(timezone.utc)
         with self.transaction() as db:
+            from .update_rollouts import tick_rollouts
+            tick_rollouts(db,stamp)
             db.execute("EXEC scheduler.ExpireOfflineMachines")
-            sites = [r["SiteId"] for r in db.rows("SELECT SiteId FROM scheduler.Site WHERE SchedulingEnabled=1")]
+            sites = [r["SiteId"] for r in db.rows("SELECT SiteId FROM scheduler.Site WHERE SchedulingEnabled=1 OR EXISTS(SELECT 1 FROM scheduler.MachineAssignment a WHERE a.SiteId=scheduler.Site.SiteId AND a.MaintenanceTaskId IS NOT NULL)")]
         results = []
         for site_id in sites:
             try: results.append(self.tick_site(site_id, stamp))
@@ -73,13 +75,14 @@ class CloudScheduler:
                 @LockOwner='Transaction',@LockTimeout=5000; SELECT @r AS value""", f"ScheduleController:site:{site_id}")
             if not lock or lock["value"] < 0: raise RuntimeError("Could not acquire site scheduling lock")
             site = db.one("SELECT * FROM scheduler.Site WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=?", site_id)
-            if not site or not site["SchedulingEnabled"]:
+            maintenance=db.rows("SELECT MachineId,MaintenanceTaskId FROM scheduler.MachineAssignment WHERE SiteId=? AND MaintenanceTaskId IS NOT NULL",site_id)
+            if not site or (not site["SchedulingEnabled"] and not maintenance):
                 return {"site_id": site_id, "status": "disabled"}
             bands = [Band(r["Tier"], r["MinBigBlind"], r["MaxBigBlind"], r["TargetBasisPoints"], bool(r["UpperInclusive"]))
                      for r in db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=?", site_id)]
             windows = [Window(r["Weekday"], r["StartMinute"], r["EndMinute"], r["TargetEntries"])
                        for r in db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=?", site_id)]
-            target = target_at(windows, stamp, site["TimeZone"])
+            target = target_at(windows, stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
             policies = db.rows("""SELECT p.*,b.IsActive,COALESCE(d.SessionSeconds,0) PlayedSeconds,
                 l.MachineId OwnerMachine,l.RequiresReconciliation,s.SessionId,s.PlannedEndUtc,
@@ -91,6 +94,15 @@ class CloudScheduler:
                 OUTER APPLY(SELECT TOP(1) x.ActualEndUtc FROM scheduler.AccountSession x
                     WHERE x.BotAccountId=p.BotAccountId AND x.IsOpen=0 ORDER BY x.ActualEndUtc DESC) prior
                 WHERE p.SiteId=? AND p.DeletedUtc IS NULL""", local_day, site_id)
+            draining_accounts=set()
+            for machine in maintenance:
+                update=db.one("SELECT r.Status FROM scheduler.MachineUpdateTask t JOIN scheduler.UpdateRollout r ON r.RolloutId=t.RolloutId WHERE t.TaskId=?",machine['MaintenanceTaskId'])
+                if not update or update['Status']!='running':continue
+                first=db.one("""SELECT TOP(1) e.BotAccountId FROM scheduler.Entry e
+                    LEFT JOIN scheduler.AccountSession x ON x.SessionId=e.SessionId
+                    WHERE e.SiteId=? AND e.MachineId=? AND e.IsOpen=1 AND e.Status IN ('reserved','joining','seated','sitting_out','draining')
+                    ORDER BY COALESCE(x.StartedUtc,e.CreatedUtc),e.BotAccountId,e.CreatedUtc""",site_id,machine['MachineId'])
+                if first: draining_accounts.add(first['BotAccountId'])
             accounts = []
             policy_by_id = {}
             for p in policies:
@@ -101,10 +113,10 @@ class CloudScheduler:
                     enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"]),
                     synthetic=bool(p["IsSynthetic"]), requires_reconciliation=bool(p["RequiresReconciliation"]),
                     eligible_after=previous+timedelta(minutes=p["SessionCooldownMinutes"]) if previous else None,
-                    session_end=aware(p["PlannedEndUtc"])))
+                    session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts))
             machine_rows = db.rows("SELECT * FROM scheduler.MachineAssignment WHERE SiteId=?", site_id)
             machines = [Machine(m["MachineId"], site_id, m["MaxEntries"], aware(m["LastHeartbeatUtc"] or datetime.min),
-                ready=bool(m["IsReady"]), enabled=bool(m["IsEnabled"])) for m in machine_rows]
+                ready=bool(m["IsReady"]), enabled=bool(m["IsEnabled"]),maintenance=bool(m["MaintenanceTaskId"])) for m in machine_rows]
             machine_by_id = {m["MachineId"]: m for m in machine_rows}
             table_rows = db.rows("SELECT * FROM scheduler.LobbyTable WHERE SiteId=?", site_id)
             observed = {}
@@ -159,6 +171,7 @@ class CloudScheduler:
 
     def _create_join(self, db, site, action, policy, machine, rng):
         if not machine or not machine["WorkerEpoch"]: return False
+        if machine.get("MaintenanceTaskId"): return False
         epoch = machine["WorkerEpoch"]
         lease = db.one("SELECT * FROM scheduler.AccountLease WITH(UPDLOCK,HOLDLOCK) WHERE BotAccountId=?", action.account)
         if lease and (lease["MachineId"] != action.machine or str(lease["WorkerEpoch"]).lower() != str(epoch).lower()

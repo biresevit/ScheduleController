@@ -26,6 +26,7 @@ class Account:
     requires_reconciliation: bool = False
     eligible_after: datetime | None = None
     session_end: datetime | None = None
+    drain_for_update: bool = False
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class Machine:
     heartbeat: datetime
     ready: bool = True
     enabled: bool = True
+    maintenance: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,9 +195,9 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     # leave through the same bounded, randomly spaced mechanism as a target
     # reduction; replacements are considered only after departures confirm.
     expired = sorted((e for e in active if e.status in ("reserved", "seated", "sitting_out")
-                      and acc[e.account].session_end is not None
-                      and now >= acc[e.account].session_end.astimezone(timezone.utc)),
-                     key=lambda e: (acc[e.account].session_end, e.status != "reserved", e.account, e.id))
+                      and (acc[e.account].drain_for_update or (acc[e.account].session_end is not None
+                      and now >= acc[e.account].session_end.astimezone(timezone.utc)))),
+                     key=lambda e: (acc[e.account].session_end or now, e.status != "reserved", e.account, e.id))
     for e in expired:
         if len(planned_entry_ids) >= settings.max_leaves:
             break
@@ -231,7 +233,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                 if table_tier[t.id] != a.tier or table_count[t.id] >= t.seats or (a.id, t.id) in pairs:
                     continue
                 for m in ready.values():
-                    if machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:
+                    if m.maintenance or machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:
                         continue
                     options.append((a, t, m))
         if not options:

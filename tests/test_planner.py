@@ -202,3 +202,28 @@ def test_future_action_is_not_followed_by_distant_queue_or_resampled_gap():
                       [Machine(1,1,30,NOW)],[Table(str(n),1,D(".1"),6,0,NOW) for n in range(10)],[],
                       random.Random(99),next_join=result.next_join)
         assert not repeated.actions and repeated.next_join==result.next_join
+
+
+def test_update_maintenance_drains_only_selected_session_and_blocks_new_joins():
+    accounts=[Account(1,1,'low',owner_machine=1,drain_for_update=True),Account(2,1,'low',owner_machine=1),Account(3,1,'low')]
+    machines=[Machine(1,1,20,NOW,maintenance=True),Machine(2,1,20,NOW)]
+    tables=[Table(str(i),1,D('.1'),6,1,NOW,observed_accounts=frozenset({1 if i<2 else 2})) for i in range(3)]
+    entries=[Entry('a',1,1,'0'),Entry('b',1,1,'1'),Entry('c',2,1,'2')]
+    result=plan(SETTINGS,NOW,4,accounts,machines,tables,entries,random.Random(5))
+    leaves=[a for a in result.actions if a.kind=='leave']
+    assert len(leaves)==2 and all(a.account==1 for a in leaves)
+    assert all(a.machine==2 for a in result.actions if a.kind=='join')
+
+
+def test_worker_sql_parameters_follow_configured_pc():
+    from schedule_controller.pilot_repository import DB
+    sql,values=DB(None,8,23).bind('INSERT example(SiteId,MachineId,Value) VALUES(:site,:machine,?)',('test',))
+    assert sql=='INSERT example(SiteId,MachineId,Value) VALUES(?,?,?)'
+    assert values==[8,23,'test']
+
+
+def test_recovery_target_tracks_current_schedule_without_waiting_for_unneeded_entries():
+    from schedule_controller.update_rollouts import recovery_target
+    assert recovery_target(10,20,10)==8
+    assert recovery_target(10,3,2)==1
+    assert recovery_target(10,0,2)==0
