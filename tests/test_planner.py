@@ -269,3 +269,12 @@ def test_manual_session_reports_why_it_cannot_join():
     started_later = Account(1, 1, "low", manual=True, session_start=NOW + timedelta(minutes=5),
                             session_end=NOW + timedelta(hours=1))
     assert run(accounts=[started_later]).manual_blocked == {1: "session not started"}
+
+
+def test_open_session_without_tables_is_refilled_before_a_new_session_starts():
+    tables = [Table(str(n), 1, D(".1"), 6, 0, NOW) for n in range(2)]
+    idle_session = Account(2, 1, "low", owner_machine=1, session_end=NOW + timedelta(hours=1))
+    for seed in range(5):
+        result = plan(SETTINGS, NOW, 5, [Account(1, 1, "low"), idle_session], [Machine(1, 1, 6, NOW)], tables, [],
+                      random.Random(seed))
+        assert result.actions[0].account == 2

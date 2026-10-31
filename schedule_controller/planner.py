@@ -281,6 +281,11 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         # between accounts with the same number of entries.
         least_tables = min(account_count[o[0].id] for o in options)
         options = [o for o in options if account_count[o[0].id] == least_tables]
+        # A session outlives its tables (bust, failed join, no longer seated): refill it before
+        # starting a new session for another account.
+        resuming = [o for o in options if o[0].session_end is not None]
+        if resuming:
+            options = resuming
         available = {o[0].id: o[0] for o in options}
         chosen = rng.choices(list(available), weights=[FREQUENCY_WEIGHTS[a.frequency] /
                           (1 + a.played_seconds / 3600) for a in available.values()], k=1)[0]

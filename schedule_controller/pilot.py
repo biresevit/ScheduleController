@@ -434,7 +434,7 @@ class Pilot:
             closed_accounts.add(entry['account'])
             log.info('Live reconciliation confirmed absent: %s / %s',policy['Username'],entry['table'])
         for account in closed_accounts:
-            if not any(e['account']==account and e['status'] not in ('closed','failed') for e in self.entries.values()):
+            if not getattr(self,'cloud',False) and not any(e['account']==account and e['status'] not in ('closed','failed') for e in self.entries.values()):
                 for session in self.sessions:
                     if session['account']==account and not session.get('closed'):session.update(closed=max(session['start'],stamp),reason='reconciled_absent')
             try:await self.close_session_if_idle(account)
@@ -619,9 +619,10 @@ class Pilot:
                 e['status']='uncertain';cmd.update(status='uncertain',result='cleanup_unconfirmed')
                 c.failures[tid]='cleanup_unconfirmed'
         finally:
-            for s in self.sessions:
-                if not s.get('closed') and not any(x['account']==s['account'] and x['status'] not in ('closed','failed') for x in self.entries.values()):
-                    s.update(closed=now(),reason='all_entries_closed')
+            if not getattr(self,'cloud',False):
+                for s in self.sessions:
+                    if not s.get('closed') and not any(x['account']==s['account'] and x['status'] not in ('closed','failed') for x in self.entries.values()):
+                        s.update(closed=now(),reason='all_entries_closed')
             if c:
                 try: await self.close_session_if_idle(e['account'])
                 except Exception: log.exception('Could not close idle account %s',self.policies[e['account']]['Username'])
@@ -653,6 +654,9 @@ class Pilot:
 
     async def run_cloud_worker(self):
         """Execute commands planned by Azure; no scheduling is performed locally."""
+        # Azure owns session lifetimes here: a session outlives its tables and the scheduler
+        # closes it at its planned end. The worker must not end sessions when tables close.
+        self.cloud=True
         await self.decision.require_evenbet_hand_history()
         await self.configuration()
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)

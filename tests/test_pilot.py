@@ -279,3 +279,18 @@ def test_live_views_publish_on_state_change_and_heartbeat_only_when_unchanged(mo
     try:asyncio.run(p.run_live_views())
     except asyncio.CancelledError:pass
     assert published==[1,2,2]
+
+
+def test_cloud_worker_keeps_session_open_when_its_last_table_closes(monkeypatch):
+    import schedule_controller.pilot as module
+    stamp=datetime(2026,10,29,17,tzinfo=timezone.utc);monkeypatch.setattr(module,'now',lambda:stamp)
+    def pilot(cloud):
+        p=Pilot.__new__(Pilot);p.cloud=cloud;p.policies={1:{'Username':'kate'}};p.clients={};p.accrue=lambda:None
+        p.close_session_if_idle=AsyncMock();p.jobs={};p.sessions=[{'id':'session','account':1,'start':stamp-timedelta(hours=1)}]
+        p.tables=[{'id':'43','snapshot':stamp,'occupied':0}];p.seats={'43':[]}
+        p.entries={'gone':{'id':'gone','account':1,'table':'43','status':'seated','created':stamp-timedelta(hours=1),'confirmed':stamp-timedelta(minutes=2)}}
+        asyncio.run(p.reconcile_observed_entries())
+        assert p.entries['gone']['status']=='closed'
+        return p.sessions[0]
+    assert not pilot(True).get('closed')
+    assert pilot(False)['reason']=='reconciled_absent'

@@ -170,9 +170,7 @@ class Repository(ChatRepository,ManualRepository):
                 LastConfirmedUtc=SYSUTCDATETIME() WHERE EntryId=?""",entry_id)
             remaining=db.one("SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=:site AND BotAccountId=? AND IsOpen=1",entry['BotAccountId'])
             if not remaining:
-                if entry['SessionId']:
-                    db.execute("""UPDATE scheduler.AccountSession SET ActualEndUtc=SYSUTCDATETIME(),IsOpen=0,
-                        EndReason='reconciled_absent' WHERE SessionId=? AND IsOpen=1""",entry['SessionId'])
+                # The session stays open; the scheduler rejoins it until its planned end.
                 db.execute("DELETE scheduler.AccountLease WHERE SiteId=:site AND BotAccountId=?",entry['BotAccountId'])
 
     @retry_deadlocks
@@ -284,8 +282,6 @@ class Repository(ChatRepository,ManualRepository):
                 raise RuntimeError('Expected one open uncertain entry')
             db.execute("UPDATE scheduler.Command SET Status='succeeded',IsOpen=0,ResultCode='reconciled_absent',UpdatedUtc=SYSUTCDATETIME() WHERE EntryId=? AND IsOpen=1",entry['EntryId'])
             db.execute("UPDATE scheduler.Entry SET Status='closed',IsOpen=0,ClosedUtc=SYSUTCDATETIME(),LastConfirmedUtc=SYSUTCDATETIME() WHERE EntryId=?",entry['EntryId'])
-            if entry['SessionId']:
-                db.execute("UPDATE scheduler.AccountSession SET ActualEndUtc=SYSUTCDATETIME(),IsOpen=0,EndReason='reconciled_absent' WHERE SessionId=? AND IsOpen=1",entry['SessionId'])
             db.execute("DELETE scheduler.AccountLease WHERE SiteId=:site AND BotAccountId=?",account_id)
             return entry['EntryId']
 
@@ -302,9 +298,6 @@ class Repository(ChatRepository,ManualRepository):
             for entry in entries:
                 db.execute("UPDATE scheduler.Command SET Status='succeeded',IsOpen=0,ResultCode='reconciled_absent',UpdatedUtc=SYSUTCDATETIME() WHERE EntryId=? AND IsOpen=1",entry['EntryId'])
                 db.execute("UPDATE scheduler.Entry SET Status='closed',IsOpen=0,ClosedUtc=SYSUTCDATETIME(),LastConfirmedUtc=SYSUTCDATETIME() WHERE EntryId=?",entry['EntryId'])
-            session_ids={e['SessionId'] for e in entries if e['SessionId']}
-            for session_id in session_ids:
-                db.execute("UPDATE scheduler.AccountSession SET ActualEndUtc=SYSUTCDATETIME(),IsOpen=0,EndReason='reconciled_absent' WHERE SessionId=? AND IsOpen=1",session_id)
             db.execute("DELETE scheduler.AccountLease WHERE SiteId=:site AND BotAccountId=?",account_id)
             return [e['EntryId'] for e in entries]
 
@@ -337,8 +330,9 @@ class Repository(ChatRepository,ManualRepository):
             for s in sessions:
                 if not db.one('SELECT SessionId FROM scheduler.AccountSession WHERE SessionId=?',s['id']):
                     db.execute("INSERT scheduler.AccountSession(SessionId,SiteId,BotAccountId,MachineId,WorkerEpoch,StartedUtc,PlannedEndUtc,ActualEndUtc,IsOpen,EndReason) VALUES(?,:site,?,:machine,?,?,?,?,?,?)",s['id'],s['account'],self.epoch,utc(s['start']),utc(s['end']),utc(s.get('closed')),not bool(s.get('closed')),s.get('reason'))
-                else:
-                    db.execute('UPDATE scheduler.AccountSession SET ActualEndUtc=?,IsOpen=?,EndReason=? WHERE SessionId=?',utc(s.get('closed')),not bool(s.get('closed')),s.get('reason'),s['id'])
+                elif s.get('closed'):
+                    # Only ever close; the scheduler may already have closed it, and must never see it reopened.
+                    db.execute('UPDATE scheduler.AccountSession SET ActualEndUtc=?,IsOpen=0,EndReason=COALESCE(EndReason,?) WHERE SessionId=? AND IsOpen=1',utc(s.get('closed')),s.get('reason'),s['id'])
             for e in entries:
                 opened=e['status'] not in ('closed','failed')
                 if not db.one('SELECT EntryId FROM scheduler.Entry WHERE EntryId=?',e['id']):

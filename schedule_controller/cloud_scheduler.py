@@ -95,6 +95,17 @@ class CloudScheduler:
                 site_id).rowcount
             if released > 0:
                 log.info("Released %s stale lease(s) left by earlier worker runs", released)
+            # Sessions outlive their tables: a bot that busts, fails a join or is no longer seated
+            # keeps its session and gets new joins. The session ends once its planned end has
+            # passed and the planner's leaves have closed its last table.
+            ended = db.execute("""UPDATE s SET IsOpen=0,EndReason=COALESCE(s.EndReason,'planned_end'),
+                    ActualEndUtc=CASE WHEN s.StartedUtc>SYSUTCDATETIME() THEN s.StartedUtc ELSE SYSUTCDATETIME() END
+                FROM scheduler.AccountSession s
+                WHERE s.SiteId=? AND s.IsOpen=1 AND s.PlannedEndUtc<=SYSUTCDATETIME()
+                  AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=s.BotAccountId AND e.IsOpen=1)""",
+                site_id).rowcount
+            if ended > 0:
+                log.info("Closed %s session(s) that reached their planned end with no open tables", ended)
             policies = db.rows("""SELECT p.*,b.IsActive,COALESCE(d.SessionSeconds,0) PlayedSeconds,
                 l.MachineId OwnerMachine,l.RequiresReconciliation,s.SessionId,s.PlannedEndUtc,
                 s.IsManual SessionManual,s.StartedUtc SessionStart,s.MachineId SessionMachine,
@@ -121,8 +132,9 @@ class CloudScheduler:
                 aid = p["BotAccountId"]; policy_by_id[aid] = p
                 previous = aware(p["PreviousEndUtc"])
                 manual = bool(p["SessionManual"])
-                # A manual session is pinned to the machine the operator chose.
-                owner = p["SessionMachine"] if manual else p["OwnerMachine"]
+                # An open session's entries must be on its machine (Entry->AccountSession FK), and a
+                # session can now be open with no tables, so pin the account to the session's machine.
+                owner = p["SessionMachine"] if p["SessionId"] else p["OwnerMachine"]
                 accounts.append(Account(aid, site_id, p["StakeTier"], p["PlayingFrequency"], int(p["PlayedSeconds"]),
                     p["MaxPlaytimeMinutes"], p["MaxTables"], owner,
                     enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"]),
@@ -150,6 +162,10 @@ class CloudScheduler:
                 THEN 'draining' ELSE e.Status END AS PlanningStatus
                 FROM scheduler.Entry e WHERE e.SiteId=? AND e.IsOpen=1""", site_id)
             entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["PlanningStatus"]) for e in entry_rows]
+            # Plan on the database clock, read after every input above. A tick can take tens of
+            # seconds; with the start-of-tick time, heartbeats and lobby observations written during
+            # the tick looked like they came from the future and the planner treated them as stale.
+            stamp = aware(db.one("SELECT SYSUTCDATETIME() AS now")["now"])
             max_actions = max(site["MaxJoinsPerTick"], site["MaxLeavesPerTick"], 1)
             planning_horizon = max(120, site["MaxJoinGapSeconds"] * max_actions + 30)
             settings = Settings(site_id, bands, site["CurrencyCode"], site["MaxJoinsPerTick"], site["MaxLeavesPerTick"],
