@@ -86,6 +86,7 @@ class CloudScheduler:
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
             policies = db.rows("""SELECT p.*,b.IsActive,COALESCE(d.SessionSeconds,0) PlayedSeconds,
                 l.MachineId OwnerMachine,l.RequiresReconciliation,s.SessionId,s.PlannedEndUtc,
+                s.IsManual SessionManual,s.StartedUtc SessionStart,s.MachineId SessionMachine,
                 prior.ActualEndUtc PreviousEndUtc
                 FROM scheduler.AccountPolicy p JOIN dbo.BotAccount b ON b.BotAccountId=p.BotAccountId
                 LEFT JOIN scheduler.AccountDay d ON d.SiteId=p.SiteId AND d.BotAccountId=p.BotAccountId AND d.LocalDate=?
@@ -108,12 +109,16 @@ class CloudScheduler:
             for p in policies:
                 aid = p["BotAccountId"]; policy_by_id[aid] = p
                 previous = aware(p["PreviousEndUtc"])
+                manual = bool(p["SessionManual"])
+                # A manual session is pinned to the machine the operator chose.
+                owner = p["SessionMachine"] if manual else p["OwnerMachine"]
                 accounts.append(Account(aid, site_id, p["StakeTier"], p["PlayingFrequency"], int(p["PlayedSeconds"]),
-                    p["MaxPlaytimeMinutes"], p["MaxTables"], p["OwnerMachine"],
+                    p["MaxPlaytimeMinutes"], p["MaxTables"], owner,
                     enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"]),
                     synthetic=bool(p["IsSynthetic"]), requires_reconciliation=bool(p["RequiresReconciliation"]),
                     eligible_after=previous+timedelta(minutes=p["SessionCooldownMinutes"]) if previous else None,
-                    session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts))
+                    session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts,
+                    manual=manual,session_start=aware(p["SessionStart"]) if manual else None))
             machine_rows = db.rows("SELECT * FROM scheduler.MachineAssignment WHERE SiteId=?", site_id)
             machines = [Machine(m["MachineId"], site_id, m["MaxEntries"], aware(m["LastHeartbeatUtc"] or datetime.min),
                 ready=bool(m["IsReady"]), enabled=bool(m["IsEnabled"]),maintenance=bool(m["MaintenanceTaskId"])) for m in machine_rows]

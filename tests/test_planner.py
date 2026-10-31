@@ -227,3 +227,34 @@ def test_recovery_target_tracks_current_schedule_without_waiting_for_unneeded_en
     assert recovery_target(10,20,10)==8
     assert recovery_target(10,3,2)==1
     assert recovery_target(10,0,2)==0
+
+
+def test_manual_session_plays_even_when_target_is_met_and_on_its_machine():
+    tables = [Table(str(n), 1, D(".1"), 6, 0, NOW) for n in range(3)]
+    machines = [Machine(1, 1, 6, NOW), Machine(2, 1, 6, NOW)]
+    manual = Account(2, 1, "low", manual=True, owner_machine=2, session_end=NOW + timedelta(hours=1))
+    result = run(accounts=[Account(1, 1, "low"), manual], machines=machines, tables=tables,
+                 entries=[Entry("x", 1, 1, "0", "seated")], target=1)
+    assert result.actions and all(a.account == 2 and a.machine == 2 for a in result.actions)
+    assert result.remaining_deficits["low"] == 0
+
+
+def test_manual_session_waits_for_start_but_ignores_cooldown():
+    later = Account(1, 1, "low", manual=True, session_start=NOW + timedelta(minutes=5),
+                    session_end=NOW + timedelta(hours=1))
+    assert not run(accounts=[later], target=0).actions
+    cooling = Account(1, 1, "low", manual=True, eligible_after=NOW + timedelta(minutes=30),
+                      session_end=NOW + timedelta(hours=1))
+    assert run(accounts=[cooling], target=0).actions
+
+
+def test_manual_session_entries_are_not_trimmed_by_target():
+    manual = Account(1, 1, "low", manual=True, session_end=NOW + timedelta(hours=1))
+    result = run(accounts=[manual], entries=[Entry("x", 1, 1, "a", "seated")], target=0)
+    assert not any(a.kind == "leave" for a in result.actions)
+
+
+def test_stopped_manual_session_drains():
+    stopped = Account(1, 1, "low", manual=True, session_end=NOW - timedelta(seconds=1))
+    result = run(accounts=[stopped], entries=[Entry("x", 1, 1, "a", "seated")], target=0)
+    assert [a.kind for a in result.actions] == ["leave"]

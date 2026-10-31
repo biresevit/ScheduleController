@@ -27,6 +27,10 @@ class Account:
     eligible_after: datetime | None = None
     session_end: datetime | None = None
     drain_for_update: bool = False
+    # Operator-created session: plays up to max_tables outside the occupancy target,
+    # ignores the post-session cooldown and starts no earlier than session_start.
+    manual: bool = False
+    session_start: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -141,8 +145,8 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     owners: dict[int, set[int]] = {a.id: ({a.owner_machine} if a.owner_machine is not None else set()) for a in acc.values()}
     for e in active:
         owners[e.account].add(e.machine)
-    current = Counter(acc[e.account].tier for e in active)
-    draining = Counter(acc[e.account].tier for e in active if e.status == "draining")
+    current = Counter(acc[e.account].tier for e in active if not acc[e.account].manual)
+    draining = Counter(acc[e.account].tier for e in active if e.status == "draining" and not acc[e.account].manual)
     machine_count = Counter(e.machine for e in active)
     account_count = Counter(e.account for e in active)
     concentration = Counter((e.machine, e.table) for e in active)
@@ -207,8 +211,8 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
 
     for tier in TIERS:
         excess = max(0, current[tier] - desired[tier] - draining[tier] - planned_departures[tier])
-        candidates = sorted((e for e in active if acc[e.account].tier == tier and e.status in
-                             ("reserved", "seated", "sitting_out") and e.id not in planned_entry_ids),
+        candidates = sorted((e for e in active if acc[e.account].tier == tier and not acc[e.account].manual
+                             and e.status in ("reserved", "seated", "sitting_out") and e.id not in planned_entry_ids),
                             key=lambda e: (e.status != "reserved", -acc[e.account].played_seconds, e.id))
         for e in candidates[:excess]:
             if len(planned_entry_ids) >= settings.max_leaves:
@@ -225,9 +229,10 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
             if (not (a.enabled or simulation and a.synthetic) or a.synthetic and not simulation
                 or not a.credentials_ready and not (simulation and a.synthetic)
                 or a.requires_reconciliation or len(owners[a.id]) > 1 or account_count[a.id] >= a.max_tables
-                or a.eligible_after is not None and now < a.eligible_after
+                or not a.manual and a.eligible_after is not None and now < a.eligible_after
+                or a.manual and a.session_start is not None and now < a.session_start
                 or a.session_end is not None and now >= a.session_end
-                or current[a.tier] >= desired[a.tier]):
+                or not a.manual and current[a.tier] >= desired[a.tier]):
                 continue
             for t in supported.values():
                 if table_tier[t.id] != a.tier or table_count[t.id] >= t.seats or (a.id, t.id) in pairs:
@@ -238,6 +243,9 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                     options.append((a, t, m))
         if not options:
             break
+        manual_options = [o for o in options if o[0].manual]
+        if manual_options:
+            options = manual_options
         under_limit = [o for o in options if o[0].played_seconds < o[0].max_minutes * 60]
         if under_limit:
             options = under_limit
@@ -271,7 +279,8 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                                      soft_limit_override=not bool(under_limit)))
         result.next_join = due_join
         pairs.add((a.id, t.id))
-        current[a.tier] += 1
+        if not a.manual:
+            current[a.tier] += 1
         account_count[a.id] += 1
         machine_count[m.id] += 1
         table_count[t.id] += 1
