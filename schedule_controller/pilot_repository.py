@@ -16,6 +16,36 @@ from .database import connection_string
 NAMES=("richard","kate","john","jeremy","mason","monica","emma","andrew")
 
 
+def iso(value):
+    value=utc(value)
+    return value.isoformat() if value else None
+
+
+# One batch: the table upsert and the seat replacement, set-based.
+LOBBY_SQL="""SET NOCOUNT ON;
+DECLARE @site int=:site,@machine int=:machine,@epoch uniqueidentifier=?,@tables nvarchar(max)=?,@seatTables nvarchar(max)=?,@seats nvarchar(max)=?;
+DECLARE @t TABLE(TableId nvarchar(80) PRIMARY KEY,TableName nvarchar(200),GameType varchar(8),TableType varchar(4),BigBlind decimal(19,4),
+    MinBuyIn decimal(19,4),MaxBuyIn decimal(19,4),MaxSeats smallint,OccupiedSeats smallint,IsOpen bit,ObservedUtc datetime2(3),FullSnapshotUtc datetime2(3));
+INSERT @t SELECT * FROM OPENJSON(@tables) WITH(TableId nvarchar(80) '$.id',TableName nvarchar(200) '$.name',GameType varchar(8) '$.game',
+    TableType varchar(4) '$.type',BigBlind decimal(19,4) '$.bb',MinBuyIn decimal(19,4) '$.min',MaxBuyIn decimal(19,4) '$.max',MaxSeats smallint '$.seats',
+    OccupiedSeats smallint '$.occupied',IsOpen bit '$.open',ObservedUtc datetime2(3) '$.observed',FullSnapshotUtc datetime2(3) '$.snapshot');
+UPDATE l SET TableName=t.TableName,GameType=t.GameType,TableType=t.TableType,BigBlind=t.BigBlind,MinBuyIn=t.MinBuyIn,MaxBuyIn=t.MaxBuyIn,
+    MaxSeats=t.MaxSeats,OccupiedSeats=t.OccupiedSeats,IsOpen=t.IsOpen,ObservedUtc=t.ObservedUtc,FullSnapshotUtc=t.FullSnapshotUtc,
+    ObserverEpoch=@epoch,ObserverMachineId=@machine,SnapshotSequence=l.SnapshotSequence+1
+    FROM scheduler.LobbyTable l JOIN @t t ON l.SiteId=@site AND l.TableId=t.TableId;
+INSERT scheduler.LobbyTable(SiteId,TableId,TableName,GameType,TableType,BigBlind,MinBuyIn,MaxBuyIn,MaxSeats,OccupiedSeats,IsOpen,
+    ObservedUtc,FullSnapshotUtc,ObserverEpoch,CurrencyCode,ObserverMachineId,SnapshotSequence)
+    SELECT @site,t.TableId,t.TableName,t.GameType,t.TableType,t.BigBlind,t.MinBuyIn,t.MaxBuyIn,t.MaxSeats,t.OccupiedSeats,t.IsOpen,
+        t.ObservedUtc,t.FullSnapshotUtc,@epoch,'DEMO',@machine,1
+    FROM @t t WHERE NOT EXISTS(SELECT 1 FROM scheduler.LobbyTable l WHERE l.SiteId=@site AND l.TableId=t.TableId);
+DELETE s FROM scheduler.TableSeat s WHERE s.SiteId=@site AND s.TableId IN (SELECT CONVERT(nvarchar(80),value) FROM OPENJSON(@seatTables));
+INSERT scheduler.TableSeat(SiteId,TableId,SeatIndex,NativePlayerId,Username,BotAccountId,Stack,CurrentBet,InGame,SittingOut,HandId,ObservedUtc)
+    SELECT @site,TableId,SeatIndex,NativePlayerId,Username,BotAccountId,Stack,CurrentBet,InGame,SittingOut,HandId,ObservedUtc
+    FROM OPENJSON(@seats) WITH(TableId nvarchar(80) '$.table',SeatIndex smallint '$.seat',NativePlayerId nvarchar(80) '$.native',
+        Username nvarchar(100) '$.name',BotAccountId int '$.account',Stack decimal(19,4) '$.stack',CurrentBet decimal(19,4) '$.bet',
+        InGame bit '$.in_game',SittingOut bit '$.away',HandId nvarchar(80) '$.hand',ObservedUtc datetime2(3) '$.observed');"""
+
+
 def utc(value):
     return value.replace(tzinfo=None) if value else None
 
@@ -317,16 +347,6 @@ class Repository(ChatRepository,ManualRepository):
             db.execute("UPDATE backoffice.MachineMetadata SET LastAgentUtc=SYSUTCDATETIME() WHERE MachineId=:machine")
             if last_plan:
                 db.execute("UPDATE scheduler.Site SET NextJoinUtc=?,NextLeaveUtc=?,LastReconciledUtc=? WHERE SiteId=:site",utc(next_join),utc(next_leave),utc(last_plan))
-            for t in sorted(tables,key=lambda row:str(row['id'])):
-                values=(t['name'],t['game'],t.get('table_type','RING'),t['bb'],t['minimum'],t['maximum'],t['seats'],t['occupied'],t['open'],utc(t['observed']),utc(t.get('snapshot')),self.epoch,t['id'])
-                if db.one("SELECT TableId FROM scheduler.LobbyTable WHERE SiteId=:site AND TableId=?",t['id']):
-                    db.execute("UPDATE scheduler.LobbyTable SET TableName=?,GameType=?,TableType=?,BigBlind=?,MinBuyIn=?,MaxBuyIn=?,MaxSeats=?,OccupiedSeats=?,IsOpen=?,ObservedUtc=?,FullSnapshotUtc=?,ObserverEpoch=?,ObserverMachineId=:machine,SnapshotSequence=SnapshotSequence+1 WHERE SiteId=:site AND TableId=?",*values)
-                else:
-                    db.execute("INSERT scheduler.LobbyTable(SiteId,TableName,GameType,TableType,BigBlind,MinBuyIn,MaxBuyIn,MaxSeats,OccupiedSeats,IsOpen,ObservedUtc,FullSnapshotUtc,ObserverEpoch,TableId,CurrencyCode,ObserverMachineId,SnapshotSequence) VALUES(:site,?,?,?,?,?,?,?,?,?,?,?,?,?,'DEMO',:machine,1)",*values)
-            for tid,players in sorted(seats.items(),key=lambda item:str(item[0])):
-                db.execute("DELETE scheduler.TableSeat WHERE SiteId=:site AND TableId=?",tid)
-                for p in players:
-                    db.execute("INSERT scheduler.TableSeat(SiteId,TableId,SeatIndex,NativePlayerId,Username,BotAccountId,Stack,CurrentBet,InGame,SittingOut,HandId,ObservedUtc) VALUES(:site,?,?,?,?,?,?,?,?,?,?,?)",tid,p['seat'],p['native_id'],p['name'],p['account'],p['stack'],p['bet'],p['in_game'],p['away'],p['hand'],utc(p['observed']))
             for s in sessions:
                 if not db.one('SELECT SessionId FROM scheduler.AccountSession WHERE SessionId=?',s['id']):
                     db.execute("INSERT scheduler.AccountSession(SessionId,SiteId,BotAccountId,MachineId,WorkerEpoch,StartedUtc,PlannedEndUtc,ActualEndUtc,IsOpen,EndReason) VALUES(?,:site,?,:machine,?,?,?,?,?,?)",s['id'],s['account'],self.epoch,utc(s['start']),utc(s['end']),utc(s.get('closed')),not bool(s.get('closed')),s.get('reason'))
@@ -363,6 +383,30 @@ class Repository(ChatRepository,ManualRepository):
                         db.execute("UPDATE scheduler.AccountDay SET SessionSeconds=SessionSeconds+?,EntrySeconds=EntrySeconds+?,UpdatedUtc=SYSUTCDATETIME() WHERE SiteId=:site AND BotAccountId=? AND LocalDate=?",count,count*span['entries'],span['account'],day)
                     else:
                         db.execute("INSERT scheduler.AccountDay(SiteId,BotAccountId,LocalDate,SessionSeconds,EntrySeconds) VALUES(:site,?,?,?,?)",span['account'],day,count,count*span['entries'])
+        if tables or seats:
+            self.publish_lobby(tables,seats)
+
+    def publish_lobby(self,tables,seats):
+        """Write lobby tables and seats in one round trip, in a transaction of their own.
+
+        Every PC rewrites the same lobby rows each refresh. Writing them row by row inside the
+        journal transaction kept those shared rows locked for seconds per PC, and the PCs
+        queued behind each other for minutes. Heartbeats waited in that queue, so the
+        scheduler saw every machine as stale and planned no joins, and the backoffice counted
+        no confirmed seats until the queue drained.
+        """
+        latest={str(t['id']):t for t in tables}
+        rows=[dict(id=tid,name=t['name'],game=t['game'],type=t.get('table_type','RING'),bb=t['bb'],min=t['minimum'],max=t['maximum'],
+                   seats=t['seats'],occupied=t['occupied'],open=bool(t['open']),observed=iso(t['observed']),snapshot=iso(t.get('snapshot')))
+              for tid,t in sorted(latest.items())]
+        players=[dict(table=str(tid),seat=p['seat'],native=None if p['native_id'] is None else str(p['native_id']),name=p['name'],account=p['account'],
+                      stack=p['stack'],bet=p['bet'],in_game=bool(p['in_game']),away=bool(p['away']),hand=None if p['hand'] is None else str(p['hand']),
+                      observed=iso(p['observed']))
+                 for tid,ps in seats.items() for p in ps]
+        with self.transaction() as db:
+            owned=db.one("SELECT WorkerEpoch FROM scheduler.MachineAssignment WHERE SiteId=:site AND MachineId=:machine")
+            if not owned or str(owned['WorkerEpoch']).lower()!=str(self.epoch).lower(): raise RuntimeError('Worker epoch lost')
+            db.execute(LOBBY_SQL,self.epoch,json.dumps(rows,default=str),json.dumps(sorted(str(t) for t in seats)),json.dumps(players,default=str))
 
     @retry_deadlocks
     def live_view_requests(self):
