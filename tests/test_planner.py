@@ -75,16 +75,40 @@ def test_empty_table_can_be_started_and_last_available_seat_can_be_filled():
     assert len(run(tables=[Table("a", 1, D(".1"), 6, 5, NOW)], target=1).actions) == 1
 
 
-def test_under_daily_limit_is_preferred_then_least_played_over_limit():
+def test_under_daily_limit_is_preferred_then_every_over_limit_account_stays_eligible():
     accounts = [Account(1, 1, "low", played_seconds=10000, max_minutes=120),
                 Account(2, 1, "low", played_seconds=100, max_minutes=120)]
     result = run(accounts=accounts, target=1)
     assert result.actions[0].account == 2
     assert not result.actions[0].soft_limit_override
     accounts[1] = replace(accounts[1], played_seconds=9000)
-    result = run(accounts=accounts, target=1)
-    assert result.actions[0].account == 2
-    assert result.actions[0].soft_limit_override
+    chosen = set()
+    for seed in range(40):
+        result = plan(SETTINGS, NOW, 1, accounts, [Machine(1, 1, 6, NOW)],
+                      [Table("a", 1, D(".1"), 6, 0, NOW)], [], random.Random(seed))
+        assert result.actions[0].soft_limit_override
+        chosen.add(result.actions[0].account)
+    assert chosen == {1, 2}
+
+
+def test_new_logins_come_before_extra_tables_even_past_the_daily_preference():
+    # Only account 1 has time left; the others still get a first table before it gets a second.
+    accounts = [Account(1, 1, "low", played_seconds=0, max_minutes=600)] + \
+               [Account(n, 1, "low", played_seconds=50000, max_minutes=120) for n in (2, 3)]
+    tables = [Table(str(n), 1, D(".1"), 6, 0, NOW) for n in range(6)]
+    result = run(accounts=accounts, tables=tables, machines=[Machine(1, 1, 30, NOW)], target=3)
+    assert [a.account for a in result.actions][0] == 1
+    assert {a.account for a in result.actions} == {1, 2, 3}
+
+
+def test_new_login_goes_to_the_least_loaded_pc():
+    accounts = [Account(n, 1, "low", enabled=n == 9) for n in range(1, 10)]
+    tables = [Table(str(n), 1, D(".1"), 9, 0, NOW) for n in range(9)]
+    entries = [Entry(str(n), n, 1 if n <= 5 else 2, str(n)) for n in range(1, 8)]  # PC 1: 5/10, PC 2: 2/10
+    for seed in range(20):
+        result = plan(SETTINGS, NOW, 9, accounts, [Machine(1, 1, 10, NOW), Machine(2, 1, 10, NOW), Machine(3, 1, 20, NOW)],
+                      tables, entries, random.Random(seed))
+        assert result.actions[0].machine == 3  # 0/20 is the lightest
 
 
 def test_spread_machine_risk_across_same_table():

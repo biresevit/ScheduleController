@@ -269,18 +269,16 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         manual_options = [o for o in options if o[0].manual]
         if manual_options:
             options = manual_options
+        # Establish one session for each available account before assigning
+        # second and third tables, so new logins come before extra tables. The
+        # daily playtime preference only orders accounts with equal table counts.
+        least_tables = min(account_count[o[0].id] for o in options)
+        options = [o for o in options if account_count[o[0].id] == least_tables]
         under_limit = [o for o in options if o[0].played_seconds < o[0].max_minutes * 60]
         if under_limit:
             options = under_limit
-        else:
-            least = min(o[0].played_seconds for o in options)
-            options = [o for o in options if o[0].played_seconds == least]
-        # Establish one session for each available account before assigning
-        # second and third tables. This keeps idle authenticated sessions from
-        # waiting for many reconciliation ticks, while frequency still decides
-        # between accounts with the same number of entries.
-        least_tables = min(account_count[o[0].id] for o in options)
-        options = [o for o in options if account_count[o[0].id] == least_tables]
+        # When every account is past its preference, all stay eligible; the
+        # played-time weight below still favours the least played.
         # A session outlives its tables (bust, failed join, no longer seated): refill it before
         # starting a new session for another account.
         resuming = [o for o in options if o[0].session_end is not None]
@@ -290,9 +288,17 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         chosen = rng.choices(list(available), weights=[FREQUENCY_WEIGHTS[a.frequency] /
                           (1 + a.played_seconds / 3600) for a in available.values()], k=1)[0]
         choices=[o for o in options if o[0].id == chosen]
+        # Two of our accounts from one PC at one table share an IP and a single
+        # point of failure; take another table or PC whenever one is available.
+        apart=[o for o in choices if not concentration[o[2].id, o[1].id]]
+        if apart:
+            choices=apart
+        # A new login goes to the least loaded PC; its later tables stay there.
+        if not owners[chosen]:
+            load=lambda m: machine_count[m.id] / m.capacity
+            lightest=min(load(o[2]) for o in choices)
+            choices=[o for o in choices if load(o[2]) == lightest]
         # Prefer active/populated tables without making the choice deterministic.
-        # Penalising same-machine concentration limits the blast radius of one
-        # machine going offline, while remaining machine capacity breaks ties.
         def table_weight(o):
             _,t,m=o
             population=(table_count[t.id]+1)**2
