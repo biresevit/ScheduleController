@@ -15,6 +15,7 @@ class Database:
             Staged=False,UpdatedUtc=self.now.replace(tzinfo=None))
         t.update(values);self.tasks.append(t);return t
     def rows(self,sql,*args):
+        if 'Immediate=1' in sql:return []
         if 'FROM scheduler.UpdateRollout' in sql:return [{'RolloutId':'rollout','ReleaseId':'release'}]
         if 'FROM scheduler.MachineUpdateTask t' in sql:return self.tasks
         raise AssertionError(sql)
