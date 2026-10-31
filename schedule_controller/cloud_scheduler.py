@@ -84,6 +84,17 @@ class CloudScheduler:
                        for r in db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=?", site_id)]
             target = target_at(windows, stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
+            # A worker restart flags every lease on its machine for reconciliation, but only leases
+            # with open entries get reconciled, and idle-lease cleanup only covers the current run.
+            # Once the new worker is ready, an earlier run's lease whose bot has no open entry cannot
+            # be holding a seat; without this it locks the bot out of all play indefinitely.
+            released = db.execute("""DELETE l FROM scheduler.AccountLease l
+                JOIN scheduler.MachineAssignment a ON a.SiteId=l.SiteId AND a.MachineId=l.MachineId
+                WHERE l.SiteId=? AND l.RequiresReconciliation=1 AND a.IsReady=1 AND a.WorkerEpoch<>l.WorkerEpoch
+                  AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1)""",
+                site_id).rowcount
+            if released > 0:
+                log.info("Released %s stale lease(s) left by earlier worker runs", released)
             policies = db.rows("""SELECT p.*,b.IsActive,COALESCE(d.SessionSeconds,0) PlayedSeconds,
                 l.MachineId OwnerMachine,l.RequiresReconciliation,s.SessionId,s.PlannedEndUtc,
                 s.IsManual SessionManual,s.StartedUtc SessionStart,s.MachineId SessionMachine,
