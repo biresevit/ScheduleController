@@ -251,3 +251,31 @@ def test_resume_rejection_cannot_abort_restart_reconciliation(monkeypatch):
         for task in session.workers.values():task.cancel()
         await asyncio.gather(*session.workers.values(),return_exceptions=True)
     asyncio.run(exercise())
+
+
+def test_live_views_publish_on_state_change_and_heartbeat_only_when_unchanged(monkeypatch):
+    import schedule_controller.pilot as module
+    clock=[100.0]
+    monkeypatch.setattr(module.time,'monotonic',lambda:clock[0])
+    versions={42:1}
+    published=[]
+    class Repo:
+        def live_view_requests(self):return [{'RequestId':'r1','BotAccountId':1,'TableId':'42'}]
+    p=Pilot.__new__(Pilot)
+    p.repo=Repo()
+    p.clients={1:SimpleNamespace(client=SimpleNamespace(state_versions=versions))}
+    async def publish(request):
+        published.append(versions[42]);return True
+    p.publish_live_view=publish
+    steps=iter([
+        lambda:None,                                   # unchanged, inside heartbeat: skip
+        lambda:versions.__setitem__(42,2),             # state changed: publish immediately
+        lambda:clock.__setitem__(0,clock[0]+1.5),      # unchanged but heartbeat due: publish
+    ])
+    async def fake_sleep(_):
+        try:next(steps)()
+        except StopIteration:raise asyncio.CancelledError
+    monkeypatch.setattr(module.asyncio,'sleep',fake_sleep)
+    try:asyncio.run(p.run_live_views())
+    except asyncio.CancelledError:pass
+    assert published==[1,2,2]

@@ -457,7 +457,6 @@ class Pilot:
             await asyncio.to_thread(self.repo.publish,copy.deepcopy(self.tables),copy.deepcopy(self.seats),
                 copy.deepcopy(list(self.entries.values())),copy.deepcopy(self.sessions),spans,ready=ready,
                 next_join=self.next_join,next_leave=self.next_leave,last_plan=self.last_plan)
-            await self.publish_live_views()
             done={s['id'] for s in spans};self.intervals=[s for s in self.intervals if s['id'] not in done]
             summary={'controller_version':getattr(self.args,'controller_version',None),'at':now().isoformat(),'epoch':self.epoch,'target':self.args.target,
                 'entries':Counter(e['status'] for e in self.entries.values()),
@@ -469,40 +468,75 @@ class Pilot:
     async def publish_live_views(self):
         requests=await asyncio.to_thread(self.repo.live_view_requests)
         for request in requests:
-            aid=request['BotAccountId'];tid=int(request['TableId'])
-            session=self.clients.get(aid)
-            state=session.client.states.get(tid) if session else None
-            if not state:
-                continue
-            hero=session.client.hero_seat(state)
-            if hero is None:
-                continue
-            table_info=session.client.tables.get(tid,{})
-            payload={'table_id':str(tid),'table_name':table_info.get('n',str(tid)),
-                'game':{72:'NLH',79:'PLO4',88:'PLO5'}.get(table_info.get('g'),'NLH'),
-                'hero':session.policy['Username'],'hand_id':str(state.get('gi','')),
-                'max_seats':len(state.get('s',[])),
-                'street':{0:'Preflop',1:'Flop',2:'Turn',3:'River'}.get(state.get('m',{}).get('r'),'Complete'),
-                'board':cards(state.get('d',{}).get('c')),'pot':state.get('d',{}).get('p',0)/100,
-                'dealer':state.get('m',{}).get('di'),'acting_seat':None,'seats':[]}
-            acting_seat=state.get('m',{}).get('ai')
-            if isinstance(acting_seat,int) and 0<=acting_seat<len(state.get('s',[])):
-                actor=state['s'][acting_seat]
-                if actor and not actor.get('f',0)&128:
-                    payload['acting_seat']=acting_seat
-            for index,seat in enumerate(state.get('s',[])):
-                if not seat or seat.get('f',0)&128:
-                    continue
-                payload['seats'].append({'seat':index,'name':seat.get('dn') or seat.get('n',''),
-                    'stack':seat.get('c',0)/100,'bet':seat.get('b',0)/100,'in_game':bool(seat.get('d')),
-                    'sitting_out':bool(seat.get('f',0)&1),'hero':index==hero,
-                    'cards':cards(seat.get('d')) if index==hero else []})
-            from poker_controller.manual import options
-            bot=session.bots.get(tid)
-            payload['manual']=options(state,hero,bot.mapper if bot else None)
-            payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
-            await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
+            await self.publish_live_view(request)
         return len(requests)
+
+    async def run_live_views(self):
+        """Publish live snapshots on their own task, as soon as the hero's table state changes.
+
+        Lobby scans, bulk publishes and command claims in the main worker loop can take
+        seconds; sharing that loop left the viewer (and manual control, whose turn controls
+        come from these snapshots) up to 20s behind the real table. The 1s heartbeat keeps
+        the snapshot fresh and carries manual-control acknowledgements between hands.
+        """
+        requests=[];next_requests=0.0;published={}
+        while True:
+            try:
+                tick=time.monotonic()
+                if tick>=next_requests:
+                    requests=await asyncio.to_thread(self.repo.live_view_requests)
+                    next_requests=tick+1
+                    live={str(r['RequestId']) for r in requests}
+                    published={k:v for k,v in published.items() if k in live}
+                for request in requests:
+                    rid=str(request['RequestId']);session=self.clients.get(request['BotAccountId'])
+                    version=session.client.state_versions.get(int(request['TableId'])) if session else None
+                    last=published.get(rid)
+                    if last and last[0]==version and tick-last[1]<1:
+                        continue
+                    if await self.publish_live_view(request):
+                        published[rid]=(version,tick)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception('Live view publishing failed')
+            await asyncio.sleep(.1 if requests else 1)
+
+    async def publish_live_view(self,request):
+        aid=request['BotAccountId'];tid=int(request['TableId'])
+        session=self.clients.get(aid)
+        state=session.client.states.get(tid) if session else None
+        if not state:
+            return False
+        hero=session.client.hero_seat(state)
+        if hero is None:
+            return False
+        table_info=session.client.tables.get(tid,{})
+        payload={'table_id':str(tid),'table_name':table_info.get('n',str(tid)),
+            'game':{72:'NLH',79:'PLO4',88:'PLO5'}.get(table_info.get('g'),'NLH'),
+            'hero':session.policy['Username'],'hand_id':str(state.get('gi','')),
+            'max_seats':len(state.get('s',[])),
+            'street':{0:'Preflop',1:'Flop',2:'Turn',3:'River'}.get(state.get('m',{}).get('r'),'Complete'),
+            'board':cards(state.get('d',{}).get('c')),'pot':state.get('d',{}).get('p',0)/100,
+            'dealer':state.get('m',{}).get('di'),'acting_seat':None,'seats':[]}
+        acting_seat=state.get('m',{}).get('ai')
+        if isinstance(acting_seat,int) and 0<=acting_seat<len(state.get('s',[])):
+            actor=state['s'][acting_seat]
+            if actor and not actor.get('f',0)&128:
+                payload['acting_seat']=acting_seat
+        for index,seat in enumerate(state.get('s',[])):
+            if not seat or seat.get('f',0)&128:
+                continue
+            payload['seats'].append({'seat':index,'name':seat.get('dn') or seat.get('n',''),
+                'stack':seat.get('c',0)/100,'bet':seat.get('b',0)/100,'in_game':bool(seat.get('d')),
+                'sitting_out':bool(seat.get('f',0)&1),'hero':index==hero,
+                'cards':cards(seat.get('d')) if index==hero else []})
+        from poker_controller.manual import options
+        bot=session.bots.get(tid)
+        payload['manual']=options(state,hero,bot.mapper if bot else None)
+        payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
+        await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
+        return True
 
     async def schedule(self):
         stamp=now()
@@ -622,7 +656,7 @@ class Pilot:
         await self.decision.require_evenbet_hand_history()
         await self.configuration()
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
-        chat_task=manual_task=None
+        chat_task=manual_task=live_task=None
         try:
             recovery=await asyncio.to_thread(self.repo.start_cloud_worker)
             await self.reconcile_cloud_entries(recovery)
@@ -634,8 +668,9 @@ class Pilot:
             chat_task=asyncio.create_task(run_chat(self))
             from .manual_worker import run_manual
             manual_task=asyncio.create_task(run_manual(self))
+            live_task=asyncio.create_task(self.run_live_views())
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
-            next_claim=next_live_view=next_telemetry=0.0
+            next_claim=next_telemetry=0.0
             while (not self.args.seconds or now()<self.end) and not (self.output/'stop').exists():
                 tick=time.monotonic()
                 if tick>=next_refresh:
@@ -646,9 +681,6 @@ class Pilot:
                     for row in claimed:
                         self.accept_claim(row)
                     next_claim=tick+1
-                if tick>=next_live_view:
-                    active_requests=await self.publish_live_views()
-                    next_live_view=tick+(1 if active_requests else 2)
                 if tick>=next_telemetry and getattr(self.args,'telemetry_provider',None):
                     try:
                         metrics=await asyncio.to_thread(self.args.telemetry_provider)
@@ -658,6 +690,9 @@ class Pilot:
                     next_telemetry=tick+300
                 await asyncio.sleep(.25)
         finally:
+            if live_task:
+                live_task.cancel()
+                await asyncio.gather(live_task,return_exceptions=True)
             if manual_task:
                 manual_task.cancel()
                 await asyncio.gather(manual_task,return_exceptions=True)

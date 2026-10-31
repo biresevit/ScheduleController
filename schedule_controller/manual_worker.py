@@ -61,4 +61,4 @@ async def run_manual(pilot):
             await asyncio.gather(*pending.values(),return_exceptions=True)
             raise
         except Exception:log.exception('Manual table synchronization failed')
-        await asyncio.sleep(.5)
+        await asyncio.sleep(.25)
