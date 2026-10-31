@@ -100,6 +100,8 @@ class Plan:
     remaining_deficits: dict[str, int] = field(default_factory=dict)
     next_join: datetime | None = None
     next_leave: datetime | None = None
+    # Why each manual-session account got no join option on this pass (account id -> reason).
+    manual_blocked: dict[int, str] = field(default_factory=dict)
 
 
 def plan(settings: Settings, now: datetime, target: int, accounts: list[Account], machines: list[Machine],
@@ -219,6 +221,27 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                 break
             schedule_departure(e)
             # Leave capacity is retained until confirmation. Do not replace in this pass.
+
+    for a in acc.values():
+        if not a.manual or account_count[a.id] >= a.max_tables:
+            continue
+        pinned = sorted(owners[a.id])
+        reason = ("disabled or missing credentials" if not a.enabled or not a.credentials_ready else
+                  "lease needs reconciliation" if a.requires_reconciliation else
+                  f"pinned to several machines {pinned}" if len(pinned) > 1 else
+                  "session not started" if a.session_start is not None and now < a.session_start else
+                  "session ended" if a.session_end is not None and now >= a.session_end else None)
+        if reason is None and not any(not m.maintenance and machine_count[m.id] < m.capacity and (not pinned or m.id in pinned)
+                                      for m in ready.values()):
+            details = [f"{m.id}: enabled={m.enabled} ready={m.ready} maintenance={m.maintenance} "
+                       f"heartbeat_age={(now - m.heartbeat.astimezone(timezone.utc)).total_seconds():.0f}s "
+                       f"entries={machine_count[m.id]}/{m.capacity}" for m in mach.values() if m.id in pinned]
+            reason = f"machine not usable ({'; '.join(details) or 'none pinned'})"
+        if reason is None and not any(table_tier[t.id] == a.tier and table_count[t.id] < t.seats and (a.id, t.id) not in pairs
+                                      for t in supported.values()):
+            reason = f"no fresh {a.tier} table with a free seat"
+        if reason:
+            result.manual_blocked[a.id] = reason
 
     due_join = max(now, next_join or now)
     for _ in range(settings.max_joins):

@@ -162,6 +162,8 @@ class CloudScheduler:
                 last_planned_at=aware(site["LastReconciledUtc"]))
             if "reconciliation_cooldown" in result.reasons:
                 return {"site_id": site_id, "target": target, "status": "cooldown", "actions": 0}
+            for account, reason in result.manual_blocked.items():
+                log.info("Manual session for account %s cannot join: %s", account, reason)
             created = 0
             any_join_proposed = False
             last_successful_join_due = None
@@ -199,12 +201,18 @@ class CloudScheduler:
         return session_id
 
     def _create_join(self, db, site, action, policy, machine, rng):
-        if not machine or not machine["WorkerEpoch"]: return False
-        if machine.get("MaintenanceTaskId"): return False
+        def refuse(reason):
+            log.info("Planned join for account %s on machine %s not created: %s", action.account, action.machine, reason)
+            return False
+        if not machine or not machine["WorkerEpoch"]: return refuse("machine has no worker epoch")
+        if machine.get("MaintenanceTaskId"): return refuse("machine is updating")
         epoch = machine["WorkerEpoch"]
         lease = db.one("SELECT * FROM scheduler.AccountLease WITH(UPDLOCK,HOLDLOCK) WHERE BotAccountId=?", action.account)
         if lease and (lease["MachineId"] != action.machine or str(lease["WorkerEpoch"]).lower() != str(epoch).lower()
-                      or lease["RequiresReconciliation"]): return False
+                      or lease["RequiresReconciliation"]):
+            return refuse(f"account is leased by machine {lease['MachineId']} (epoch match="
+                          f"{str(lease['WorkerEpoch']).lower() == str(epoch).lower()}, needs reconciliation="
+                          f"{bool(lease['RequiresReconciliation'])})")
         if not lease:
             db.execute("""INSERT scheduler.AccountLease(BotAccountId,SiteId,MachineId,WorkerEpoch,LeaseToken,
                 LeaseUntilUtc,LastConfirmedUtc) VALUES(?,?,?,?,?,DATEADD(second,90,SYSUTCDATETIME()),SYSUTCDATETIME())""",

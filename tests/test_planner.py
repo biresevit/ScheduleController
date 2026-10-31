@@ -258,3 +258,14 @@ def test_stopped_manual_session_drains():
     stopped = Account(1, 1, "low", manual=True, session_end=NOW - timedelta(seconds=1))
     result = run(accounts=[stopped], entries=[Entry("x", 1, 1, "a", "seated")], target=0)
     assert [a.kind for a in result.actions] == ["leave"]
+
+
+def test_manual_session_reports_why_it_cannot_join():
+    offline = Machine(2, 1, 6, NOW - timedelta(minutes=5))
+    manual = Account(1, 1, "low", manual=True, owner_machine=2, session_end=NOW + timedelta(hours=1))
+    result = run(accounts=[manual], machines=[Machine(1, 1, 6, NOW), offline])
+    assert not result.actions
+    assert result.manual_blocked[1].startswith("machine not usable (2:")
+    started_later = Account(1, 1, "low", manual=True, session_start=NOW + timedelta(minutes=5),
+                            session_end=NOW + timedelta(hours=1))
+    assert run(accounts=[started_later]).manual_blocked == {1: "session not started"}
