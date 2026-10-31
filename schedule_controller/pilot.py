@@ -578,7 +578,7 @@ class Pilot:
         payload={'table_id':str(tid),'table_name':table_info.get('n',str(tid)),
             'game':{72:'NLH',79:'PLO4',88:'PLO5'}.get(table_info.get('g'),'NLH'),
             'hero':session.policy['Username'],'hand_id':str(state.get('gi','')),
-            'max_seats':len(state.get('s',[])),
+            'max_seats':len(state.get('s',[])),'big_blind':(table_info.get('bb') or 0)/100,
             'street':{0:'Preflop',1:'Flop',2:'Turn',3:'River'}.get(state.get('m',{}).get('r'),'Complete'),
             'board':cards(state.get('d',{}).get('c')),'pot':state.get('d',{}).get('p',0)/100,
             'dealer':state.get('m',{}).get('di'),'acting_seat':None,'seats':[]}
