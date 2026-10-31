@@ -56,6 +56,9 @@ class Session:
         self.observed={}
         self.rit_responses=set()
         self.rit_tasks=set()
+        self.bust_tasks=set()
+        # Pilot hook: on_bust_result(tid, amount) after a rebuy, (tid, None) when the seat should be left.
+        self.on_bust_result=None
         self.ready=asyncio.Event()
         self.ready.set()
         self.attach_observer(self.client,self.observed)
@@ -220,20 +223,63 @@ class Session:
         await self.client.join(tid)
         if self.client.hero_seat(self.client.states[tid]) is not None:
             raise RuntimeError('Unexpected existing seat requires reconciliation')
-        limits=await self.client.buy_in_range(tid)
-        minimum=Decimal(limits['minAmount'])/100; maximum=Decimal(limits['maxAmount'])/100
-        bb=Decimal(info['bb'])/100
-        try:
-            amount=choose_buy_in(json.loads(self.policy['BuyInPolicyJson']),bb,minimum,maximum,maximum,rng)
-        except ValueError as error:
-            raise ValueError(f'{error}. Server buy-in range: {minimum}?{maximum} chips; big blind: {bb}.') from error
+        amount=await self.buy_in_amount(tid,rng)
         post=rng.random()<float(self.policy['PostBbChance'])
         await self.client.sit(tid,str(amount),wait_big_blind=not post)
-        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid))
+        self.bots[tid]=self.new_bot(tid)
         self.queues[tid]=asyncio.Queue(maxsize=1)
         self.workers[tid]=asyncio.create_task(self.worker(tid))
         self.queues[tid].put_nowait(copy.deepcopy(self.client.states[tid]))
         return amount
+
+    async def buy_in_amount(self,tid,rng):
+        limits=await self.client.buy_in_range(tid)
+        minimum=Decimal(limits['minAmount'])/100; maximum=Decimal(limits['maxAmount'])/100
+        bb=Decimal(self.client.tables[tid]['bb'])/100
+        try:
+            return choose_buy_in(json.loads(self.policy['BuyInPolicyJson']),bb,minimum,maximum,maximum,rng)
+        except ValueError as error:
+            raise ValueError(f'{error}. Server buy-in range: {minimum}?{maximum} chips; big blind: {bb}.') from error
+
+    def new_bot(self,tid):
+        return Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid),on_bust=self.bust)
+
+    def bust(self,tid):
+        task=asyncio.create_task(self.rebuy_or_leave(tid))
+        task.bust_table=tid
+        self.bust_tasks.add(task)
+        task.add_done_callback(self.bust_tasks.discard)
+
+    async def rebuy_or_leave(self,tid):
+        """After losing the whole stack, buy back in with the account's ring rebuy chance, else leave."""
+        try:
+            await asyncio.sleep(self.rng.uniform(3,8)) # A person reads the result before the dialog.
+            await self.ready.wait()
+            bot=self.bots.get(tid);state=self.client.states.get(tid,{});hero=self.client.hero_seat(state)
+            if not bot or bot.leaving or hero is None or tid in self.failures:return
+            if state['s'][hero].get('c',0) or state['s'][hero].get('b',0):
+                bot.busted=False;return # The final snapshot credited chips after all.
+            chance=self.policy.get('RebuyRingChance')
+            chance=.8 if chance is None else float(chance)
+            if self.rng.random()<chance:
+                try:
+                    amount=await self.buy_in_amount(tid,self.rng)
+                    post=self.rng.random()<float(self.policy['PostBbChance'])
+                    await self.client.rebuy(tid,str(amount),wait_big_blind=not post)
+                    log.info('REBUY %s table=%s amount=%s',self.policy['Username'],tid,amount)
+                    if self.on_bust_result:self.on_bust_result(tid,amount)
+                    return
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    log.warning('Rebuy failed for %s / %s: %s; leaving the table',self.policy['Username'],tid,exc)
+            else:
+                log.info('BUSTED %s table=%s; leaving without a rebuy (chance %s)',self.policy['Username'],tid,chance)
+            if self.on_bust_result:self.on_bust_result(tid,None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception('Bust handling failed for %s / %s',self.policy['Username'],tid)
 
     def table_control(self,tid):
         if not self.repo:return None
@@ -256,7 +302,7 @@ class Session:
         state=self.client.states.get(tid,state)
         hero=self.client.hero_seat(state)
         if hero is None:return None
-        self.bots[tid]=Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid))
+        self.bots[tid]=self.new_bot(tid)
         self.queues[tid]=asyncio.Queue(maxsize=1)
         self.workers[tid]=asyncio.create_task(self.worker(tid))
         self.queues[tid].put_nowait(copy.deepcopy(state))
@@ -267,9 +313,14 @@ class Session:
         for task in list(self.rit_tasks):
             if getattr(task,'rit_table',None)==tid:
                 task.cancel()
+        for task in list(self.bust_tasks):
+            if getattr(task,'bust_table',None)==tid and task is not asyncio.current_task():
+                task.cancel()
         if tid in self.bots:
             self.bots[tid].leaving=True # An intentional break: the bot must not press I'm back.
-        if finish and tid in self.bots and tid not in self.failures:
+        state=self.client.states.get(tid,{});hero=self.client.hero_seat(state)
+        broke=hero is not None and not state['s'][hero].get('c',0) and not state['s'][hero].get('b',0)
+        if finish and not broke and tid in self.bots and tid not in self.failures:
             await self.client.player_command(tid,47) # Away after this hand.
             def finished(s):
                 hero=self.client.hero_seat(s)
@@ -286,8 +337,9 @@ class Session:
     async def close(self):
         for t in self.workers.values(): t.cancel()
         for t in self.rit_tasks: t.cancel()
+        for t in self.bust_tasks: t.cancel()
         if self.pump: self.pump.cancel()
-        await asyncio.gather(*self.workers.values(),*self.rit_tasks,*([self.pump] if self.pump else []),return_exceptions=True)
+        await asyncio.gather(*self.workers.values(),*self.rit_tasks,*self.bust_tasks,*([self.pump] if self.pump else []),return_exceptions=True)
         await self.client.close()
 
 
@@ -319,9 +371,18 @@ class Pilot:
             if existing:
                 return existing
             session=Session(self.policies[aid],self.decision,self.rng,repo=self.repo)
+            session.on_bust_result=lambda tid,amount,aid=aid:self.bust_result(aid,tid,amount)
             await session.open('play task')
             self.clients[aid]=session
             return session
+
+    def bust_result(self,aid,tid,amount):
+        """Count a rebuy into the entry's buy-in, or leave a seat that has no chips left."""
+        e=next((x for x in self.entries.values() if x['account']==aid and int(x['table'])==tid
+                and x['status'] in ('seated','sitting_out')),None)
+        if not e:return
+        if amount is not None:e['buy_in']=Decimal(str(e.get('buy_in') or 0))+Decimal(str(amount))
+        else:self.start_leave(e)
 
     async def close_session_if_idle(self,aid):
         """Log out after the account's final planned or active entry closes."""
@@ -529,10 +590,15 @@ class Pilot:
         for index,seat in enumerate(state.get('s',[])):
             if not seat or seat.get('f',0)&128:
                 continue
+            # Opponents' cards are hidden (-1) until they show them at showdown.
+            shown=cards(seat.get('d'))
             payload['seats'].append({'seat':index,'name':seat.get('dn') or seat.get('n',''),
                 'stack':seat.get('c',0)/100,'bet':seat.get('b',0)/100,'in_game':bool(seat.get('d')),
                 'sitting_out':bool(seat.get('f',0)&1),'hero':index==hero,
-                'cards':cards(seat.get('d')) if index==hero else []})
+                'cards':shown if index==hero or all(shown) else []})
+        result=getattr(session.client,'results',{}).get(tid)
+        if result:
+            payload['result']={'hand_id':str(result['hand_id'] or ''),'winners':result['winners']}
         from poker_controller.manual import options,clock
         bot=session.bots.get(tid)
         payload['clock']=clock(state,getattr(session.client,'state_times',{}).get(tid),time.time())
@@ -584,6 +650,9 @@ class Pilot:
 
     async def execute(self,e,cmd,kind):
         c=None;tid=int(e['table'])
+        if kind=='leave' and e['status'] in ('closed','failed'):
+            # The worker already left on its own, e.g. after a bust without a rebuy.
+            cmd.update(status='succeeded',result='already_closed');await self.publish();return
         cmd['status']='claimed'
         e['status']='joining' if kind=='join' else 'draining'
         try:
@@ -829,7 +898,8 @@ class Pilot:
 
     def start_leave(self,e):
         e['status']='draining'
-        cmd={'id':guid(),'kind':'leave','status':'pending','due':now(),'version':self.config['site']['ConfigVersion']}
+        # Claimed from the start: a publish before the job runs must not offer it to claim_due.
+        cmd={'id':guid(),'kind':'leave','status':'claimed','due':now(),'version':self.config['site']['ConfigVersion']}
         e['commands'].append(cmd)
         self.jobs[e['id']]=asyncio.create_task(self.execute_serialized(e,cmd,'leave'))
 
