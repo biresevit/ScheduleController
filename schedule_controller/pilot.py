@@ -388,6 +388,12 @@ class Pilot:
             await asyncio.to_thread(self.repo.release_observer,temporary.policy['BotAccountId'])
             log.info('Logout confirmed after lobby scan: %s',temporary.policy['Username'])
         stamp=now(); native={c.client.player_id:aid for aid,c in self.clients.items()}
+        # Our own accounts are split across machines; the observer that happens
+        # to run this scan only has this machine's accounts in self.clients.
+        # Fall back to matching on username so a seat held by an account logged
+        # in from another machine still resolves instead of being counted as an
+        # unknown occupant on every scan.
+        by_username={p['Username'].casefold():aid for aid,p in getattr(self,'policies',{}).items()}
         self.tables=[];self.seats={}
         for tid,info in self.info.items():
             state=observer_states.get(tid,{})
@@ -399,7 +405,8 @@ class Pilot:
                 'bb':Decimal(info['bb'])/100,'minimum':Decimal(info.get('mn',0))/100,'maximum':Decimal(info.get('mx',0))/100,
                 'seats':info['mp'],'occupied':len(live),'open':True,'observed':stamp,'snapshot':stamp_state})
             self.seats[str(tid)]=[{'seat':i,'native_id':str(s.get('i','')),'name':s.get('dn') or s.get('n',''),
-                'account':native.get(s.get('i')),'stack':Decimal(s.get('c',0))/100,'bet':Decimal(s.get('b',0))/100,
+                'account':native.get(s.get('i')) or by_username.get((s.get('dn') or s.get('n','')).casefold()),
+                'stack':Decimal(s.get('c',0))/100,'bet':Decimal(s.get('b',0))/100,
                 'in_game':bool(s.get('d')),'away':bool(s.get('f',0)&1),'hand':str(state.get('gi','')),'observed':stamp_state} for i,s in live]
         await self.reconcile_observed_entries()
 
