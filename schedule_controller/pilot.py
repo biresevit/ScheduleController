@@ -59,6 +59,10 @@ class Session:
         self.bust_tasks=set()
         # Pilot hook: on_bust_result(tid, amount) after a rebuy, (tid, None) when the seat should be left.
         self.on_bust_result=None
+        # Pilot hook: on_break_change(tables, True) when the account sits out for a break, (tables, False) after.
+        self.on_break_change=None
+        self.break_until=None
+        self.breaker=None
         self.ready=asyncio.Event()
         self.ready.set()
         self.attach_observer(self.client,self.observed)
@@ -80,7 +84,92 @@ class Session:
     async def open(self,purpose='play task'):
         await self.client.open()
         self.pump=asyncio.create_task(self.receive())
+        if purpose=='play task':self.breaker=asyncio.create_task(self.run_breaks())
         log.info('Login confirmed for %s: %s',purpose,self.policy['Username'])
+
+    def next_break_after(self):
+        p=self.policy;low=int(p.get('BreakAfterMinSeconds') or 1200);high=max(low,int(p.get('BreakAfterMaxSeconds') or 3600))
+        return self.rng.uniform(low,high)
+
+    def break_length(self):
+        p=self.policy;low=int(p.get('BreakMinSeconds') or 10);high=max(low,int(p.get('BreakMaxSeconds') or 300))
+        return low+(high-low)*self.rng.betavariate(1,3) # Mostly short breaks, occasionally long ones.
+
+    def playing_tables(self):
+        return [tid for tid,bot in self.bots.items() if tid in self.queues and tid not in self.failures
+                and not bot.leaving and not bot.busted and not bot.on_break]
+
+    async def run_breaks(self,tick=5):
+        """Count active play time; when the sampled break point is reached, take a break on every table."""
+        remaining=self.next_break_after()
+        while True:
+            await asyncio.sleep(tick)
+            if not self.ready.is_set() or not self.playing_tables():
+                continue # The clock only runs while the account is playing.
+            remaining-=tick
+            if remaining>0:
+                continue
+            try:
+                await self.take_break()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception('Break failed for %s',self.policy['Username'])
+            remaining=self.next_break_after()
+
+    async def take_break(self):
+        """Sit out after the current hand on all tables at once, wait, then press I'm back on each.
+
+        One simulated person never plays some tables while away from others. Tables under manual
+        control are left to the human; a leave started during the break wins over returning.
+        """
+        tables=[]
+        for tid in self.playing_tables():
+            bot=self.bots[tid]
+            if bot.control and await bot.control.manual_enabled():
+                continue
+            tables.append(tid)
+        if not tables:
+            return
+        length=self.break_length()
+        try:
+            for tid in tables:
+                self.bots[tid].on_break=True
+                try:await self.client.sit_out_next_hand(tid)
+                except Exception as exc:log.warning('Break sit-out not accepted for %s / %s: %s',self.policy['Username'],tid,exc)
+            if self.on_break_change:self.on_break_change(tables,True)
+            def away(state):
+                hero=self.client.hero_seat(state)
+                return hero is None or bool(state['s'][hero].get('f',0)&1)
+            async def finish_hand(tid):
+                try:await self.client.wait_state(tid,away,timeout=180)
+                except TimeoutError:log.warning('Hand did not finish before the break for %s / %s',self.policy['Username'],tid)
+            await asyncio.gather(*(finish_hand(tid) for tid in tables))
+            self.break_until=time.time()+length
+            log.info('BREAK %s: away from %s tables for %ss',self.policy['Username'],len(tables),round(length))
+            await asyncio.sleep(length)
+        except asyncio.CancelledError:
+            # Logging out or reconnecting: never press I'm back from a closing session.
+            for tid in tables:
+                if tid in self.bots:self.bots[tid].on_break=False
+            self.break_until=None
+            raise
+        except Exception:
+            log.exception('Break interrupted for %s; returning to the tables',self.policy['Username'])
+        back=[]
+        for tid in tables:
+            bot=self.bots.get(tid)
+            if not bot or not bot.on_break:continue
+            bot.on_break=False
+            if bot.leaving or tid not in self.queues or (bot.control and await bot.control.manual_enabled()):continue
+            state=self.client.states.get(tid,{});hero=self.client.hero_seat(state)
+            if hero is not None and state['s'][hero].get('f',0)&1:
+                try:await self.client.sit_back(tid)
+                except Exception as exc:log.warning('I\'m back not accepted after a break for %s / %s: %s',self.policy['Username'],tid,exc)
+            back.append(tid)
+        self.break_until=None
+        if self.on_break_change and back:self.on_break_change(back,False)
+        log.info('BREAK over for %s: back on %s tables',self.policy['Username'],len(back))
 
     async def receive(self):
         while True:
@@ -347,8 +436,9 @@ class Session:
         for t in self.workers.values(): t.cancel()
         for t in self.rit_tasks: t.cancel()
         for t in self.bust_tasks: t.cancel()
-        if self.pump: self.pump.cancel()
-        await asyncio.gather(*self.workers.values(),*self.rit_tasks,*self.bust_tasks,*([self.pump] if self.pump else []),return_exceptions=True)
+        extra=[t for t in (self.pump,getattr(self,'breaker',None)) if t]
+        for t in extra: t.cancel()
+        await asyncio.gather(*self.workers.values(),*self.rit_tasks,*self.bust_tasks,*extra,return_exceptions=True)
         await self.client.close()
 
 
@@ -381,6 +471,7 @@ class Pilot:
                 return existing
             session=Session(self.policies[aid],self.decision,self.rng,repo=self.repo)
             session.on_bust_result=lambda tid,amount,aid=aid:self.bust_result(aid,tid,amount)
+            session.on_break_change=lambda tables,away,aid=aid:self.break_change(aid,tables,away)
             await session.open('play task')
             self.clients[aid]=session
             return session
@@ -392,6 +483,12 @@ class Pilot:
         if not e:return
         if amount is not None:e['buy_in']=Decimal(str(e.get('buy_in') or 0))+Decimal(str(amount))
         else:self.start_leave(e)
+
+    def break_change(self,aid,tables,away):
+        """A break keeps the seats (they still count toward the target) but shows them as sitting out."""
+        for e in self.entries.values():
+            if e['account']==aid and int(e['table']) in tables and e['status'] in ('seated','sitting_out'):
+                e['status']='sitting_out' if away else 'seated'
 
     async def close_session_if_idle(self,aid):
         """Log out after the account's final planned or active entry closes."""
@@ -614,6 +711,8 @@ class Pilot:
         payload['manual']=options(state,hero,bot.mapper if bot else None)
         payload['manual']['sit_out_pending']=bool(bot and bot.sit_out_requested and not payload['manual']['away'])
         payload['manual']['leaving']=bool(bot and bot.leaving)
+        payload['manual']['on_break']=bool(bot and bot.on_break)
+        payload['manual']['break_seconds']=max(0,round(session.break_until-time.time())) if bot and bot.on_break and getattr(session,'break_until',None) else None
         payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
         await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
         return True
