@@ -236,10 +236,19 @@ class Session:
         limits=await self.client.buy_in_range(tid)
         minimum=Decimal(limits['minAmount'])/100; maximum=Decimal(limits['maxAmount'])/100
         bb=Decimal(self.client.tables[tid]['bb'])/100
+        weights=json.loads(self.policy['BuyInPolicyJson'])
         try:
-            return choose_buy_in(json.loads(self.policy['BuyInPolicyJson']),bb,minimum,maximum,maximum,rng)
+            return choose_buy_in(weights,bb,minimum,maximum,maximum,rng)
         except ValueError as error:
-            raise ValueError(f'{error}. Server buy-in range: {minimum}?{maximum} chips; big blind: {bb}.') from error
+            if maximum<minimum or bb<=0:
+                raise ValueError(f'{error}. Server buy-in range: {minimum}–{maximum} chips; big blind: {bb}.') from error
+        # No configured amount is legal, typically when rejoining soon after leaving: the server
+        # then demands the stack the account left with. Buy in for the legal amount closest to
+        # the account's most likely choice (exactly that stack when the range is one value).
+        preferred=max((w,k) for k,w in weights.items() if k!='irregular' and w)[1] if any(w for k,w in weights.items() if k!='irregular') else 100
+        amount=min(maximum,max(minimum,(Decimal(preferred)*bb).quantize(Decimal('0.01'))))
+        log.info('Buy-in for %s / %s: no configured amount fits %s–%s; using %s',self.policy['Username'],tid,minimum,maximum,amount)
+        return amount
 
     def new_bot(self,tid):
         return Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid),on_bust=self.bust)

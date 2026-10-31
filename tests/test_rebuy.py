@@ -119,3 +119,16 @@ def test_live_view_shows_the_winner_and_shown_cards():
     asyncio.run(p.publish_live_views())
     assert [s['cards'] for s in captured['seats']]==[['6d','jc'],[],['4c','4d']]
     assert captured['result']=={'hand_id':'9','winners':winners}
+
+
+def test_buy_in_falls_back_to_the_only_legal_amount_when_rejoining():
+    session=busted_session(1)
+    session.client.buy_in_range=AsyncMock(return_value={'minAmount':39293,'maxAmount':39293})
+    assert asyncio.run(session.buy_in_amount(7,random.Random(1)))==Decimal('392.93')
+
+
+def test_buy_in_falls_back_to_the_closest_legal_amount():
+    session=busted_session(1)
+    session.policy['BuyInPolicyJson']=json.dumps({'20':5,'100':65,'200':20,'irregular':10})
+    session.client.buy_in_range=AsyncMock(return_value={'minAmount':41000,'maxAmount':45000})  # 205–225 BB at BB 2
+    assert asyncio.run(session.buy_in_amount(7,random.Random(1)))==Decimal('410.00')
