@@ -205,5 +205,8 @@ def finish_recovery(db,task,rollout,stamp):
     actual=db.one("SELECT COUNT(*) AS n FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1 AND Status IN ('seated','sitting_out','draining')",sid,mid)['n']
     db.execute('UPDATE scheduler.MachineUpdateTask SET RecoveryTarget=?,Detail=? WHERE TaskId=?',needed,f'Traffic recovery: {actual}/{needed} entries required before the next PC.',tid)
     same=str(task['CurrentReleaseId']).lower()==str(rollout['ReleaseId']).lower()
-    if agent_fresh and task['AgentHeartbeat']>=now-timedelta(seconds=15) and task['AppsHealthy'] and worker_fresh and task['LastHeartbeatUtc']>=now-timedelta(seconds=45) and same and actual>=needed and task['UpdatedUtc']<=now-timedelta(seconds=60):
+    # The agent verified versions and a fresh worker heartbeat before reporting 'resuming'. Workers publish
+    # every 15-90 s under load, so stricter freshness here (or the agent's 45 s AppsHealthy flag) only made
+    # completion wait for a lucky tick.
+    if agent_fresh and worker_fresh and same and actual>=needed and task['UpdatedUtc']<=now-timedelta(seconds=60):
         db.execute("UPDATE scheduler.MachineUpdateTask SET Status='completed',CompletedUtc=?,UpdatedUtc=?,Detail='Healthy; traffic recovered.' WHERE TaskId=?",now,now,tid)

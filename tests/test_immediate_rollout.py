@@ -82,3 +82,17 @@ def test_immediate_pc_completes_without_waiting_for_traffic():
         db.rollout.update(Immediate=immediate, ReleaseId='old')
         finish_recovery(db, task(1, 'resuming') | {'UpdatedUtc': old}, db.rollout, NOW)
         assert bool(db.moved('completed')) is done
+
+
+def test_completion_tolerates_slow_worker_publishes():
+    old = (NOW - timedelta(minutes=2)).replace(tzinfo=None)
+    db = Database([])
+    db.rollout.update(Immediate=True, ReleaseId='old')
+    slow = task(1, 'resuming') | {'UpdatedUtc': old, 'AppsHealthy': False,
+                                  'LastHeartbeatUtc': (NOW - timedelta(seconds=100)).replace(tzinfo=None)}
+    finish_recovery(db, slow, db.rollout, NOW)
+    assert db.moved('completed')
+    db = Database([])
+    db.rollout.update(Immediate=True, ReleaseId='old')
+    finish_recovery(db, slow | {'IsReady': False}, db.rollout, NOW)  # A stopped worker never completes.
+    assert not db.moved('completed')
