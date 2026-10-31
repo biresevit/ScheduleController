@@ -23,10 +23,39 @@ class ManualRepository:
             self._manual_lock(db,aid,tid);mode=self._manual_mode(db,aid,tid)
             db.execute("""UPDATE scheduler.ManualTableAction SET Status='expired',ResultText='The turn or manual-control lease ended.',UpdatedUtc=SYSUTCDATETIME()
                 WHERE SiteId=:site AND MachineId=:machine AND BotAccountId=? AND TableId=? AND Status='queued'
+                  AND Action NOT IN ('sit_out','sit_in')
                   AND (TurnKey<>? OR RequestId<>? OR WorkerEpoch<>?)""",aid,str(tid),key,mode['RequestId'] if mode else '00000000-0000-0000-0000-000000000000',self.epoch)
             if not mode:return False,None
-            command=db.one("SELECT TOP(1) * FROM scheduler.ManualTableAction WHERE RequestId=? AND TurnKey=? AND Status='queued' ORDER BY CreatedUtc",mode['RequestId'],key)
+            command=db.one("SELECT TOP(1) * FROM scheduler.ManualTableAction WHERE RequestId=? AND TurnKey=? AND Status='queued' AND Action NOT IN ('sit_out','sit_in') ORDER BY CreatedUtc",mode['RequestId'],key)
             return True,command
+
+    @retry_deadlocks
+    def manual_enabled(self,aid,tid):
+        with self.transaction() as db:
+            return bool(self._manual_mode(db,aid,tid))
+
+    @retry_deadlocks
+    def claim_table_command(self,aid,tid):
+        """Claim the oldest queued sit-out / I'm-back command; they are not tied to a turn."""
+        with self.transaction() as db:
+            self._manual_lock(db,aid,tid);mode=self._manual_mode(db,aid,tid)
+            stale="""UPDATE scheduler.ManualTableAction SET Status='expired',ResultText='Manual control ended before the command was sent.',UpdatedUtc=SYSUTCDATETIME()
+                WHERE SiteId=:site AND MachineId=:machine AND BotAccountId=? AND TableId=? AND Status='queued' AND Action IN ('sit_out','sit_in')"""
+            if not mode:
+                db.execute(stale,aid,str(tid));return None
+            db.execute(stale+" AND (RequestId<>? OR WorkerEpoch<>?)",aid,str(tid),mode['RequestId'],self.epoch)
+            command=db.one("""SELECT TOP(1) * FROM scheduler.ManualTableAction WHERE RequestId=? AND Status='queued'
+                AND Action IN ('sit_out','sit_in') ORDER BY CreatedUtc""",mode['RequestId'])
+            if command:
+                db.execute("UPDATE scheduler.ManualTableAction SET Status='submitted',UpdatedUtc=SYSUTCDATETIME() WHERE ActionId=?",command['ActionId'])
+            return command
+
+    @retry_deadlocks
+    def release_turn(self,aid,tid,key):
+        """Let the operator choose again after the table refused a manual action for this turn."""
+        with self.transaction() as db:
+            self._manual_lock(db,aid,tid)
+            db.execute("DELETE scheduler.TableActionClaim WHERE SiteId=:site AND BotAccountId=? AND TableId=? AND TurnKey=? AND Source='manual'",aid,str(tid),key)
 
     @retry_deadlocks
     def claim_table_action(self,aid,tid,key,command=None):

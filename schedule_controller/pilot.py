@@ -267,6 +267,8 @@ class Session:
         for task in list(self.rit_tasks):
             if getattr(task,'rit_table',None)==tid:
                 task.cancel()
+        if tid in self.bots:
+            self.bots[tid].leaving=True # An intentional break: the bot must not press I'm back.
         if finish and tid in self.bots and tid not in self.failures:
             await self.client.player_command(tid,47) # Away after this hand.
             def finished(s):
@@ -531,9 +533,12 @@ class Pilot:
                 'stack':seat.get('c',0)/100,'bet':seat.get('b',0)/100,'in_game':bool(seat.get('d')),
                 'sitting_out':bool(seat.get('f',0)&1),'hero':index==hero,
                 'cards':cards(seat.get('d')) if index==hero else []})
-        from poker_controller.manual import options
+        from poker_controller.manual import options,clock
         bot=session.bots.get(tid)
+        payload['clock']=clock(state,getattr(session.client,'state_times',{}).get(tid),time.time())
         payload['manual']=options(state,hero,bot.mapper if bot else None)
+        payload['manual']['sit_out_pending']=bool(bot and bot.sit_out_requested and not payload['manual']['away'])
+        payload['manual']['leaving']=bool(bot and bot.leaving)
         payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
         await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
         return True
