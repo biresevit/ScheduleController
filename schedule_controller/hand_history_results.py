@@ -9,15 +9,17 @@ import os
 import re
 
 from .database import connection_string
-from .hand_settlement import correct_winnings
+from .hand_settlement import balance, correct_winnings
 
 log = logging.getLogger(__name__)
 # 2: showdowns re-settled from the cards (correct_winnings); older results are reprocessed.
-PARSER_VERSION = 2
+# 3: every hand balanced (balance): placeholder winners and misplaced uncalled bets.
+PARSER_VERSION = 3
 MONEY = r"(?P<amount>\d+(?:\.\d+)?)"
 ACTION = re.compile(r"^(?P<player>.+?) (?:posts (?:small blind|big blind|ante)|calls|bets|raises) \[\$" + MONEY + r" USD\]", re.I)
 WIN = re.compile(r"^(?P<player>.+?) wins \$" + MONEY + r" USD(?:\s+from .+)?$", re.I)
 SEAT = re.compile(r"^Seat\s+\d+:\s+(?P<player>.*?)\s+\(\s*\$[\d.]+\s+USD\s*\)", re.I)
+FOLD = re.compile(r"^(?P<player>.+?) folds\s*$", re.I)
 
 
 def player_results(text: str) -> list[dict]:
@@ -28,7 +30,7 @@ def player_results(text: str) -> list[dict]:
         raise ValueError("Unsupported hand-history format")
     combined: dict[str, dict] = {}
     for hand in sections[1:]:
-        contributions, prizes, names = defaultdict(Decimal), defaultdict(Decimal), {}
+        contributions, prizes, names, folded = defaultdict(Decimal), defaultdict(Decimal), {}, set()
         bb_match = re.search(r"^\$[\d.]+/\$([\d.]+)", hand, re.M)
         if not bb_match:
             raise ValueError("Missing big blind")
@@ -40,15 +42,13 @@ def player_results(text: str) -> list[dict]:
             if match := ACTION.match(line):
                 contributions[match["player"].casefold()] += Decimal(match["amount"])
                 continue
+            if match := FOLD.match(line):
+                folded.add(match["player"].casefold())
             if match := WIN.match(line):
                 prizes[match["player"].casefold()] += Decimal(match["amount"])
         if not names or not contributions or not prizes:
             raise ValueError("Incomplete hand settlement")
-        # Preserve PDecision's correction for an unmatched all-in overbet.
-        ranked = sorted(contributions, key=contributions.get, reverse=True)
-        if (len(ranked) >= 2 and ranked[0] not in prizes
-                and contributions[ranked[0]] > contributions[ranked[1]] >= bb):
-            contributions[ranked[0]] = contributions[ranked[1]]
+        balance(contributions, prizes, set(names), folded, bb)
         for key, display_name in names.items():
             row = combined.setdefault(key, {"player_name": display_name,
                                             "invested": Decimal(0), "won": Decimal(0)})

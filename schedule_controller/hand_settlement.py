@@ -180,6 +180,34 @@ def _settle_hand(lines: list[str]) -> list[str] | None:
     return result
 
 
+def balance(contributions: dict, prizes: dict, seated: set, folded: set, big_blind: Decimal) -> tuple[dict, dict]:
+    """Make one parsed hand pay out what was put in, for hands the bot captured incompletely.
+
+    Keys are case-folded player names; both dicts are changed in place and returned.
+
+    1. A win credited to a name that is not seated (a placeholder such as "player3") goes to the
+       only player who put money in and did not fold, when there is exactly one.
+    2. The top contributor who won nothing gets back the part of the bet nobody matched.
+    3. A hand that still pays out more than was put in credited an uncalled bet to the wrong
+       player: the largest prize is reduced by exactly the excess.
+    """
+    unknown = [p for p in prizes if p not in seated]
+    if unknown:
+        remaining = [p for p, v in contributions.items() if v > 0 and p in seated and p not in folded]
+        if len(remaining) == 1:
+            for p in unknown:
+                prizes[remaining[0]] = prizes.get(remaining[0], Decimal(0)) + prizes.pop(p)
+    ranked = sorted(contributions, key=contributions.get, reverse=True)
+    if (len(ranked) >= 2 and ranked[0] not in prizes
+            and contributions[ranked[0]] > contributions[ranked[1]] >= big_blind):
+        contributions[ranked[0]] = contributions[ranked[1]]
+    excess = sum(prizes.values(), Decimal(0)) - sum(contributions.values(), Decimal(0))
+    if excess > 0 and prizes:
+        top = max(prizes, key=prizes.get)
+        prizes[top] = max(Decimal(0), prizes[top] - excess)
+    return contributions, prizes
+
+
 def correct_winnings(text: str) -> str:
     """Return the hand history with each settleable showdown's "wins" lines recomputed."""
     starts = [m.start() for m in HEADER.finditer(text)]

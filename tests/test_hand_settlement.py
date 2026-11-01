@@ -194,3 +194,76 @@ def test_stored_files_with_windows_line_endings_are_corrected_and_keep_them():
     fixed = correct_winnings(text)
     assert "WashingtonS wins $59.58 USD from the side pot 2\r\n" in fixed
     assert "jeremy wins" not in fixed and "\r\r" not in fixed
+
+
+MISSING_RIVER_REPLY = """***** Hand History for Game 13890 *****
+$0.50/$1.00 USD fastforward NL Texas Hold'em - Sunday, November 01, 10:00:00 CEST 2026
+Seat 1 is the button
+Seat 1: john ( $245.11 USD )
+Seat 2: andrew ( $139.62 USD )
+Seat 4: monica ( $220.71 USD )
+Seat 7: BarberShop ( $49.32 USD )
+Seat 8: kate ( $319.85 USD )
+andrew posts small blind [$0.50 USD]
+monica posts big blind [$1 USD]
+Dealt to kate [  7s 8h ]
+BarberShop folds
+kate folds
+john raises [$2.5 USD]
+andrew raises [$8 USD]
+monica folds
+john calls [$6 USD]
+** Dealing Flop ** [ Qh, Tc, 8s ]
+andrew bets [$7 USD]
+john raises [$22 USD]
+andrew calls [$15 USD]
+** Dealing Turn ** [ Jc ]
+andrew checks
+john bets [$40 USD]
+andrew calls [$40 USD]
+** Dealing River ** [ Kd ]
+andrew checks
+john bets [$174.61 USD]
+john does not show cards.
+andrew does not show cards.
+andrew wins $316.61 USD
+"""
+
+
+def test_uncalled_bet_paid_to_the_wrong_player_is_returned_and_hand_balances():
+    rows = {r["player_name"]: r for r in player_results(MISSING_RIVER_REPLY)}
+    # The pot before the river bet is 70.5 + 70.5 + monica's 1 = 142; john's 174.61 was never called.
+    assert rows["andrew"]["won"] == Decimal("142.00") and rows["andrew"]["net"] == Decimal("71.50")
+    assert rows["john"]["net"] == Decimal("-70.5")
+    assert sum(r["net"] for r in rows.values()) == 0
+
+
+PLACEHOLDER_WINNER = """***** Hand History for Game 13489 *****
+$1.00/$2.00 USD fastforward NL Texas Hold'em - Sunday, November 01, 10:00:00 CEST 2026
+Seat 1 is the button
+Seat 1: Yhannson ( $300 USD )
+Seat 2: john ( $200 USD )
+Seat 3: Hartginia ( $300 USD )
+Seat 4: andrew ( $300 USD )
+john posts small blind [$1 USD]
+Hartginia posts big blind [$2 USD]
+Dealt to john [  Ad 9h ]
+Yhannson calls [$2 USD]
+andrew raises [$10 USD]
+john folds
+Hartginia calls [$8 USD]
+Yhannson raises [$33.09 USD]
+andrew calls [$25.09 USD]
+Hartginia raises [$64.45 USD]
+Yhannson folds
+andrew folds
+Hartginia does not show cards.
+player3 wins $145.63 USD
+"""
+
+
+def test_win_credited_to_a_placeholder_name_goes_to_the_only_player_left():
+    rows = {r["player_name"]: r for r in player_results(PLACEHOLDER_WINNER)}
+    assert rows["Hartginia"]["won"] == Decimal("145.63") and rows["Hartginia"]["net"] == Decimal("71.18")
+    assert "player3" not in rows
+    assert sum(r["net"] for r in rows.values()) == 0
