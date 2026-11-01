@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from schedule_controller.planner import Account, Entry, Machine
-from schedule_controller.tournaments import Tournament, plan_registrations
+from schedule_controller.tournaments import Tournament, excluded_names, plan_registrations
 
 NOW = datetime(2026, 11, 1, 12, 0, tzinfo=timezone.utc)
 RANGES = {"low": (Decimal("0"), Decimal("2")), "medium": (Decimal("2.01"), Decimal("20")), "high": None}
@@ -84,3 +84,14 @@ def test_stale_completed_and_non_nlh_tournaments_are_ignored():
     running = Tournament("T2", "SNG", Decimal("1"), 6, 6, "running", NOW)
     plo = Tournament("T3", "SNG", Decimal("1"), 3, 6, "registering", NOW, game="PLO4")
     assert run("SNG", 5, [account(1)], [old, running, plo]).reasons == ["no_open_tournament"]
+
+
+def test_excluded_names_are_never_chosen_ignoring_case():
+    shootout = Tournament("T1", "SNG", Decimal("2"), 34, 36, "registering", NOW, name="Shootout SNG")
+    plain = Tournament("T2", "SNG", Decimal("2"), 1, 6, "registering", NOW, name="Double or Nothing")
+    plan = plan_registrations("SNG", NOW, 5, [account(1)], [machine()], [shootout, plain], [], RANGES,
+                              None, 20, 60, 60, 300, random.Random(1), excluded=["shootout"])
+    assert [a.tournament for a in plan.actions] == ["T2"]
+    only = plan_registrations("SNG", NOW, 5, [account(1)], [machine()], [shootout], [], RANGES,
+                              None, 20, 60, 60, 300, random.Random(1), excluded=excluded_names("\n  SHOOTOUT \n\n"))
+    assert only.reasons == ["no_open_tournament"]

@@ -4,7 +4,8 @@ A weekly-schedule target for a format is the number of bots registered in or pla
 at once. Below target, one registration is planned at a time, paced by a random gap like ring joins:
   * accounts follow the ring rules (enabled, credentials, cooldown, session, table limit, PC);
   * a tournament fits an account when its buy-in is inside the account tier's tournament range;
-  * SNG: the one with the fewest free seats, as it starts soonest; MTT: the earliest start, then the fullest.
+  * SNG: the one with the fewest free seats, as it starts soonest; MTT: the earliest start, then the fullest;
+  * a tournament whose name contains one of the site's excluded names is never chosen.
 Registrations are never cancelled: once registered, a bot plays the tournament to the end.
 """
 from __future__ import annotations
@@ -34,6 +35,18 @@ class Tournament:
     observed: datetime
     start: datetime | None = None
     game: str = "NLH"
+    name: str = ""
+
+
+def excluded_names(text) -> list[str]:
+    """The site's excluded tournament names: one per line, blank lines ignored."""
+    return [line.strip() for line in str(text or "").splitlines() if line.strip()]
+
+
+def is_excluded(name, excluded) -> bool:
+    """True when the tournament name contains any excluded name, ignoring case."""
+    name = str(name or "").casefold()
+    return any(part.casefold() in name for part in excluded)
 
 
 @dataclass(frozen=True)
@@ -61,11 +74,12 @@ def fits(buy_in: Decimal, buy_in_range) -> bool:
 def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Account], machines: list[Machine],
                        tournaments: list[Tournament], entries: list[Entry], ranges: dict,
                        next_time: datetime | None, min_gap: int, max_gap: int, heartbeat_seconds: int,
-                       freshness_seconds: int, rng: random.Random) -> TournamentPlan:
+                       freshness_seconds: int, rng: random.Random, excluded=()) -> TournamentPlan:
     """Plan at most one registration for `fmt`.
 
     entries: every open entry of the site (ring and tournament), for table limits and PC capacity.
     ranges: tier -> (min buy-in, max buy-in), or None when the tier plays no tournaments.
+    excluded: names (substrings, any case) of tournaments never to register for.
     """
     if fmt not in FORMATS:
         raise ValueError(f"Unknown tournament format {fmt}")
@@ -83,7 +97,7 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
         return (now - stamp.astimezone(timezone.utc)).total_seconds() <= seconds
 
     open_tournaments = [t for t in tournaments if t.format == fmt and t.state == "registering" and t.game == "NLH"
-                        and fresh(t.observed, freshness_seconds)
+                        and not is_excluded(t.name, excluded) and fresh(t.observed, freshness_seconds)
                         and (t.registered < t.max_players if fmt == "SNG" else
                              t.start is not None and t.start.astimezone(timezone.utc) > now + MTT_MIN_LEAD)]
     if not open_tournaments:

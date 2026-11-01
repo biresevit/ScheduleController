@@ -16,7 +16,7 @@ from zoneinfo import ZoneInfo
 from .database import connection_string
 from .planner import Account, Entry, Machine, Settings, Table, plan
 from .rules import Band, Window, target_at
-from .tournaments import Tournament, plan_registrations
+from .tournaments import Tournament, excluded_names, plan_registrations
 
 log = logging.getLogger(__name__)
 
@@ -239,8 +239,10 @@ class CloudScheduler:
         ranges = {r["Tier"]: (r["TournamentMinBuyIn"], r["TournamentMaxBuyIn"]) if r.get("TournamentMinBuyIn") is not None else None
                   for r in db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=?", site_id)}
         tournaments = [Tournament(t["TableId"], t["TableType"], Decimal(t["MinBuyIn"]), int(t["OccupiedSeats"]), int(t["MaxSeats"]),
-                                  t.get("TournamentState") or "registering", aware(t["ObservedUtc"]), aware(t.get("StartUtc")), t["GameType"])
+                                  t.get("TournamentState") or "registering", aware(t["ObservedUtc"]), aware(t.get("StartUtc")), t["GameType"],
+                                  t.get("TableName") or "")
                        for t in lobby_rows if t.get("TableType") in ("SNG", "MTT")]
+        excluded = excluded_names(site.get("ExcludedTournamentNames"))
         freshness = max(site["TableFreshnessSeconds"], 3 * (site.get("LobbyRefreshSeconds") or 60))
         results = {}
         for fmt, column in (("SNG", "NextSngUtc"), ("MTT", "NextMttUtc")):
@@ -250,7 +252,7 @@ class CloudScheduler:
                        for e in db.rows("SELECT * FROM scheduler.Entry WHERE SiteId=? AND IsOpen=1", site_id)]
             plan = plan_registrations(fmt, stamp, target, accounts, machines, tournaments, entries, ranges,
                 aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
-                site["HeartbeatTimeoutSeconds"], freshness, rng)
+                site["HeartbeatTimeoutSeconds"], freshness, rng, excluded)
             created = 0
             for action in plan.actions:
                 join = SimpleNamespace(account=action.account, machine=action.machine, table=action.tournament,
