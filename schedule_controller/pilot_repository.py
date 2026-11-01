@@ -223,7 +223,7 @@ class Repository(ChatRepository,ManualRepository):
         """Atomically claim due Azure-planned commands for this worker epoch."""
         token=str(uuid.uuid4())
         with self.transaction() as db:
-            rows=db.rows("""SELECT TOP (?) c.CommandId,c.EntryId,c.Kind,c.ConfigVersion,c.NotBeforeUtc,
+            rows=db.rows("""SELECT TOP (?) c.CommandId,c.EntryId,c.Kind,c.ConfigVersion,c.NotBeforeUtc,c.PayloadJson,
                     e.BotAccountId,e.TableId,e.Status AS EntryStatus,e.CreatedUtc,e.SessionId,
                     s.StartedUtc,s.PlannedEndUtc
                 FROM scheduler.Command c WITH(UPDLOCK,READPAST,ROWLOCK)

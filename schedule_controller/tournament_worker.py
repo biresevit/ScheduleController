@@ -114,6 +114,34 @@ class TournamentPlay:
         self.log.info("REGISTERED %s %s=%s entry=%s", self.policy["Username"], fmt, tid, entry_idx)
         return reply
 
+    async def registered_tournaments(self) -> set[int]:
+        """Tournament ids EvenBet holds a registration of this account for."""
+        reply = await self.client.connection.request("GetPlayerTournaments")
+        return {int(t) for t in reply.get("tournaments") or []}
+
+    async def unregister(self, tid: int) -> None:
+        """Cancel a registration before the tournament starts (as the web client's Unregister button).
+
+        Succeeds when EvenBet no longer lists the registration, also when it was already gone."""
+        tid = int(tid)
+        state = self.active.get(tid) or {}
+        if state.get("table"):
+            raise ValueError("The tournament has already seated this bot; it plays to the end")
+        if tid in await self.registered_tournaments():
+            await self.client.connection.request("UnregisterInTournament", tournamentId=tid,
+                                                 playerEntryIdx=int(state.get("entry_idx") or 0))
+            if tid in await self.registered_tournaments():
+                raise ValueError("EvenBet kept the registration; its unregistration period may be over")
+        self.forget(tid)
+        self.log.info("UNREGISTERED %s tournament=%s", self.policy["Username"], tid)
+
+    def forget(self, tid: int) -> None:
+        """Stop following a tournament the account is no longer in."""
+        state = self.active.pop(int(tid), None) or {}
+        poller = state.get("poller")
+        if poller and not poller.done():
+            poller.cancel()
+
     # ---- messages --------------------------------------------------------------------------------
 
     def handle(self, message: dict):

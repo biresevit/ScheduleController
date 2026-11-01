@@ -916,7 +916,12 @@ class Pilot:
         then 'seated'; it closes when the bot's tournament ends. Tournaments are never left."""
         username=self.policies[e['account']]['Username']
         if kind!='join':
-            cmd.update(status='succeeded',result='tournament_kept');await self.publish();return
+            if e['status'] in ('closed','failed'):
+                cmd.update(status='succeeded',result='already_closed');await self.publish();return
+            if not (cmd.get('payload') or {}).get('unregister'):
+                # Scheduler departures never apply to tournaments: a registered bot plays to the end.
+                cmd.update(status='succeeded',result='tournament_kept');await self.publish();return
+            return await self.unregister_tournament(e,cmd,username)
         cmd['status']='claimed';e['status']='joining'
         try:
             await self.publish()
@@ -949,6 +954,26 @@ class Pilot:
         async with lock:
             await self.execute(e,cmd,kind)
 
+    async def unregister_tournament(self,e,cmd,username):
+        """Operator Unregister task: cancel an SNG/MTT registration before the tournament seats the bot."""
+        cmd['status']='claimed'
+        try:
+            await self.publish()
+            if e['status']!='joining':
+                raise ValueError('The tournament has already started for this bot; it plays to the end')
+            c=self.clients.get(e['account']) or await self.session_for(e['account'])
+            await c.tourneys.unregister(tournament_id(e['table']))
+            self.accrue();e.update(status='closed',closed=now(),confirmed=now());self.accrue()
+            cmd.update(status='succeeded',result='unregistered')
+            log.info('UNREGISTERED %s %s',username,e['table'])
+        except Exception as exc:
+            self.errors.append({'account':username,'table':e['table'],'kind':'unregister','error':type(exc).__name__,'at':now().isoformat()})
+            log.exception('Tournament unregistration failed: %s / %s',username,e['table'])
+            cmd.update(status='failed',result=type(exc).__name__,result_text=str(exc)[:1000] if isinstance(exc,ValueError) else None)
+        finally:
+            try:await self.publish()
+            except Exception:log.exception('Could not persist tournament unregistration')
+
     def accept_claim(self,row):
         """Materialize one persisted Azure command in the local execution journal."""
         eid=str(row['EntryId']);cid=str(row['CommandId'])
@@ -961,8 +986,10 @@ class Pilot:
         if row['SessionId'] and not any(str(s['id'])==str(row['SessionId']) for s in self.sessions):
             self.sessions.append({'id':str(row['SessionId']),'account':row['BotAccountId'],
                 'start':aware(row['StartedUtc']),'end':aware(row['PlannedEndUtc'])})
+        try:payload=json.loads(row.get('PayloadJson') or '{}')
+        except ValueError:payload={}
         cmd={'id':cid,'kind':row['Kind'],'status':'claimed','due':aware(row['NotBeforeUtc']),
-             'version':row['ConfigVersion']}
+             'version':row['ConfigVersion'],'payload':payload if isinstance(payload,dict) else {}}
         e['commands'].append(cmd)
         self.jobs[eid]=asyncio.create_task(self.execute_serialized(e,cmd,row['Kind']))
 
@@ -1058,6 +1085,17 @@ class Pilot:
                     session.tourneys.active.setdefault(tournament_id(key),{'format':'SNG','entry_idx':0,'table':None,'addon_decided':False})
                     try:await session.tourneys.resume()
                     except Exception as exc:log.warning('Tournament resume failed for %s / %s: %s',row['Username'],key,exc)
+                    # A registration EvenBet no longer holds (unregistered or cancelled) and that has no
+                    # table is over: close it so it stops counting toward the tournament target.
+                    if status=='joining' and not session.tourneys.active.get(tournament_id(key),{}).get('table'):
+                        try:registered=await session.tourneys.registered_tournaments()
+                        except Exception as exc:
+                            registered=None;log.warning('Tournament registrations unknown for %s: %s',row['Username'],exc)
+                        if registered is not None and tournament_id(key) not in registered:
+                            self.entries[eid].update(status='closed',closed=now(),confirmed=now())
+                            session.tourneys.forget(tournament_id(key))
+                            log.info('Restart closed tournament entry no longer registered: %s / %s',row['Username'],key)
+                            continue
                     log.info('Restart kept tournament entry: %s / %s',row['Username'],key)
                     continue
                 tid=int(row['TableId'])

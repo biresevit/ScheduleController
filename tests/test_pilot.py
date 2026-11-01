@@ -294,3 +294,27 @@ def test_cloud_worker_keeps_session_open_when_its_last_table_closes(monkeypatch)
         return p.sessions[0]
     assert not pilot(True).get('closed')
     assert pilot(False)['reason']=='reconciled_absent'
+
+
+def test_tournament_leave_unregisters_only_when_the_operator_asked():
+    def pilot(status):
+        p=Pilot.__new__(Pilot)
+        p.publish=AsyncMock();p.accrue=lambda:None;p.errors=[]
+        p.policies={7:{'Username':'jeremy'}}
+        tourneys=SimpleNamespace(unregister=AsyncMock())
+        p.clients={7:SimpleNamespace(tourneys=tourneys)}
+        e={'id':'e1','account':7,'table':'T128872490','status':status,'commands':[]}
+        return p,e,tourneys
+    p,e,tourneys=pilot('joining')
+    cmd={'id':'c1','kind':'leave','payload':{}}
+    asyncio.run(p.execute_tournament(e,cmd,'leave'))
+    assert cmd['result']=='tournament_kept' and e['status']=='joining' and not tourneys.unregister.called
+    cmd={'id':'c2','kind':'leave','payload':{'unregister':True,'manual':True}}
+    asyncio.run(p.execute_tournament(e,cmd,'leave'))
+    tourneys.unregister.assert_awaited_once_with(128872490)
+    assert cmd['status']=='succeeded' and cmd['result']=='unregistered' and e['status']=='closed'
+    p,e,tourneys=pilot('seated')
+    cmd={'id':'c3','kind':'leave','payload':{'unregister':True}}
+    asyncio.run(p.execute_tournament(e,cmd,'leave'))
+    assert cmd['status']=='failed' and 'already started' in cmd['result_text'] and e['status']=='seated'
+    assert not tourneys.unregister.called

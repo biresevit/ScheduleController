@@ -204,3 +204,33 @@ def test_resume_reattaches_running_tournament_tables():
         assert events[-1][1:3] == ("T42", "seated")
         await t.close()
     run(go())
+
+
+def test_unregister_cancels_a_registration_and_confirms_it_is_gone():
+    async def go():
+        registered = {9, 10}
+        replies = {"GetPlayerTournaments": lambda f: {"tournaments": sorted(registered)},
+                   "UnregisterInTournament": lambda f: registered.discard(f["tournamentId"]) or {"t": "Result", "resultCodeExt": -1}}
+        session, t, _ = play(replies)
+        t.active[9] = {"format": "SNG", "entry_idx": 0, "table": None, "addon_decided": False}
+        await t.unregister(9)
+        assert ("UnregisterInTournament", {"tournamentId": 9, "playerEntryIdx": 0}) in session.client.connection.sent
+        assert 9 not in t.active and registered == {10}
+        # Already gone on EvenBet (e.g. unregistered by hand): nothing to send, still a success.
+        sent = len(session.client.connection.sent)
+        await t.unregister(9)
+        assert [x[0] for x in session.client.connection.sent[sent:]] == ["GetPlayerTournaments"]
+    run(go())
+
+
+def test_unregister_refuses_once_seated_or_when_evenbet_keeps_the_registration():
+    async def go():
+        session, t, _ = play({"GetPlayerTournaments": {"tournaments": [9]}})
+        t.active[9] = {"format": "SNG", "entry_idx": 0, "table": 501, "addon_decided": False}
+        with pytest.raises(ValueError, match="already seated"):
+            await t.unregister(9)
+        t.active[9]["table"] = None
+        with pytest.raises(ValueError, match="kept the registration"):
+            await t.unregister(9)
+        assert 9 in t.active
+    run(go())
