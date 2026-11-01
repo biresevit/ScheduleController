@@ -25,11 +25,30 @@ class Connection:
 class Client:
     def __init__(self, connection):
         self.connection = connection
-        self.tables, self.states, self.table_entry_indices = {}, {}, {}
+        self.tables, self.states, self.table_entry_indices, self.tournament_entry_indices = {}, {}, {}, {}
+        self.table_select_indices = {}
+        self.player_tables = []
 
     async def wait_state(self, table, predicate=None, timeout=20):
-        self.states.setdefault(table, {"ti": table})
+        self.states.setdefault(table, {"ti": table, "s": [{"i": 1, "f": 1}]})
         return self.states[table]
+
+    async def refresh_player_tables(self):
+        return self.player_tables
+
+    async def join(self, table):
+        await self.connection.request("SelectTable", tableId=table, playerEntryIdx=self.tournament_entry_indices.get(table, 0))
+        await self.wait_state(table)
+
+    async def take_tournament_seat(self, table):
+        await self.connection.request("SitDown", tableId=table, cash=0)
+        return 0
+
+    def hero_seat(self, state):
+        return 0 if state.get("s") else None
+
+    async def return_from_away(self, table):
+        await self.connection.request("ReturnFromAway", tableId=table)
 
 
 class Session:
@@ -94,11 +113,15 @@ def test_start_seat_move_and_finish():
         t.handle({"t": "TournamentSeatedDown", "tournamentId": 9, "info": {"i": 501, "t": 9}, "playerEntryIdx": 0})
         await settle(t)
         assert session.attached == [501] and t.by_table == {501: 9}
+        sent = [topic for topic, _ in session.client.connection.sent]
+        assert sent[-3:] == ["SelectTable", "SitDown", "ReturnFromAway"]
+        assert session.client.tournament_entry_indices == {501: 0}
         assert session.client.tables[501]["tournament"]["format"] == "SNG"
         # Table balancing: moved to 502 without leaving 501.
         t.handle({"t": "TournamentSeatedDown", "tournamentId": 9, "info": {"i": 502, "t": 9}, "playerEntryIdx": 0})
         await settle(t)
         assert session.detached == [501] and session.attached == [501, 502] and t.by_table == {502: 9}
+        assert session.client.tournament_entry_indices == {502: 0}
         assert not any(topic == "LeaveTable" for topic, _ in session.client.connection.sent)
         t.handle({"t": "PlayerEndTournamentNotification", "tableId": 502, "playerInTournament": {"p": 3}})
         await settle(t)
@@ -169,3 +192,15 @@ def test_lobby_rows_keep_only_nlh_sngs_and_mtts():
     assert rows["T1"]["table_type"] == "SNG" and rows["T1"]["minimum"] == Decimal("1") and rows["T1"]["start"] is None
     assert rows["T2"]["table_type"] == "MTT" and rows["T2"]["start"] == datetime(2026, 11, 1, 20, tzinfo=timezone.utc)
     assert rows["T5"]["tournament_state"] == "running" and rows["T5"]["bb"] == Decimal("0.01") and not rows["T5"]["open"]
+
+
+def test_resume_reattaches_running_tournament_tables():
+    async def go():
+        session, t, events = play()
+        session.client.player_tables = [{"i": 777, "t": 42, "n": "Double or Nothing"}, {"i": 5, "n": "ring table"}]
+        await t.resume()
+        assert session.attached == [777] and t.by_table == {777: 42}
+        assert ("SubscribeTournament", {"tournamentId": 42}) in session.client.connection.sent
+        assert events[-1][1:3] == ("T42", "seated")
+        await t.close()
+    run(go())

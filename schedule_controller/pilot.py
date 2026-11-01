@@ -1047,8 +1047,8 @@ class Pilot:
                         'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),'commands':[],
                         'session':str(row['SessionId']) if row.get('SessionId') else None}
                     session.tourneys.active.setdefault(tournament_id(key),{'format':'SNG','entry_idx':0,'table':None,'addon_decided':False})
-                    try:await session.client.connection.request('SubscribeTournament',tournamentId=tournament_id(key))
-                    except Exception as exc:log.warning('Tournament resubscribe failed for %s / %s: %s',row['Username'],key,exc)
+                    try:await session.tourneys.resume()
+                    except Exception as exc:log.warning('Tournament resume failed for %s / %s: %s',row['Username'],key,exc)
                     log.info('Restart kept tournament entry: %s / %s',row['Username'],key)
                     continue
                 tid=int(row['TableId'])

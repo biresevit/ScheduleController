@@ -4,7 +4,7 @@ A weekly-schedule target for a format is the number of bots registered in or pla
 at once. Below target, one registration is planned at a time, paced by a random gap like ring joins:
   * accounts follow the ring rules (enabled, credentials, cooldown, session, table limit, PC);
   * a tournament fits an account when its buy-in is inside the account tier's tournament range;
-  * SNG: the fullest open one, as it starts soonest; MTT: the earliest start, then the fullest.
+  * SNG: the one with the fewest free seats, as it starts soonest; MTT: the earliest start, then the fullest.
 Registrations are never cancelled: once registered, a bot plays the tournament to the end.
 """
 from __future__ import annotations
@@ -132,8 +132,9 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
     machine = min((o[1] for o in choices), key=lambda m: (load(m), m.id))
     fitting = choices[0][2]
     if fmt == "SNG":
-        best = max(t.registered for t in fitting)
-        pool = [t for t in fitting if t.registered == best]
+        # Fewest free seats starts soonest: a 6-max at 5/6 before a 36-player SNG at 34/36.
+        best = min(t.max_players - t.registered for t in fitting)
+        pool = [t for t in fitting if t.max_players - t.registered == best]
     else:
         soonest = min(t.start for t in fitting)
         pool = [t for t in fitting if t.start == soonest]

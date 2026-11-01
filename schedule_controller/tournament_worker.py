@@ -165,11 +165,34 @@ class TournamentPlay:
         self.by_table[table] = tid
         self.client.tables.setdefault(table, {"i": table, "n": state.get("name") or f"Tournament {tid}", "g": 72})
         self.refresh_table_info(tid)
-        self.client.table_entry_indices[table] = entry_idx
-        await self.client.connection.request("GetTableState", tableId=table, playerEntryIdx=entry_idx, isRealTable=False)
-        await self.client.wait_state(table)
+        # Every request for this table uses the tournament's entry index (the seat's TableState "ei" differs).
+        self.client.tournament_entry_indices[table] = entry_idx
+        if previous:
+            self.client.tournament_entry_indices.pop(previous, None)
+        # Open the table as EvenBet's web client does: select it, then claim the seat the tournament gave
+        # us. Without the SitDown this connection only watches (hidden cards, auto-folded as away).
+        await self.client.refresh_player_tables()
+        await self.client.join(table)
+        await self.client.take_tournament_seat(table)
+        seat = self.client.hero_seat(self.client.states.get(table, {}))
+        if seat is not None and self.client.states[table]["s"][seat].get("f", 0) & 1:
+            await self.client.return_from_away(table)
         await self.session.attach_table(table)
         self.emit(tid, "seated", table=table)
+
+    async def resume(self):
+        """Re-attach tournament tables the account still sits at (after a reconnect or worker restart)."""
+        for table in await self.client.refresh_player_tables():
+            tid, table_id = table.get("t"), table.get("i")
+            if not tid or not table_id:
+                continue
+            state = self.active.setdefault(int(tid), {"format": "SNG", "entry_idx": int(self.client.table_select_indices.get(int(table_id), 0)),
+                                                      "table": None, "addon_decided": False})
+            state["name"] = table.get("n")
+            if not state.get("poller"):
+                state["poller"] = self.spawn(self.follow(int(tid)), "standings")
+            await self.client.connection.request("SubscribeTournament", tournamentId=int(tid))
+            await self.on_seated(int(tid), int(table_id), int(state.get("entry_idx") or 0))
 
     async def on_end(self, tid, table, place):
         state = self.active.get(tid)

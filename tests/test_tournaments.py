@@ -30,9 +30,9 @@ def run(fmt, target, accounts, tournaments, entries=(), next_time=None, machines
                               next_time, 20, 60, 60, 300, random.Random(1))
 
 
-def test_sng_prefers_the_fullest_open_sng_in_the_tier_range():
-    plan = run("SNG", 2, [account(1)], [sng(1, 2), sng(2, 5), sng(3, 6), sng(4, 5, buy_in="50")])
-    # T3 is full and T4 is outside the low range (0-2): T2 has the most players.
+def test_sng_prefers_the_open_sng_with_the_fewest_free_seats_in_the_tier_range():
+    plan = run("SNG", 2, [account(1)], [sng(1, 2), sng(2, 5), sng(3, 6), sng(4, 5, buy_in="50"), sng(5, 34, max_players=36)])
+    # T3 is full and T4 is outside the low range (0-2); T5 has more players but 2 free seats, T2 only 1.
     assert [(a.account, a.tournament) for a in plan.actions] == [(1, "T2")]
     assert NOW + timedelta(seconds=20) <= plan.next_time <= NOW + timedelta(seconds=60)
 
