@@ -244,7 +244,11 @@ class Session:
 
     async def reconnect_active(self):
         """Reconnect surviving seats; a departed table cannot reject the rest."""
-        old=self.client;table_ids=list(self.queues);table_info=copy.deepcopy(old.tables)
+        old=self.client;table_info=copy.deepcopy(old.tables)
+        # Tournament tables are re-opened by TournamentPlay.resume (select + claim the seat with the
+        # tournament's entry index); the ring resume below would only leave the bot watching.
+        tourneys=getattr(self,'tourneys',None);tournament_tables=set(getattr(tourneys,'by_table',{}))
+        table_ids=[tid for tid in self.queues if tid not in tournament_tables]
         for delay in (1,3,10):
             candidate=None
             try:
@@ -275,6 +279,11 @@ class Session:
                     self.bots[tid].client=candidate;self.queues[tid]=asyncio.Queue(maxsize=1)
                     self.queues[tid].put_nowait(copy.deepcopy(candidate.states[tid]))
                     self.workers[tid]=asyncio.create_task(self.worker(tid))
+                for tid in tournament_tables:self.bots.pop(tid,None)
+                if tournament_tables:
+                    tourneys.by_table.clear()
+                    for state in tourneys.active.values():state['table']=None
+                    tourneys.spawn(tourneys.resume(),'resume after reconnect')
                 await old.close()
                 log.info('Active login reconnected: %s (%s surviving, %s absent tables)',self.policy['Username'],len(present),len(table_ids)-len(present))
                 return True
