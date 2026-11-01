@@ -1,6 +1,7 @@
 # ScheduleController
 
 **Deploying:** see `../PokerBackoffice/docs/deploy.md`. Files in `schedule_controller` ship in different places (scheduler function, backoffice bundle or PC release); its section 1 lists which.
+
 Python foundation for customer-scoped poker scheduling. The complete design is in [SPECIFICATION.md](SPECIFICATION.md).
 
 The first environment is **Nenad / Evenbet**, with eight verified demo accounts. The transactional planner is deployed as the Flex Consumption Function `poker-schedule-controller`; poker connections remain on the assigned PokerController machines.
