@@ -128,7 +128,7 @@ class Repository(ChatRepository,ManualRepository):
                 row=db.one("SELECT SessionSeconds FROM scheduler.AccountDay WHERE SiteId=:site AND BotAccountId=? AND LocalDate=?",a['BotAccountId'],today)
                 a['PlayedSeconds']=row['SessionSeconds'] if row else 0
             return {'site':site,'accounts':accounts,'bands':db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=:site"),
-                'windows':db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=:site"),
+                'windows':db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=:site AND Format='RING'"),
                 'machine':db.one("SELECT * FROM scheduler.MachineAssignment WHERE SiteId=:site AND MachineId=:machine")}
 
     @retry_deadlocks

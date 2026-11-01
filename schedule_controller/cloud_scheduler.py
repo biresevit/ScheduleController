@@ -1,18 +1,22 @@
 """Transactional Azure timer scheduler. It never opens poker connections."""
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 import json
 import logging
 import random
 import uuid
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 from .database import connection_string
 from .planner import Account, Entry, Machine, Settings, Table, plan
 from .rules import Band, Window, target_at
+from .tournaments import Tournament, plan_registrations
 
 log = logging.getLogger(__name__)
 
@@ -80,9 +84,11 @@ class CloudScheduler:
                 return {"site_id": site_id, "status": "disabled"}
             bands = [Band(r["Tier"], r["MinBigBlind"], r["MaxBigBlind"], r["TargetBasisPoints"], bool(r["UpperInclusive"]))
                      for r in db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=?", site_id)]
-            windows = [Window(r["Weekday"], r["StartMinute"], r["EndMinute"], r["TargetEntries"])
-                       for r in db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=?", site_id)]
-            target = target_at(windows, stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
+            windows_by_format = {}
+            for r in db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=?", site_id):
+                windows_by_format.setdefault(r.get("Format") or "RING", []).append(
+                    Window(r["Weekday"], r["StartMinute"], r["EndMinute"], r["TargetEntries"]))
+            target = target_at(windows_by_format.get("RING", []), stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
             # A worker restart flags every lease on its machine for reconciliation, but only leases
             # with open entries get reconciled, and idle-lease cleanup only covers the current run.
@@ -117,6 +123,13 @@ class CloudScheduler:
                 OUTER APPLY(SELECT TOP(1) x.ActualEndUtc FROM scheduler.AccountSession x
                     WHERE x.BotAccountId=p.BotAccountId AND x.IsOpen=0 ORDER BY x.ActualEndUtc DESC) prior
                 WHERE p.SiteId=? AND p.DeletedUtc IS NULL""", local_day, site_id)
+            # Tournament entries (SNG/MTT) are planned separately and never left; for ring planning
+            # they only use up each account's table limit and each PC's capacity.
+            tournament_entries = db.rows("""SELECT e.BotAccountId,e.MachineId FROM scheduler.Entry e
+                JOIN scheduler.LobbyTable t ON t.SiteId=e.SiteId AND t.TableId=e.TableId
+                WHERE e.SiteId=? AND e.IsOpen=1 AND t.TableType IN ('SNG','MTT')""", site_id)
+            tournament_by_account = Counter(r["BotAccountId"] for r in tournament_entries)
+            tournament_by_machine = Counter(r["MachineId"] for r in tournament_entries)
             draining_accounts=set()
             for machine in maintenance:
                 update=db.one("SELECT r.Status FROM scheduler.MachineUpdateTask t JOIN scheduler.UpdateRollout r ON r.RolloutId=t.RolloutId WHERE t.TaskId=?",machine['MaintenanceTaskId'])
@@ -127,6 +140,7 @@ class CloudScheduler:
                     ORDER BY COALESCE(x.StartedUtc,e.CreatedUtc),e.BotAccountId,e.CreatedUtc""",site_id,machine['MachineId'])
                 if first: draining_accounts.add(first['BotAccountId'])
             accounts = []
+            tournament_accounts = []
             policy_by_id = {}
             for p in policies:
                 aid = p["BotAccountId"]; policy_by_id[aid] = p
@@ -135,18 +149,25 @@ class CloudScheduler:
                 # An open session's entries must be on its machine (Entry->AccountSession FK), and a
                 # session can now be open with no tables, so pin the account to the session's machine.
                 owner = p["SessionMachine"] if p["SessionId"] else p["OwnerMachine"]
-                accounts.append(Account(aid, site_id, p["StakeTier"], p["PlayingFrequency"], int(p["PlayedSeconds"]),
+                account = Account(aid, site_id, p["StakeTier"], p["PlayingFrequency"], int(p["PlayedSeconds"]),
                     p["MaxPlaytimeMinutes"], p["MaxTables"], owner,
                     enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"]),
                     synthetic=bool(p["IsSynthetic"]), requires_reconciliation=bool(p["RequiresReconciliation"]),
                     eligible_after=previous+timedelta(minutes=p["SessionCooldownMinutes"]) if previous else None,
                     session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts,
-                    manual=manual,session_start=aware(p["SessionStart"]) if manual else None))
+                    manual=manual,session_start=aware(p["SessionStart"]) if manual else None)
+                tournament_accounts.append(account)
+                ring_tables = p["MaxTables"] - tournament_by_account[aid]
+                accounts.append(account if ring_tables == p["MaxTables"] else
+                                replace(account, max_tables=max(1, ring_tables), enabled=account.enabled and ring_tables > 0))
             machine_rows = db.rows("SELECT * FROM scheduler.MachineAssignment WHERE SiteId=?", site_id)
-            machines = [Machine(m["MachineId"], site_id, m["MaxEntries"], aware(m["LastHeartbeatUtc"] or datetime.min),
+            tournament_machines = [Machine(m["MachineId"], site_id, m["MaxEntries"], aware(m["LastHeartbeatUtc"] or datetime.min),
                 ready=bool(m["IsReady"]), enabled=bool(m["IsEnabled"]),maintenance=bool(m["MaintenanceTaskId"])) for m in machine_rows]
+            machines = [replace(m, capacity=max(0, m.capacity - tournament_by_machine[m.id])) for m in tournament_machines]
             machine_by_id = {m["MachineId"]: m for m in machine_rows}
-            table_rows = db.rows("SELECT * FROM scheduler.LobbyTable WHERE SiteId=?", site_id)
+            lobby_rows = db.rows("SELECT * FROM scheduler.LobbyTable WHERE SiteId=?", site_id)
+            table_rows = [t for t in lobby_rows if (t.get("TableType") or "RING") == "RING"]
+            ring_table_ids = {t["TableId"] for t in table_rows}
             observed = {}
             for r in db.rows("""SELECT ts.TableId,ts.BotAccountId FROM scheduler.TableSeat ts
                     JOIN scheduler.LobbyTable lt ON lt.SiteId=ts.SiteId AND lt.TableId=ts.TableId
@@ -161,7 +182,8 @@ class CloudScheduler:
                 WHERE c.EntryId=e.EntryId AND c.Kind='leave' AND c.IsOpen=1)
                 THEN 'draining' ELSE e.Status END AS PlanningStatus
                 FROM scheduler.Entry e WHERE e.SiteId=? AND e.IsOpen=1""", site_id)
-            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["PlanningStatus"]) for e in entry_rows]
+            all_entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["PlanningStatus"]) for e in entry_rows]
+            entries = [e for e in all_entries if e.table in ring_table_ids]
             # Plan on the database clock, read after every input above. A tick can take tens of
             # seconds; with the start-of-tick time, heartbeats and lobby observations written during
             # the tick looked like they came from the future and the planner treated them as stale.
@@ -203,8 +225,43 @@ class CloudScheduler:
                 next_join = last_successful_join_due if last_successful_join_due is not None else aware(site["NextJoinUtc"])
             db.execute("UPDATE scheduler.Site SET NextJoinUtc=?,NextLeaveUtc=?,LastReconciledUtc=?,UpdatedUtc=SYSUTCDATETIME() WHERE SiteId=? AND ConfigVersion=?",
                 next_join, result.next_leave, stamp.replace(tzinfo=None), site_id, site["ConfigVersion"])
+            tournament_results = {}
+            if site["SchedulingEnabled"]:
+                tournament_results = self._plan_tournaments(db, site, stamp, windows_by_format, tournament_accounts,
+                    tournament_machines, lobby_rows, policy_by_id, machine_by_id, rng)
+                created += sum(r["created"] for r in tournament_results.values())
             return {"site_id": site_id, "target": target, "status": "planned", "actions": created,
-                    "reasons": result.reasons, "deficits": result.remaining_deficits}
+                    "reasons": result.reasons, "deficits": result.remaining_deficits, "tournaments": tournament_results}
+
+    def _plan_tournaments(self, db, site, stamp, windows_by_format, accounts, machines, lobby_rows, policy_by_id, machine_by_id, rng):
+        """SNG and MTT registrations, each against its own weekly schedule and pacing."""
+        site_id = site["SiteId"]
+        ranges = {r["Tier"]: (r["TournamentMinBuyIn"], r["TournamentMaxBuyIn"]) if r.get("TournamentMinBuyIn") is not None else None
+                  for r in db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=?", site_id)}
+        tournaments = [Tournament(t["TableId"], t["TableType"], Decimal(t["MinBuyIn"]), int(t["OccupiedSeats"]), int(t["MaxSeats"]),
+                                  t.get("TournamentState") or "registering", aware(t["ObservedUtc"]), aware(t.get("StartUtc")), t["GameType"])
+                       for t in lobby_rows if t.get("TableType") in ("SNG", "MTT")]
+        freshness = max(site["TableFreshnessSeconds"], 3 * (site.get("LobbyRefreshSeconds") or 60))
+        results = {}
+        for fmt, column in (("SNG", "NextSngUtc"), ("MTT", "NextMttUtc")):
+            target = target_at(windows_by_format.get(fmt, []), stamp, site["TimeZone"])
+            # Re-read open entries so a registration planned just before counts toward this one.
+            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"])
+                       for e in db.rows("SELECT * FROM scheduler.Entry WHERE SiteId=? AND IsOpen=1", site_id)]
+            plan = plan_registrations(fmt, stamp, target, accounts, machines, tournaments, entries, ranges,
+                aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
+                site["HeartbeatTimeoutSeconds"], freshness, rng)
+            created = 0
+            for action in plan.actions:
+                join = SimpleNamespace(account=action.account, machine=action.machine, table=action.tournament,
+                                       not_before=action.not_before, soft_limit_override=False)
+                extra = {"format": fmt, "tournament_id": int(action.tournament.removeprefix("T"))}
+                if self._create_join(db, site, join, policy_by_id[action.account], machine_by_id[action.machine], rng, extra):
+                    created += 1
+            if created:
+                db.execute(f"UPDATE scheduler.Site SET {column}=? WHERE SiteId=?", plan.next_time.replace(tzinfo=None), site_id)
+            results[fmt] = {"target": target, "created": created, "reasons": plan.reasons}
+        return results
 
     def _session(self, db, site_id, account_id, machine_id, epoch, policy, due, rng):
         current = db.one("SELECT SessionId FROM scheduler.AccountSession WHERE BotAccountId=? AND IsOpen=1", account_id)
@@ -216,7 +273,7 @@ class CloudScheduler:
             machine_id, epoch, due.replace(tzinfo=None), (due+timedelta(minutes=minutes)).replace(tzinfo=None))
         return session_id
 
-    def _create_join(self, db, site, action, policy, machine, rng):
+    def _create_join(self, db, site, action, policy, machine, rng, extra=None):
         def refuse(reason):
             log.info("Planned join for account %s on machine %s not created: %s", action.account, action.machine, reason)
             return False
@@ -239,7 +296,7 @@ class CloudScheduler:
             IsOpen,CreatedUtc,SessionId) VALUES(?,?,?,?,?,?,'reserved',1,SYSUTCDATETIME(),?)""",
             entry_id, site["SiteId"], action.account, action.machine, epoch, action.table, session_id)
         payload = json.dumps({"account_id": action.account, "table_id": action.table,
-                              "soft_limit_override": action.soft_limit_override})
+                              "soft_limit_override": action.soft_limit_override, **(extra or {})})
         due = action.not_before.replace(tzinfo=None)
         db.execute("""INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,
             ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc) VALUES(?,?,?,?,?,'join','pending',1,?,?,?,?)""",

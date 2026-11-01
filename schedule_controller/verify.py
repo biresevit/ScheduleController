@@ -24,7 +24,7 @@ def main():
                 p.PostBbChance,p.RunItTwiceChance,p.IsSynthetic,p.IsEnabled FROM scheduler.AccountPolicy p
                 JOIN dbo.BotAccount b ON b.BotAccountId=p.BotAccountId WHERE p.SiteId=? ORDER BY b.Username"""),
             "machines": rows("SELECT MachineId,MaxEntries,IsEnabled,IsReady FROM scheduler.MachineAssignment WHERE SiteId=?"),
-            "schedule": rows("SELECT Weekday,StartMinute,EndMinute,TargetEntries FROM scheduler.ScheduleWindow WHERE SiteId=?"),
+            "schedule": rows("SELECT Format,Weekday,StartMinute,EndMinute,TargetEntries FROM scheduler.ScheduleWindow WHERE SiteId=?"),
             "commands": rows("SELECT COUNT(*) AS Count FROM scheduler.Command WHERE SiteId=?")}
         print(json.dumps(report, default=str, indent=2))
     finally:

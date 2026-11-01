@@ -197,7 +197,7 @@ def finish_recovery(db,task,rollout,stamp):
     agent_fresh=task['AgentEnabled'] and task['AgentHeartbeat'] and task['AgentHeartbeat']>=now-timedelta(seconds=60)
     worker_fresh=task['IsReady'] and task['LastHeartbeatUtc'] and task['LastHeartbeatUtc']>=now-timedelta(seconds=180)
     site=db.one('SELECT TimeZone,SchedulingEnabled FROM scheduler.Site WHERE SiteId=?',sid)
-    windows=[Window(r['Weekday'],r['StartMinute'],r['EndMinute'],r['TargetEntries']) for r in db.rows('SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=?',sid)]
+    windows=[Window(r['Weekday'],r['StartMinute'],r['EndMinute'],r['TargetEntries']) for r in db.rows("SELECT * FROM scheduler.ScheduleWindow WHERE SiteId=? AND Format='RING'",sid)]
     target=target_at(windows,stamp,site['TimeZone']) if site['SchedulingEnabled'] else 0
     others=db.one("SELECT COUNT(*) AS n FROM scheduler.Entry WHERE SiteId=? AND MachineId<>? AND IsOpen=1 AND Status IN ('seated','sitting_out','draining')",sid,mid)['n']
     # Immediate rollouts do not hold PCs back for traffic; the planner refills them as usual.
