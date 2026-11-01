@@ -25,18 +25,21 @@ def iso(value):
 LOBBY_SQL="""SET NOCOUNT ON;
 DECLARE @site int=:site,@machine int=:machine,@epoch uniqueidentifier=?,@tables nvarchar(max)=?,@seatTables nvarchar(max)=?,@seats nvarchar(max)=?;
 DECLARE @t TABLE(TableId nvarchar(80) PRIMARY KEY,TableName nvarchar(200),GameType varchar(8),TableType varchar(4),BigBlind decimal(19,4),
-    MinBuyIn decimal(19,4),MaxBuyIn decimal(19,4),MaxSeats smallint,OccupiedSeats smallint,IsOpen bit,ObservedUtc datetime2(3),FullSnapshotUtc datetime2(3));
+    MinBuyIn decimal(19,4),MaxBuyIn decimal(19,4),MaxSeats smallint,OccupiedSeats smallint,IsOpen bit,ObservedUtc datetime2(3),FullSnapshotUtc datetime2(3),
+    StartUtc datetime2(3),TournamentState varchar(12));
 INSERT @t SELECT * FROM OPENJSON(@tables) WITH(TableId nvarchar(80) '$.id',TableName nvarchar(200) '$.name',GameType varchar(8) '$.game',
     TableType varchar(4) '$.type',BigBlind decimal(19,4) '$.bb',MinBuyIn decimal(19,4) '$.min',MaxBuyIn decimal(19,4) '$.max',MaxSeats smallint '$.seats',
-    OccupiedSeats smallint '$.occupied',IsOpen bit '$.open',ObservedUtc datetime2(3) '$.observed',FullSnapshotUtc datetime2(3) '$.snapshot');
+    OccupiedSeats smallint '$.occupied',IsOpen bit '$.open',ObservedUtc datetime2(3) '$.observed',FullSnapshotUtc datetime2(3) '$.snapshot',
+    StartUtc datetime2(3) '$.start',TournamentState varchar(12) '$.state');
 UPDATE l SET TableName=t.TableName,GameType=t.GameType,TableType=t.TableType,BigBlind=t.BigBlind,MinBuyIn=t.MinBuyIn,MaxBuyIn=t.MaxBuyIn,
     MaxSeats=t.MaxSeats,OccupiedSeats=t.OccupiedSeats,IsOpen=t.IsOpen,ObservedUtc=t.ObservedUtc,FullSnapshotUtc=t.FullSnapshotUtc,
+    StartUtc=t.StartUtc,TournamentState=t.TournamentState,
     ObserverEpoch=@epoch,ObserverMachineId=@machine,SnapshotSequence=l.SnapshotSequence+1
     FROM scheduler.LobbyTable l JOIN @t t ON l.SiteId=@site AND l.TableId=t.TableId;
 INSERT scheduler.LobbyTable(SiteId,TableId,TableName,GameType,TableType,BigBlind,MinBuyIn,MaxBuyIn,MaxSeats,OccupiedSeats,IsOpen,
-    ObservedUtc,FullSnapshotUtc,ObserverEpoch,CurrencyCode,ObserverMachineId,SnapshotSequence)
+    ObservedUtc,FullSnapshotUtc,ObserverEpoch,CurrencyCode,ObserverMachineId,SnapshotSequence,StartUtc,TournamentState)
     SELECT @site,t.TableId,t.TableName,t.GameType,t.TableType,t.BigBlind,t.MinBuyIn,t.MaxBuyIn,t.MaxSeats,t.OccupiedSeats,t.IsOpen,
-        t.ObservedUtc,t.FullSnapshotUtc,@epoch,'DEMO',@machine,1
+        t.ObservedUtc,t.FullSnapshotUtc,@epoch,'DEMO',@machine,1,t.StartUtc,t.TournamentState
     FROM @t t WHERE NOT EXISTS(SELECT 1 FROM scheduler.LobbyTable l WHERE l.SiteId=@site AND l.TableId=t.TableId);
 DELETE s FROM scheduler.TableSeat s WHERE s.SiteId=@site AND s.TableId IN (SELECT CONVERT(nvarchar(80),value) FROM OPENJSON(@seatTables));
 INSERT scheduler.TableSeat(SiteId,TableId,SeatIndex,NativePlayerId,Username,BotAccountId,Stack,CurrentBet,InGame,SittingOut,HandId,ObservedUtc)
@@ -357,7 +360,8 @@ class Repository(ChatRepository,ManualRepository):
                 opened=e['status'] not in ('closed','failed')
                 if not db.one('SELECT EntryId FROM scheduler.Entry WHERE EntryId=?',e['id']):
                     db.execute("INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,IsOpen,CreatedUtc) VALUES(?,:site,?,:machine,?,?,?,?,?)",e['id'],e['account'],self.epoch,e['table'],e['status'],opened,utc(e['created']))
-                db.execute('UPDATE scheduler.Entry SET Status=?,IsOpen=?,BuyInAmount=?,SeatedUtc=?,ClosedUtc=?,LastConfirmedUtc=?,SessionId=? WHERE EntryId=?',e['status'],opened,e.get('buy_in'),utc(e.get('seated')),utc(e.get('closed')),utc(e.get('confirmed')),e.get('session'),e['id'])
+                # PlayTableId: the tournament table a registered bot currently plays (None for ring entries).
+                db.execute('UPDATE scheduler.Entry SET Status=?,IsOpen=?,BuyInAmount=?,SeatedUtc=?,ClosedUtc=?,LastConfirmedUtc=?,SessionId=?,PlayTableId=? WHERE EntryId=?',e['status'],opened,e.get('buy_in'),utc(e.get('seated')),utc(e.get('closed')),utc(e.get('confirmed')),e.get('session'),e.get('play_table'),e['id'])
                 for cmd in e.get('commands',[]):
                     is_open=cmd['status'] in ('pending','claimed','uncertain')
                     if not db.one('SELECT CommandId FROM scheduler.Command WHERE CommandId=?',cmd['id']):
@@ -397,7 +401,8 @@ class Repository(ChatRepository,ManualRepository):
         """
         latest={str(t['id']):t for t in tables}
         rows=[dict(id=tid,name=t['name'],game=t['game'],type=t.get('table_type','RING'),bb=t['bb'],min=t['minimum'],max=t['maximum'],
-                   seats=t['seats'],occupied=t['occupied'],open=bool(t['open']),observed=iso(t['observed']),snapshot=iso(t.get('snapshot')))
+                   seats=t['seats'],occupied=t['occupied'],open=bool(t['open']),observed=iso(t['observed']),snapshot=iso(t.get('snapshot')),
+                   start=iso(t.get('start')),state=t.get('tournament_state'))
               for tid,t in sorted(latest.items())]
         players=[dict(table=str(tid),seat=p['seat'],native=None if p['native_id'] is None else str(p['native_id']),name=p['name'],account=p['account'],
                       stack=p['stack'],bet=p['bet'],in_game=bool(p['in_game']),away=bool(p['away']),hand=None if p['hand'] is None else str(p['hand']),

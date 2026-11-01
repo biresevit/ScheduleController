@@ -27,6 +27,7 @@ from poker_controller.transport import ProtocolError
 from .planner import Account,Entry,Machine,Settings,Table,plan
 from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
+from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,tournament_id
 
 log=logging.getLogger(__name__)
 # Audited ordinary NLH/PLO4 demo tables. No fast-fold, double-board, bomb-pot,
@@ -35,6 +36,10 @@ TABLE_IDS={128197714,128016534,128048285,128048284,128053412,
            113891676,88548202,128053413,128094710}
 
 def now(): return datetime.now(timezone.utc)
+def ring_table(entry):
+    """The numeric EvenBet table of a ring entry; None for a tournament entry ('T' + tournament id)."""
+    table=str(entry['table'])
+    return None if table.startswith('T') else int(table)
 def guid(): return str(uuid.uuid4())
 def aware(value):
     if value is None: return None
@@ -66,6 +71,7 @@ class Session:
         self.ready=asyncio.Event()
         self.ready.set()
         self.attach_observer(self.client,self.observed)
+        self.tourneys=TournamentPlay(self,log)
 
     def attach_observer(self,client,observed):
         # Reconnect candidates must not refresh timestamps on an older client's
@@ -96,7 +102,9 @@ class Session:
         return low+(high-low)*self.rng.betavariate(1,3) # Mostly short breaks, occasionally long ones.
 
     def playing_tables(self):
+        # Tournament tables never take breaks: sitting out there only blinds the stack away.
         return [tid for tid,bot in self.bots.items() if tid in self.queues and tid not in self.failures
+                and tid not in getattr(getattr(self,'tourneys',None),'by_table',())
                 and not bot.leaving and not bot.busted and not bot.on_break]
 
     async def run_breaks(self,tick=5):
@@ -175,6 +183,8 @@ class Session:
         while True:
             try:
                 event=await self.client.connection.next_event()
+                if event.get('t') in TOURNAMENT_TOPICS:
+                    self.tourneys.handle(event)
                 if event.get('t')=='GameState':
                     s=event.get('gameState',event.get('GameState',{})); tid=s.get('ti')
                     if tid in self.queues:
@@ -340,8 +350,27 @@ class Session:
         return amount
 
     def new_bot(self,tid):
-        return Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid),on_bust=self.bust,
+        return Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid),on_bust=self.on_table_bust,
                    on_show_offer=self.show_offer)
+
+    def on_table_bust(self,tid):
+        if tid in getattr(getattr(self,'tourneys',None),'by_table',()):self.tourneys.on_bust(tid)
+        else:self.bust(tid)
+
+    async def attach_table(self,tid):
+        """Start the bot for a tournament table the server seated us at (no buy-in, no sit-down)."""
+        if tid in self.workers:return
+        self.bots[tid]=self.new_bot(tid)
+        self.queues[tid]=asyncio.Queue(maxsize=1)
+        self.workers[tid]=asyncio.create_task(self.worker(tid))
+        state=self.client.states.get(tid)
+        if state:self.queues[tid].put_nowait(copy.deepcopy(state))
+
+    async def detach_table(self,tid):
+        """Stop a tournament table's bot without leaving (moved to another table, or out of the tournament)."""
+        worker=self.workers.pop(tid,None)
+        if worker:worker.cancel()
+        self.queues.pop(tid,None);self.bots.pop(tid,None)
 
     def show_offer(self,tid,state,hero):
         # Short table responses share the run-it-twice task set: cancelled when the table or session closes.
@@ -465,6 +494,7 @@ class Session:
         self.queues.pop(tid,None)
 
     async def close(self):
+        if getattr(self,'tourneys',None):await self.tourneys.close()
         for t in self.workers.values(): t.cancel()
         for t in self.rit_tasks: t.cancel()
         for t in self.bust_tasks: t.cancel()
@@ -504,13 +534,14 @@ class Pilot:
             session=Session(self.policies[aid],self.decision,self.rng,repo=self.repo)
             session.on_bust_result=lambda tid,amount,aid=aid:self.bust_result(aid,tid,amount)
             session.on_break_change=lambda tables,away,aid=aid:self.break_change(aid,tables,away)
+            if hasattr(session,'tourneys'):session.tourneys.on_event=self.tournament_event
             await session.open('play task')
             self.clients[aid]=session
             return session
 
     def bust_result(self,aid,tid,amount):
         """Count a rebuy into the entry's buy-in, or leave a seat that has no chips left."""
-        e=next((x for x in self.entries.values() if x['account']==aid and int(x['table'])==tid
+        e=next((x for x in self.entries.values() if x['account']==aid and ring_table(x)==tid
                 and x['status'] in ('seated','sitting_out')),None)
         if not e:return
         if amount is not None:e['buy_in']=Decimal(str(e.get('buy_in') or 0))+Decimal(str(amount))
@@ -519,8 +550,27 @@ class Pilot:
     def break_change(self,aid,tables,away):
         """A break keeps the seats (they still count toward the target) but shows them as sitting out."""
         for e in self.entries.values():
-            if e['account']==aid and int(e['table']) in tables and e['status'] in ('seated','sitting_out'):
+            if e['account']==aid and ring_table(e) in tables and e['status'] in ('seated','sitting_out'):
                 e['status']='sitting_out' if away else 'seated'
+
+    def tournament_event(self,aid,key,event,details):
+        """Update a tournament entry: 'seated' (playing, with the current table) or 'finished'."""
+        e=next((x for x in self.entries.values() if x['account']==aid and str(x['table'])==key
+                and x['status'] not in ('closed','failed')),None)
+        if not e:
+            log.warning('Tournament %s event %s for %s has no open entry',key,event,self.policies[aid]['Username']);return
+        if event=='seated':
+            e.update(status='seated',seated=e.get('seated') or now(),confirmed=now(),play_table=str(details.get('table')))
+            log.info('SEATED %s tournament=%s table=%s',self.policies[aid]['Username'],key,details.get('table'))
+        elif event=='finished':
+            self.accrue();e.update(status='closed',closed=now(),confirmed=now());self.accrue()
+            log.info('FINISHED %s tournament=%s place=%s',self.policies[aid]['Username'],key,details.get('place'))
+        async def persist():
+            try:
+                await self.publish()
+                if event=='finished':await self.close_session_if_idle(aid)
+            except Exception:log.exception('Could not persist tournament %s for %s',key,self.policies[aid]['Username'])
+        asyncio.create_task(persist())
 
     async def close_session_if_idle(self,aid):
         """Log out after the account's final planned or active entry closes."""
@@ -584,6 +634,11 @@ class Pilot:
             raise RuntimeError('No healthy lobby observer') from last_error
         observer_states=copy.deepcopy(observer.client.states)
         observer_observed=dict(observer.observed)
+        # SNGs and MTTs are published as lobby rows too; a failed listing only skips them this round.
+        try:observer_tournaments=await observer.client.list_tournaments()
+        except Exception as exc:
+            observer_tournaments=None
+            log.warning('Tournament listing failed for %s: %s',observer.policy['Username'],type(exc).__name__)
         if temporary:
             await temporary.close()
             await asyncio.to_thread(self.repo.release_observer,temporary.policy['BotAccountId'])
@@ -609,6 +664,8 @@ class Pilot:
                 'account':native.get(s.get('i')) or by_username.get((s.get('dn') or s.get('n','')).casefold()),
                 'stack':Decimal(s.get('c',0))/100,'bet':Decimal(s.get('b',0))/100,
                 'in_game':bool(s.get('d')),'away':bool(s.get('f',0)&1),'hand':str(state.get('gi','')),'observed':stamp_state} for i,s in live]
+        if observer_tournaments is not None:
+            self.tables.extend(tournament_lobby_rows(observer_tournaments,stamp))
         await self.reconcile_observed_entries()
 
     async def reconcile_observed_entries(self):
@@ -789,6 +846,8 @@ class Pilot:
         await self.publish()
 
     async def execute(self,e,cmd,kind):
+        if str(e['table']).startswith('T'):
+            return await self.execute_tournament(e,cmd,kind)
         c=None;tid=int(e['table'])
         if kind=='leave' and e['status'] in ('closed','failed'):
             # The worker already left on its own, e.g. after a bust without a rebuy.
@@ -842,6 +901,38 @@ class Pilot:
                 except Exception: log.exception('Could not close idle account %s',self.policies[e['account']]['Username'])
             try: await self.publish()
             except Exception: log.exception('Could not persist task outcome')
+
+    async def execute_tournament(self,e,cmd,kind):
+        """Register for an SNG/MTT. The entry stays 'joining' until the tournament seats the bot,
+        then 'seated'; it closes when the bot's tournament ends. Tournaments are never left."""
+        username=self.policies[e['account']]['Username']
+        if kind!='join':
+            cmd.update(status='succeeded',result='tournament_kept');await self.publish();return
+        cmd['status']='claimed';e['status']='joining'
+        try:
+            await self.publish()
+            if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
+                e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed');return
+            await self.decision.require_evenbet_hand_history()
+            c=await self.session_for(e['account'])
+            if c.failures:raise RuntimeError('Account connection is unhealthy')
+            row=next((t for t in self.tables if str(t['id'])==str(e['table'])),{})
+            fmt=row.get('table_type') or 'SNG'
+            await c.tourneys.register(tournament_id(e['table']),fmt)
+            session=next((s for s in reversed(self.sessions) if s['account']==e['account'] and not s.get('closed')),None)
+            e.update(confirmed=now(),session=e.get('session') or (session and session['id']))
+            cmd['status']='succeeded'
+            log.info('REGISTERED %s %s %s',username,fmt,e['table'])
+        except Exception as exc:
+            self.errors.append({'account':username,'table':e['table'],'kind':'register','error':type(exc).__name__,'at':now().isoformat()})
+            log.exception('Tournament registration failed: %s / %s',username,e['table'])
+            e.update(status='failed',closed=now())
+            cmd.update(status='failed',result=type(exc).__name__,result_text=str(exc)[:1000] if isinstance(exc,ValueError) else None)
+            try:await self.close_session_if_idle(e['account'])
+            except Exception:log.exception('Could not close idle account %s',username)
+        finally:
+            try:await self.publish()
+            except Exception:log.exception('Could not persist tournament registration')
 
     async def execute_serialized(self,e,cmd,kind):
         """Serialize poker-server mutations per login while allowing accounts in parallel."""
@@ -947,6 +1038,19 @@ class Pilot:
             await session.client.list_tables()
             lobby={int(t['i']):t for t in session.client.tables.values()}
             for row in entries:
+                if str(row['TableId']).startswith('T'):
+                    # A registered or running tournament survives a restart: subscribe again and let the
+                    # server's seating messages re-attach the table bot.
+                    eid=str(row['EntryId']);key=str(row['TableId']);status=row['Status'] if row['Status'] in ('joining','seated') else 'joining'
+                    await asyncio.to_thread(self.repo.adopt_reconciled_entry,row['EntryId'],status)
+                    self.entries[eid]={'id':eid,'account':aid,'table':key,'status':status,'buy_in':row['BuyInAmount'],
+                        'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),'commands':[],
+                        'session':str(row['SessionId']) if row.get('SessionId') else None}
+                    session.tourneys.active.setdefault(tournament_id(key),{'format':'SNG','entry_idx':0,'table':None,'addon_decided':False})
+                    try:await session.client.connection.request('SubscribeTournament',tournamentId=tournament_id(key))
+                    except Exception as exc:log.warning('Tournament resubscribe failed for %s / %s: %s',row['Username'],key,exc)
+                    log.info('Restart kept tournament entry: %s / %s',row['Username'],key)
+                    continue
                 tid=int(row['TableId'])
                 info=lobby.get(tid) or session.client.tables.get(tid) or {'i':tid,'n':str(tid)}
                 status=await session.adopt(tid,info)
@@ -1005,6 +1109,7 @@ class Pilot:
                     if e['status'] not in ('seated','sitting_out'): continue
                     s=next(s for s in self.sessions if s['id']==e['session'])
                     c=self.clients[e['account']]
+                    if ring_table(e) is None: continue # Tournaments are played to the end.
                     if now()>=s['end'] or int(e['table']) in c.failures or -1 in c.failures:
                         self.start_leave(e)
                 await asyncio.sleep(.25)
