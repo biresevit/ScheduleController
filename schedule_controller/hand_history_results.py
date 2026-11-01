@@ -9,9 +9,11 @@ import os
 import re
 
 from .database import connection_string
+from .hand_settlement import correct_winnings
 
 log = logging.getLogger(__name__)
-PARSER_VERSION = 1
+# 2: showdowns re-settled from the cards (correct_winnings); older results are reprocessed.
+PARSER_VERSION = 2
 MONEY = r"(?P<amount>\d+(?:\.\d+)?)"
 ACTION = re.compile(r"^(?P<player>.+?) (?:posts (?:small blind|big blind|ante)|calls|bets|raises) \[\$" + MONEY + r" USD\]", re.I)
 WIN = re.compile(r"^(?P<player>.+?) wins \$" + MONEY + r" USD(?:\s+from .+)?$", re.I)
@@ -20,6 +22,7 @@ SEAT = re.compile(r"^Seat\s+\d+:\s+(?P<player>.*?)\s+\(\s*\$[\d.]+\s+USD\s*\)", 
 
 def player_results(text: str) -> list[dict]:
     """Return every seated player's invested, won and net amounts in one pass."""
+    text = correct_winnings(text)
     sections = re.split(r"\*{5} Hand History for Game \d+ \*{5}", text)
     if len(sections) == 1:
         raise ValueError("Unsupported hand-history format")
@@ -88,14 +91,19 @@ class HandHistoryProcessor:
                 WHERE NOT EXISTS(SELECT 1 FROM reporting.HandProcessing p WITH(UPDLOCK,HOLDLOCK)
                                  WHERE p.HandHistoryId=h.Id)
                 ORDER BY h.Id""", limit * 2, PARSER_VERSION)
+            # Rows recorded by an older parser are claimed again, whatever their status, so a
+            # parser fix corrects existing results; they start a fresh attempt count.
             ids = [r[0] for r in c.execute(""";WITH work AS(
                     SELECT TOP (?) p.* FROM reporting.HandProcessing p WITH(UPDLOCK,READPAST,ROWLOCK)
-                    WHERE (p.Status='pending' OR (p.Status='failed' AND p.AttemptCount<5)
-                           OR (p.Status='processing' AND p.LeaseUntilUtc<SYSUTCDATETIME()))
-                      AND p.ParserVersion=? ORDER BY p.HandHistoryId)
-                UPDATE work SET Status='processing',AttemptCount=AttemptCount+1,
+                    WHERE ((p.Status='pending' OR (p.Status='failed' AND p.AttemptCount<5)) AND p.ParserVersion=?)
+                       OR (p.ParserVersion<? AND p.Status<>'processing')
+                       OR (p.Status='processing' AND p.LeaseUntilUtc<SYSUTCDATETIME())
+                    ORDER BY p.HandHistoryId)
+                UPDATE work SET Status='processing',
+                    AttemptCount=CASE WHEN ParserVersion<? THEN 1 ELSE AttemptCount+1 END,ParserVersion=?,
                     LeaseUntilUtc=DATEADD(minute,5,SYSUTCDATETIME()),LastError=NULL,UpdatedUtc=SYSUTCDATETIME()
-                OUTPUT inserted.HandHistoryId""", limit, PARSER_VERSION).fetchall()]
+                OUTPUT inserted.HandHistoryId""", limit, PARSER_VERSION, PARSER_VERSION,
+                PARSER_VERSION, PARSER_VERSION).fetchall()]
             if not ids:
                 conn.commit()
                 return []
