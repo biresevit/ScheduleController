@@ -234,3 +234,13 @@ def test_unregister_refuses_once_seated_or_when_evenbet_keeps_the_registration()
             await t.unregister(9)
         assert 9 in t.active
     run(go())
+
+
+def test_concurrent_resumes_attach_a_tournament_table_once():
+    async def go():
+        session, t, events = play()
+        session.client.player_tables = [{"i": 777, "t": 42, "n": "Sandstorm"}]
+        await asyncio.gather(t.resume(), t.resume())
+        assert session.attached == [777] and t.by_table == {777: 42}
+        await t.close()
+    run(go())

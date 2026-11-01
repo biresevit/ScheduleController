@@ -179,7 +179,8 @@ class Repository(ChatRepository,ManualRepository):
 
     @retry_deadlocks
     def adopt_reconciled_entry(self,entry_id,status):
-        if status not in ('seated','sitting_out'):
+        # 'joining': a tournament registration still waiting for its tournament to start.
+        if status not in ('seated','sitting_out','joining'):
             raise ValueError('Invalid adopted entry status')
         with self.transaction() as db:
             entry=db.one("""SELECT EntryId,BotAccountId,SessionId FROM scheduler.Entry WITH(UPDLOCK,HOLDLOCK)

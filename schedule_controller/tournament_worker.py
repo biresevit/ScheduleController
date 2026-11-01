@@ -64,6 +64,7 @@ class TournamentPlay:
         self.by_table: dict[int, int] = {}    # play table id -> tournament id
         self.tasks: set = set()
         self.on_event = None
+        self.resume_lock = asyncio.Lock()
 
     @property
     def client(self):
@@ -209,7 +210,11 @@ class TournamentPlay:
         self.emit(tid, "seated", table=table)
 
     async def resume(self):
-        """Re-attach tournament tables the account still sits at (after a reconnect or worker restart)."""
+        """Re-attach tournament tables the account still sits at (after a login, reconnect or worker restart)."""
+        async with self.resume_lock:
+            await self._resume()
+
+    async def _resume(self):
         for table in await self.client.refresh_player_tables():
             tid, table_id = table.get("t"), table.get("i")
             if not tid or not table_id:

@@ -546,6 +546,10 @@ class Pilot:
             if hasattr(session,'tourneys'):session.tourneys.on_event=self.tournament_event
             await session.open('play task')
             self.clients[aid]=session
+            if hasattr(session,'tourneys'):
+                # Play every tournament table EvenBet already seated this account at, also one whose
+                # registration the database no longer holds (e.g. cut off by an immediate update).
+                session.tourneys.spawn(session.tourneys.resume(),'resume at login')
             return session
 
     def bust_result(self,aid,tid,amount):
