@@ -340,7 +340,39 @@ class Session:
         return amount
 
     def new_bot(self,tid):
-        return Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid),on_bust=self.bust)
+        return Bot(self.client,self.decision,tid,hand_history=True,control=self.table_control(tid),on_bust=self.bust,
+                   on_show_offer=self.show_offer)
+
+    def show_offer(self,tid,state,hero):
+        # Short table responses share the run-it-twice task set: cancelled when the table or session closes.
+        task=asyncio.create_task(self.maybe_show(tid,copy.deepcopy(state),hero))
+        task.rit_table=tid
+        self.rit_tasks.add(task)
+        task.add_done_callback(self.rit_tasks.discard)
+
+    async def maybe_show(self,tid,state,hero):
+        """After an uncontested win, show a qualifying hand with the account's show-cards chance."""
+        from poker_controller.handrank import show_reason
+        try:
+            bot=self.bots.get(tid)
+            if not bot or (bot.control and await bot.control.manual_enabled()):
+                return
+            game=state.get('gt',self.client.tables.get(tid,{}).get('g'))
+            reason=show_reason(game,cards(state['s'][hero].get('d')),cards(state.get('d',{}).get('c')))
+            chance=self.policy.get('ShowCardsChance')
+            chance=.05 if chance is None else float(chance)
+            if not reason or self.rng.random()>=chance:
+                return
+            await asyncio.sleep(self.rng.uniform(.6,2.5))
+            latest=self.client.states.get(tid,{})
+            if latest.get('gi')!=state.get('gi') or latest.get('m',{}).get('ai')!=hero or 10 not in latest.get('aa',[]):
+                return # The offer expired while "thinking".
+            await self.client.play(tid,10,0)
+            log.info('SHOW %s table=%s hand=%s (%s)',self.policy['Username'],tid,state.get('gi'),reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning('Show cards failed for %s / %s: %s',self.policy['Username'],tid,exc)
 
     def bust(self,tid):
         task=asyncio.create_task(self.rebuy_or_leave(tid))
