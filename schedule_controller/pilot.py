@@ -885,6 +885,8 @@ class Pilot:
                 if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
                     e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed')
                     return
+                if tid not in self.info:
+                    raise RuntimeError(f'Table {tid} is no longer available in the lobby')
                 await self.decision.require_evenbet_hand_history()
                 c=await self.session_for(e['account'])
                 if now()>self.end or c.failures: raise RuntimeError('Pilot is ending or account is unhealthy')
@@ -907,12 +909,13 @@ class Pilot:
             cmd['status']='succeeded'
         except Exception as exc:
             username=self.policies[e['account']]['Username']
+            error_detail=f'{type(exc).__name__}: {str(exc)}'
             self.errors.append({'account':username,'table':tid,'kind':kind,'error':type(exc).__name__,'at':now().isoformat()})
             log.exception('Task failed: %s / %s / %s',kind,username,tid)
             try:
                 if c: await c.remove(tid,finish=False)
                 self.accrue();e.update(status='failed',closed=now());self.accrue()
-                cmd.update(status='failed',result=type(exc).__name__,result_text=str(exc)[:1000] if isinstance(exc,ValueError) else None)
+                cmd.update(status='failed',result=type(exc).__name__,result_text=error_detail[:1000])
             except Exception:
                 e['status']='uncertain';cmd.update(status='uncertain',result='cleanup_unconfirmed')
                 c.failures[tid]='cleanup_unconfirmed'
