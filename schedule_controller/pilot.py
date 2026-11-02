@@ -774,8 +774,16 @@ class Pilot:
             await asyncio.sleep(.1 if requests else 1)
 
     async def publish_live_view(self,request):
-        aid=request['BotAccountId'];tid=int(request['TableId'])
+        aid=request['BotAccountId'];key=str(request['TableId'])
         session=self.clients.get(aid)
+        tournament=key.startswith('T')
+        if tournament:
+            # The request names the tournament; follow the table the bot plays now (also after a move).
+            tid=((getattr(session,'tourneys',None) and session.tourneys.active.get(tournament_id(key))) or {}).get('table')
+            if not tid:
+                return False
+        else:
+            tid=int(key)
         state=session.client.states.get(tid) if session else None
         if not state:
             return False
@@ -816,6 +824,10 @@ class Pilot:
         payload['manual']['on_break']=bool(bot and bot.on_break)
         payload['manual']['break_seconds']=max(0,round(session.break_until-time.time())) if bot and bot.on_break and getattr(session,'break_until',None) else None
         payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
+        if tournament:
+            # Manual control is per ring table; at a tournament table the bot always plays itself.
+            payload['tournament']=True
+            payload['manual'].update(supported=False,enabled=False)
         await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
         return True
 

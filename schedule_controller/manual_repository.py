@@ -66,7 +66,8 @@ class ManualRepository:
                 pending=db.one("SELECT Status FROM scheduler.ManualTableAction WHERE ActionId=?",command['ActionId'])
                 if not pending or pending['Status']!='queued':return False
             elif mode:return False
-            if not db.one('SELECT EntryId FROM scheduler.Entry WHERE SiteId=:site AND MachineId=:machine AND BotAccountId=? AND TableId=? AND IsOpen=1 AND WorkerEpoch=?',aid,str(tid),self.epoch):return False
+            # A tournament entry's TableId is the tournament ('T...'); the table it plays is PlayTableId.
+            if not db.one('SELECT EntryId FROM scheduler.Entry WHERE SiteId=:site AND MachineId=:machine AND BotAccountId=? AND (TableId=? OR PlayTableId=?) AND IsOpen=1 AND WorkerEpoch=?',aid,str(tid),str(tid),self.epoch):return False
             if db.one('SELECT TurnKey FROM scheduler.TableActionClaim WHERE SiteId=:site AND BotAccountId=? AND TableId=? AND TurnKey=?',aid,str(tid),key):
                 if command:db.execute("UPDATE scheduler.ManualTableAction SET Status='expired',ResultText='An action was already submitted for this turn.' WHERE ActionId=?",command['ActionId'])
                 return False
