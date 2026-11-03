@@ -710,7 +710,11 @@ class Pilot:
                 if command['status'] in ('pending','claimed','uncertain'):
                     command.update(status='succeeded' if command['kind']=='leave' else 'cancelled',result='reconciled_absent',result_text='A fresh complete table snapshot confirms the bot is no longer seated.')
             closed_accounts.add(entry['account'])
-            log.info('Live reconciliation confirmed absent: %s / %s',policy['Username'],entry['table'])
+            transport=getattr(getattr(connection,'client',None),'connection',None)
+            failure=getattr(transport,'failure',None);session_ready=getattr(connection,'ready',None)
+            log.info('Live reconciliation confirmed absent: %s / %s; observed=%s previous_confirmation=%s connection_failed=%s session_ready=%s',
+                policy['Username'],entry['table'],observed,last,
+                type(failure).__name__ if failure else None,session_ready.is_set() if session_ready else False)
         for account in closed_accounts:
             if not getattr(self,'cloud',False) and not any(e['account']==account and e['status'] not in ('closed','failed') for e in self.entries.values()):
                 for session in self.sessions:
