@@ -761,30 +761,42 @@ class Pilot:
                     live={str(r['RequestId']) for r in requests}
                     published={k:v for k,v in published.items() if k in live}
                 for request in requests:
-                    rid=str(request['RequestId']);session=self.clients.get(request['BotAccountId'])
-                    version=session.client.state_versions.get(int(request['TableId'])) if session else None
-                    last=published.get(rid)
-                    if last and last[0]==version and tick-last[1]<1:
-                        continue
-                    if await self.publish_live_view(request):
-                        published[rid]=(version,tick)
+                    try:
+                        rid=str(request['RequestId']);session=self.clients.get(request['BotAccountId'])
+                        tid=self.live_table_id(request)
+                        # Tournament IDs name a registration, not an integer table.
+                        # Include the playing table so moves publish immediately even
+                        # when both tables happen to have the same state version.
+                        version=(tid,session.client.state_versions.get(tid)) if session else None
+                        last=published.get(rid)
+                        if last and last[0]==version and tick-last[1]<1:
+                            continue
+                        if await self.publish_live_view(request):
+                            published[rid]=(version,tick)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        log.exception('Live view publishing failed for request %s / table %s',request.get('RequestId'),request.get('TableId'))
             except asyncio.CancelledError:
                 raise
             except Exception:
                 log.exception('Live view publishing failed')
             await asyncio.sleep(.1 if requests else 1)
 
+    def live_table_id(self,request):
+        key=str(request['TableId'])
+        session=self.clients.get(request['BotAccountId'])
+        if key.startswith('T'):
+            # The request names the tournament; follow the table the bot plays now (also after a move).
+            tid=((getattr(session,'tourneys',None) and session.tourneys.active.get(tournament_id(key))) or {}).get('table')
+            return int(tid) if tid else None
+        return int(key)
+
     async def publish_live_view(self,request):
         aid=request['BotAccountId'];key=str(request['TableId'])
         session=self.clients.get(aid)
         tournament=key.startswith('T')
-        if tournament:
-            # The request names the tournament; follow the table the bot plays now (also after a move).
-            tid=((getattr(session,'tourneys',None) and session.tourneys.active.get(tournament_id(key))) or {}).get('table')
-            if not tid:
-                return False
-        else:
-            tid=int(key)
+        tid=self.live_table_id(request)
         state=session.client.states.get(tid) if session else None
         if not state:
             return False
