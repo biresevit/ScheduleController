@@ -17,6 +17,7 @@ from .database import connection_string
 from .planner import Account, Entry, Machine, Settings, Table, plan
 from .rules import Band, Window, target_at
 from .tournaments import Tournament, excluded_names, plan_registrations
+from .join_failures import limit_failed_sessions
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +91,7 @@ class CloudScheduler:
                     Window(r["Weekday"], r["StartMinute"], r["EndMinute"], r["TargetEntries"]))
             target = target_at(windows_by_format.get("RING", []), stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
+            limit_failed_sessions(db, site_id)
             # A worker restart flags every lease on its machine for reconciliation, but only leases
             # with open entries get reconciled, and idle-lease cleanup only covers the current run.
             # Once the new worker is ready, an earlier run's lease whose bot has no open entry cannot

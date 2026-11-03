@@ -82,6 +82,30 @@ from .manual_repository import ManualRepository
 class Repository(ChatRepository,ManualRepository):
     def __init__(self,epoch,site_id=1,machine_id=1):
         self.epoch=epoch;self.site_id=int(site_id);self.machine_id=int(machine_id)
+
+    @retry_deadlocks
+    def join_session_block(self, session_id):
+        """Called under the login's execution lock before every server-side join."""
+        if not session_id:
+            return 'session_ended'
+        with self.transaction() as db:
+            row=db.one("""SELECT s.IsOpen,s.EndReason,s.PlannedEndUtc,
+                    CASE WHEN s.PlannedEndUtc>SYSUTCDATETIME() THEN 1 ELSE 0 END AS NotEnded,
+                    (SELECT COUNT(*) FROM scheduler.Command c JOIN scheduler.Entry e ON e.EntryId=c.EntryId
+                     WHERE e.SessionId=s.SessionId AND c.Kind='join' AND c.Status='failed') AS Failures
+                FROM scheduler.AccountSession s
+                JOIN scheduler.MachineAssignment a ON a.SiteId=s.SiteId AND a.MachineId=s.MachineId
+                WHERE s.SiteId=:site AND s.MachineId=:machine
+                  AND a.WorkerEpoch=? AND s.SessionId=?""",self.epoch,session_id)
+            if row and (row['EndReason']=='join_failure_limit' or row['Failures']>=2):
+                return 'join_failure_limit'
+            return None if row and row['IsOpen'] and row['NotEnded'] else 'session_ended'
+
+    @retry_deadlocks
+    def enforce_join_failure_limit(self):
+        from .join_failures import limit_failed_sessions
+        with self.transaction() as db:
+            limit_failed_sessions(db,self.site_id)
     @contextmanager
     def transaction(self):
         import pyodbc

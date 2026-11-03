@@ -27,6 +27,7 @@ from poker_controller.transport import ProtocolError
 from .planner import Account,Entry,Machine,Settings,Table,plan
 from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
+from .join_failures import LIMIT_REASON,LIMIT_DESCRIPTION,failure_description
 from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,tournament_id
 
 log=logging.getLogger(__name__)
@@ -873,7 +874,7 @@ class Pilot:
     async def execute(self,e,cmd,kind):
         if str(e['table']).startswith('T'):
             return await self.execute_tournament(e,cmd,kind)
-        c=None;tid=int(e['table'])
+        c=None;tid=int(e['table']);phase='persisting task intent'
         if kind=='leave' and e['status'] in ('closed','failed'):
             # The worker already left on its own, e.g. after a bust without a rebuy.
             cmd.update(status='succeeded',result='already_closed');await self.publish();return
@@ -882,15 +883,24 @@ class Pilot:
         try:
             await self.publish() # Persist intent before touching the poker server.
             if kind=='join':
+                if await self.block_ended_session(e,cmd):return
                 if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
                     e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed')
                     return
-                if tid not in self.info:
-                    raise RuntimeError(f'Table {tid} is no longer available in the lobby')
+                info=self.info.get(tid) # Retain a snapshot: refresh replaces self.info while login awaits.
+                phase='checking PDecision readiness'
                 await self.decision.require_evenbet_hand_history()
+                phase='logging in'
                 c=await self.session_for(e['account'])
                 if now()>self.end or c.failures: raise RuntimeError('Pilot is ending or account is unhealthy')
-                amount=await c.add(tid,self.info[tid],self.rng)
+                if info is None:
+                    phase='refreshing the account lobby'
+                    await c.client.list_tables()
+                    info=c.client.tables.get(tid)
+                if info is None:
+                    raise RuntimeError(f'Table {tid} is no longer available in this account\'s lobby')
+                phase='joining the table and taking a seat'
+                amount=await c.add(tid,info,self.rng)
                 self.accrue()
                 session=next((s for s in reversed(self.sessions) if s['account']==e['account'] and not s.get('closed')),None)
                 if not session:
@@ -899,8 +909,9 @@ class Pilot:
                     self.sessions.append(session)
                 e.update(status='seated',seated=now(),confirmed=now(),buy_in=amount,session=session['id'])
                 self.accrue()
-                log.info('SEATED %s table=%s name=%s buyin=%s',c.policy['Username'],tid,self.info[tid]['n'],amount)
+                log.info('SEATED %s table=%s name=%s buyin=%s',c.policy['Username'],tid,info.get('n',tid),amount)
             else:
+                phase='leaving the table'
                 c=self.clients.get(e['account'])
                 if not c: raise RuntimeError('Playing account is not authenticated')
                 await c.remove(tid,finish=tid not in c.failures)
@@ -909,7 +920,7 @@ class Pilot:
             cmd['status']='succeeded'
         except Exception as exc:
             username=self.policies[e['account']]['Username']
-            error_detail=f'{type(exc).__name__}: {str(exc)}'
+            error_detail=failure_description(exc,'Join' if kind=='join' else 'Leave',username,tid,phase)
             self.errors.append({'account':username,'table':tid,'kind':kind,'error':type(exc).__name__,'at':now().isoformat()})
             log.exception('Task failed: %s / %s / %s',kind,username,tid)
             try:
@@ -918,7 +929,8 @@ class Pilot:
                 cmd.update(status='failed',result=type(exc).__name__,result_text=error_detail[:1000])
             except Exception:
                 e['status']='uncertain';cmd.update(status='uncertain',result='cleanup_unconfirmed')
-                c.failures[tid]='cleanup_unconfirmed'
+                cmd['result_text']=(error_detail+' Cleanup could not be confirmed; reconciliation is required.')[:1000]
+                if c:c.failures[tid]='cleanup_unconfirmed'
         finally:
             if not getattr(self,'cloud',False):
                 for s in self.sessions:
@@ -927,8 +939,41 @@ class Pilot:
             if c:
                 try: await self.close_session_if_idle(e['account'])
                 except Exception: log.exception('Could not close idle account %s',self.policies[e['account']]['Username'])
-            try: await self.publish()
+            try:
+                await self.publish()
+                if kind=='join' and cmd['status']=='failed':
+                    await self.after_join_failure(e)
             except Exception: log.exception('Could not persist task outcome')
+
+    async def block_ended_session(self,e,cmd):
+        if not getattr(self,'cloud',False):return False
+        reason=await asyncio.to_thread(self.repo.join_session_block,e.get('session'))
+        if not reason:return False
+        e.update(status='closed',closed=now())
+        cmd.update(status='cancelled',result=reason,result_text=LIMIT_DESCRIPTION if reason==LIMIT_REASON else 'Session has ended; no new join or registration was attempted.')
+        return True
+
+    async def after_join_failure(self,e):
+        if not getattr(self,'cloud',False):return
+        # The failed outcome is committed before counting it. The per-login execution
+        # lock keeps already-claimed tasks from sending a third join in the meantime.
+        await asyncio.to_thread(self.repo.enforce_join_failure_limit)
+        if await asyncio.to_thread(self.repo.join_session_block,e.get('session'))!=LIMIT_REASON:return
+        stamp=now()
+        for s in self.sessions:
+            if str(s['id'])==str(e.get('session')):s.update(end=max(stamp,s['start']),reason=LIMIT_REASON)
+        for other in self.entries.values():
+            if str(other.get('session'))!=str(e.get('session')):continue
+            if other['status'] in ('reserved','joining'):
+                other.update(status='closed',closed=stamp)
+                for command in other.get('commands',[]):
+                    if command['kind']=='join' and command['status'] in ('pending','claimed'):
+                        command.update(status='cancelled',result=LIMIT_REASON,result_text=LIMIT_DESCRIPTION)
+            elif other['status'] in ('seated','sitting_out') and ring_table(other) is not None:
+                self.start_leave(other)
+        await self.close_session_if_idle(e['account'])
+        await self.publish()
+        log.warning('Session %s for %s stopped after two failed joins/registrations',e.get('session'),self.policies[e['account']]['Username'])
 
     async def execute_tournament(self,e,cmd,kind):
         """Register for an SNG/MTT. The entry stays 'joining' until the tournament seats the bot,
@@ -941,16 +986,20 @@ class Pilot:
                 # Scheduler departures never apply to tournaments: a registered bot plays to the end.
                 cmd.update(status='succeeded',result='tournament_kept');await self.publish();return
             return await self.unregister_tournament(e,cmd,username)
-        cmd['status']='claimed';e['status']='joining'
+        cmd['status']='claimed';e['status']='joining';phase='persisting task intent'
         try:
             await self.publish()
+            if await self.block_ended_session(e,cmd):return
             if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
                 e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed');return
+            phase='checking PDecision readiness'
             await self.decision.require_evenbet_hand_history()
+            phase='logging in'
             c=await self.session_for(e['account'])
             if c.failures:raise RuntimeError('Account connection is unhealthy')
             row=next((t for t in self.tables if str(t['id'])==str(e['table'])),{})
             fmt=row.get('table_type') or 'SNG'
+            phase='registering for the tournament'
             await c.tourneys.register(tournament_id(e['table']),fmt)
             session=next((s for s in reversed(self.sessions) if s['account']==e['account'] and not s.get('closed')),None)
             e.update(confirmed=now(),session=e.get('session') or (session and session['id']))
@@ -960,11 +1009,13 @@ class Pilot:
             self.errors.append({'account':username,'table':e['table'],'kind':'register','error':type(exc).__name__,'at':now().isoformat()})
             log.exception('Tournament registration failed: %s / %s',username,e['table'])
             e.update(status='failed',closed=now())
-            cmd.update(status='failed',result=type(exc).__name__,result_text=str(exc)[:1000] if isinstance(exc,ValueError) else None)
+            cmd.update(status='failed',result=type(exc).__name__,result_text=failure_description(exc,'Registration',username,e['table'],phase))
             try:await self.close_session_if_idle(e['account'])
             except Exception:log.exception('Could not close idle account %s',username)
         finally:
-            try:await self.publish()
+            try:
+                await self.publish()
+                if cmd['status']=='failed':await self.after_join_failure(e)
             except Exception:log.exception('Could not persist tournament registration')
 
     async def execute_serialized(self,e,cmd,kind):
