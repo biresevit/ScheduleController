@@ -42,6 +42,9 @@ def test_real_live_loop_publishes_sng_and_ring_without_integer_conversion_error(
     payload=captured[0][1]
     assert payload['table_id']=='42' and payload['table_name']=='SNG table 1'
     assert payload['tournament'] is True
+    assert payload['amount_unit']=='tournament_chips'
+    assert payload['seats'][0]['stack']==9900 and payload['seats'][1]['bet']==200
+    assert payload['pot']==300
     assert not payload['manual']['supported'] and not payload['manual']['enabled']
     assert payload['seats'][0]['cards']==[] and payload['seats'][1]['cards']
 

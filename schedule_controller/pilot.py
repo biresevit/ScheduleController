@@ -22,7 +22,7 @@ import uuid
 from poker_controller.client import EvenBetClient,Settings as ClientSettings
 from poker_controller.bot import Bot
 from poker_controller.decision import PDecision
-from poker_controller.state import cards
+from poker_controller.state import amount_scale,cards
 from poker_controller.transport import ProtocolError
 from .planner import Account,Entry,Machine,Settings,Table,plan
 from .rules import Band,Window,target_at,choose_buy_in
@@ -804,12 +804,17 @@ class Pilot:
         if hero is None:
             return False
         table_info=session.client.tables.get(tid,{})
+        # The request also identifies tournaments before optional table metadata arrives.
+        scale=1 if tournament else amount_scale(table_info)
         payload={'table_id':str(tid),'table_name':table_info.get('n',str(tid)),
             'game':{72:'NLH',79:'PLO4',88:'PLO5'}.get(table_info.get('g'),'NLH'),
             'hero':session.policy['Username'],'hand_id':str(state.get('gi','')),
-            'max_seats':len(state.get('s',[])),'big_blind':(table_info.get('bb') or 0)/100,
+            'max_seats':len(state.get('s',[])),
+            'amount_unit':'tournament_chips' if scale==1 else 'currency',
+            'big_blind':state.get('bbv',table_info.get('bb') or 0)/scale,
+            'small_blind':state.get('sbv',table_info.get('s') or 0)/scale,
             'street':{0:'Preflop',1:'Flop',2:'Turn',3:'River'}.get(state.get('m',{}).get('r'),'Complete'),
-            'board':cards(state.get('d',{}).get('c')),'pot':state.get('d',{}).get('p',0)/100,
+            'board':cards(state.get('d',{}).get('c')),'pot':state.get('d',{}).get('p',0)/scale,
             'dealer':state.get('m',{}).get('di'),'acting_seat':None,'seats':[]}
         acting_seat=state.get('m',{}).get('ai')
         if isinstance(acting_seat,int) and 0<=acting_seat<len(state.get('s',[])):
@@ -822,7 +827,7 @@ class Pilot:
             # Opponents' cards are hidden (-1) until they show them at showdown.
             shown=cards(seat.get('d'))
             payload['seats'].append({'seat':index,'name':seat.get('dn') or seat.get('n',''),
-                'stack':seat.get('c',0)/100,'bet':seat.get('b',0)/100,'in_game':bool(seat.get('d')),
+                'stack':seat.get('c',0)/scale,'bet':seat.get('b',0)/scale,'in_game':bool(seat.get('d')),
                 'sitting_out':bool(seat.get('f',0)&1),'hero':index==hero,
                 'cards':shown if index==hero or all(shown) else []})
         result=getattr(session.client,'results',{}).get(tid)
