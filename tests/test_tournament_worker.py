@@ -89,6 +89,28 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def test_repeated_partial_lobby_scans_keep_sng_and_mtt_fresh():
+    from unittest.mock import AsyncMock
+    from types import SimpleNamespace
+    from datetime import timedelta
+    from poker_controller.client import EvenBetClient
+    async def scan():
+        client=EvenBetClient(connection=SimpleNamespace(listeners=[],request=AsyncMock(side_effect=[
+            {'tournaments':[{'i':42,'n':'Sandstorm','tt':71,'g':72,'p':85,'s':71,'b':100,'np':2,'mx':6},
+                            {'i':43,'n':'Daily MTT','tt':83,'g':72,'p':85,'s':71,'b':200,'np':5,'mx':100}]},
+            {'tournaments':[{'i':42},{'i':43,'np':6}]},
+            {'tournaments':[{'i':42,'s':68},{'i':43}]}])))
+        first=lobby_rows(await client.list_tournaments(),NOW)
+        later=lobby_rows(await client.list_tournaments(),NOW+timedelta(minutes=2))
+        assert [r['id'] for r in first]==[r['id'] for r in later]==['T42','T43']
+        assert all(r['observed']==NOW+timedelta(minutes=2) for r in later)
+        assert later[0]['name']=='Sandstorm' and later[1]['occupied']==6
+        finished=lobby_rows(await client.list_tournaments(),NOW+timedelta(minutes=3))
+        assert finished[0]['tournament_state']=='completed'
+        assert finished[1]['tournament_state']=='registering'
+    run(scan())
+
+
 def test_registration_success_and_refusal():
     async def go():
         ok = {"RegisterInTournament": {"t": "RegisterInTournamentsResponse", "success": True}}
