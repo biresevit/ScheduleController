@@ -15,7 +15,35 @@ class ManualRepository:
             JOIN scheduler.LiveViewRequest r ON r.RequestId=c.RequestId
             WHERE c.SiteId=:site AND c.BotAccountId=? AND c.TableId=? AND c.MachineId=:machine
                 AND c.WorkerEpoch=? AND c.Enabled=1 AND r.Status IN ('requested','active')
-                AND r.ExpiresUtc>SYSUTCDATETIME()""",aid,str(tid),self.epoch)
+                AND r.ExpiresUtc>SYSUTCDATETIME()
+                AND (r.TableId=c.TableId OR EXISTS(SELECT 1 FROM scheduler.Entry e
+                    JOIN scheduler.LiveTableSnapshot s ON s.RequestId=r.RequestId
+                    WHERE e.SiteId=c.SiteId AND e.MachineId=c.MachineId AND e.BotAccountId=c.BotAccountId
+                      AND e.TableId=r.TableId AND e.PlayTableId=c.TableId AND e.IsOpen=1
+                      AND e.WorkerEpoch=c.WorkerEpoch AND JSON_VALUE(s.PayloadJson,'$.table_id')=c.TableId))""",aid,str(tid),self.epoch)
+
+    @retry_deadlocks
+    def end_live_table_views(self,aid,tid):
+        """A moved/closed tournament table never transfers a manual lease to its successor."""
+        with self.transaction() as db:
+            self._manual_lock(db,aid,tid)
+            self._end_live_table_views(db,aid,tid)
+
+    def _end_live_table_views(self,db,aid,tid):
+        detail='The bot left or changed this tournament table. Open a new live view to continue.'
+        db.execute("""UPDATE r SET Status='failed',ErrorText=? FROM scheduler.LiveViewRequest r
+            JOIN scheduler.LiveTableSnapshot s ON s.RequestId=r.RequestId
+            WHERE r.SiteId=:site AND r.MachineId=:machine AND r.BotAccountId=?
+              AND LEFT(r.TableId,1)='T' AND JSON_VALUE(s.PayloadJson,'$.table_id')=?
+              AND r.Status IN ('requested','active')""",detail,aid,str(tid))
+        db.execute("""UPDATE c SET Enabled=0,UpdatedUtc=SYSUTCDATETIME() FROM scheduler.ManualTableControl c
+            JOIN scheduler.LiveViewRequest r ON r.RequestId=c.RequestId
+            WHERE c.SiteId=:site AND c.MachineId=:machine AND c.BotAccountId=? AND c.TableId=?
+              AND r.Status='failed'""",aid,str(tid))
+        db.execute("""UPDATE x SET Status='expired',ResultText=?,UpdatedUtc=SYSUTCDATETIME()
+            FROM scheduler.ManualTableAction x JOIN scheduler.LiveViewRequest r ON r.RequestId=x.RequestId
+            WHERE x.SiteId=:site AND x.MachineId=:machine AND x.BotAccountId=? AND x.TableId=?
+              AND x.Status='queued' AND r.Status='failed'""",detail,aid,str(tid))
 
     @retry_deadlocks
     def manual_offer(self,aid,tid,key):

@@ -378,6 +378,12 @@ class Session:
 
     async def detach_table(self,tid):
         """Stop a tournament table's bot without leaving (moved to another table, or out of the tournament)."""
+        bot=self.bots.get(tid)
+        if bot:bot.table_detached=True
+        repo=getattr(self,'repo',None)
+        if repo:
+            try:await asyncio.to_thread(repo.end_live_table_views,self.policy['BotAccountId'],tid)
+            except Exception:log.exception('Could not close live windows for detached tournament table %s',tid)
         worker=self.workers.pop(tid,None)
         if worker:worker.cancel()
         self.queues.pop(tid,None);self.bots.pop(tid,None)
@@ -797,6 +803,10 @@ class Pilot:
         session=self.clients.get(aid)
         tournament=key.startswith('T')
         tid=self.live_table_id(request)
+        bound=request.get('BoundTableId')
+        if tournament and bound and str(tid)!=str(bound):
+            await asyncio.to_thread(self.repo.end_live_table_views,aid,int(bound))
+            return False
         state=session.client.states.get(tid) if session else None
         if not state:
             return False
@@ -837,17 +847,16 @@ class Pilot:
         bot=session.bots.get(tid)
         payload['clock']=clock(state,getattr(session.client,'state_times',{}).get(tid),time.time())
         payload['manual']=options(state,hero,bot.mapper if bot else None)
+        payload['manual']['amount_scale']=scale
         payload['manual']['sit_out_pending']=bool(bot and bot.sit_out_requested and not payload['manual']['away'])
         payload['manual']['leaving']=bool(bot and bot.leaving)
         payload['manual']['on_break']=bool(bot and bot.on_break)
         payload['manual']['break_seconds']=max(0,round(session.break_until-time.time())) if bot and bot.on_break and getattr(session,'break_until',None) else None
         payload['manual'].update(await asyncio.to_thread(self.repo.manual_snapshot,aid,tid,payload['manual']['turn_key']))
         if tournament:
-            # Manual control is per ring table; at a tournament table the bot always plays itself.
             payload['tournament']=True
-            payload['manual'].update(supported=False,enabled=False)
-        await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
-        return True
+            payload['manual']['table_bound']=True
+        return await asyncio.to_thread(self.repo.publish_live_view,request['RequestId'],state.get('gi'),payload)
 
     async def schedule(self):
         stamp=now()

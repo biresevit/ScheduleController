@@ -13,12 +13,19 @@ def live_pilot():
         tables={42:{'n':'SNG table 1'},43:{'n':'SNG table 2'}},hero_seat=lambda value:1)
     p.clients={1:SimpleNamespace(client=client,bots={},policy={'Username':'andrew'},
                                 tourneys=SimpleNamespace(active={123:{'table':42}}))}
-    captured=[]
+    captured=[];ended=[]
+    requests=[{'RequestId':'sng','BotAccountId':1,'TableId':'T123'},
+              {'RequestId':'ring','BotAccountId':1,'TableId':'42'}]
+    def publish(rid,hand,payload):
+        captured.append((rid,payload))
+        for request in requests:
+            if request['RequestId']==rid:request.setdefault('BoundTableId',payload['table_id'])
+        return True
     p.repo=SimpleNamespace(
-        live_view_requests=lambda:[{'RequestId':'sng','BotAccountId':1,'TableId':'T123'},
-                                  {'RequestId':'ring','BotAccountId':1,'TableId':'42'}],
-        manual_snapshot=lambda *args:{'enabled':True},
-        publish_live_view=lambda rid,hand,payload:captured.append((rid,payload)) or True)
+        live_view_requests=lambda:requests,
+        manual_snapshot=lambda *args:{'supported':True,'enabled':False},
+        end_live_table_views=lambda aid,tid:ended.append((aid,tid)),
+        ended=ended,publish_live_view=publish)
     return p,captured
 
 
@@ -45,15 +52,17 @@ def test_real_live_loop_publishes_sng_and_ring_without_integer_conversion_error(
     assert payload['amount_unit']=='tournament_chips'
     assert payload['seats'][0]['stack']==9900 and payload['seats'][1]['bet']==200
     assert payload['pot']==300
-    assert not payload['manual']['supported'] and not payload['manual']['enabled']
+    assert payload['manual']['supported'] and not payload['manual']['enabled']
+    assert payload['manual']['amount_scale']==1 and payload['manual']['table_bound']
     assert payload['seats'][0]['cards']==[] and payload['seats'][1]['cards']
 
 
-def test_sng_table_move_with_equal_version_publishes_before_heartbeat(monkeypatch):
+def test_sng_table_move_stops_the_existing_live_window(monkeypatch):
     p,captured=live_pilot()
     def move():p.clients[1].tourneys.active[123]['table']=43
     run_steps(p,monkeypatch,[move])
-    assert [payload['table_id'] for rid,payload in captured if rid=='sng']==['42','43']
+    assert [payload['table_id'] for rid,payload in captured if rid=='sng']==['42']
+    assert p.repo.ended==[(1,42)]
     assert [rid for rid,_ in captured].count('ring')==1
 
 

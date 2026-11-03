@@ -35,12 +35,14 @@ class ManualBridge:
         return False
 
     async def play(self,bot,state,hero,key,command):
+        if getattr(bot,'table_detached',False):
+            await self.finish(command,'expired','The tournament table changed. Open a new live view.');return
         try:action,funds=action_to_play(command,state,hero,bot.mapper)
         except ValueError as e:
             await self.finish(command,'failed',str(e));return
         if not await asyncio.to_thread(self.repo.claim_table_action,self.aid,self.tid,key,command):return
         latest=bot.client.states.get(self.tid,{})
-        if bot.client.hero_seat(latest)!=hero or bot.mapper.turn_key(latest,hero)!=key:
+        if getattr(bot,'table_detached',False) or bot.client.hero_seat(latest)!=hero or bot.mapper.turn_key(latest,hero)!=key:
             await self.finish(command,'expired','The turn changed before submission.');return
         bot.submitted.add(key)
         try:
@@ -65,6 +67,8 @@ class ManualBridge:
         while True:
             command=await asyncio.to_thread(self.repo.claim_table_command,self.aid,self.tid)
             if not command:return
+            if getattr(bot,'table_detached',False):
+                await self.finish(command,'expired','The tournament table changed. Open a new live view.');return
             try:
                 if command['Action']=='sit_out':
                     await bot.client.sit_out_next_hand(self.tid)

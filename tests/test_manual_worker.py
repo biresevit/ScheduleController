@@ -79,6 +79,34 @@ def test_network_doubt_is_never_retried(setup):
     assert repo.finished[0][0] == "uncertain" and not repo.released and key in bot.submitted
 
 
+def test_detached_tournament_table_never_sends_a_queued_action(setup):
+    state,client,repo,bridge,bot,key,command=setup
+    bot.table_detached=True;client.play=AsyncMock()
+    asyncio.run(bridge.play(bot,state,HERO,key,command))
+    client.play.assert_not_awaited()
+    assert repo.finished[0][0]=='expired'
+
+
+def test_tournament_move_while_claiming_an_action_prevents_the_send(setup):
+    state,client,repo,bridge,bot,key,command=setup
+    def claim(*args):bot.table_detached=True;return True
+    repo.claim_table_action=claim;client.play=AsyncMock()
+    asyncio.run(bridge.play(bot,state,HERO,key,command))
+    client.play.assert_not_awaited()
+    assert repo.finished[0][0]=='expired'
+
+
+def test_tournament_raise_uses_native_chips_and_the_tournament_entry_index(setup):
+    state,client,repo,bridge,bot,key,command=setup
+    client.tables[state['ti']]={'tournament':{'format':'SNG'}}
+    client.tournament_entry_indices[state['ti']]=3
+    client.connection.request=AsyncMock(return_value={})
+    command.update(Action='raise',TargetMinor=600)
+    bridge.applied=AsyncMock(return_value=True)
+    asyncio.run(bridge.play(bot,state,HERO,key,command))
+    client.connection.request.assert_awaited_once_with('Play',tableId=state['ti'],playerEntryIdx=3,action=9,funds=500)
+
+
 def test_sit_out_and_im_back_commands_reach_the_table(setup):
     state, client, repo, bridge, bot, key, command = setup
     repo.commands = [{"ActionId": "s", "Action": "sit_out"}, {"ActionId": "b", "Action": "sit_in"}]

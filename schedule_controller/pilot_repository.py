@@ -443,8 +443,9 @@ class Repository(ChatRepository,ManualRepository):
         """Return only unexpired requests assigned to this worker's machine."""
         with self.transaction() as db:
             db.execute("UPDATE scheduler.LiveViewRequest SET Status='expired' WHERE MachineId=:machine AND Status IN ('requested','active') AND ExpiresUtc<=SYSUTCDATETIME()")
-            return db.rows("""SELECT r.RequestId,r.TableId,r.BotAccountId
+            return db.rows("""SELECT r.RequestId,r.TableId,r.BotAccountId,JSON_VALUE(s.PayloadJson,'$.table_id') AS BoundTableId
                 FROM scheduler.LiveViewRequest r
+                LEFT JOIN scheduler.LiveTableSnapshot s ON s.RequestId=r.RequestId
                 JOIN scheduler.Entry e ON e.SiteId=r.SiteId AND e.TableId=r.TableId
                     AND e.BotAccountId=r.BotAccountId AND e.MachineId=r.MachineId AND e.IsOpen=1
                 WHERE r.SiteId=:site AND r.MachineId=:machine AND r.Status IN ('requested','active')
@@ -453,12 +454,24 @@ class Repository(ChatRepository,ManualRepository):
     @retry_deadlocks
     def publish_live_view(self,request_id,hand_id,payload):
         with self.transaction() as db:
-            request=db.one("""SELECT RequestId FROM scheduler.LiveViewRequest WITH(UPDLOCK,HOLDLOCK)
+            # Match the website's physical-table lock before touching the request row.
+            # This also serializes first publication with a concurrent manual switch.
+            aid=db.one("""SELECT r.BotAccountId,JSON_VALUE(s.PayloadJson,'$.table_id') AS BoundTableId
+                FROM scheduler.LiveViewRequest r LEFT JOIN scheduler.LiveTableSnapshot s ON s.RequestId=r.RequestId
+                WHERE r.RequestId=? AND r.SiteId=:site AND r.MachineId=:machine""",request_id)
+            if not aid:return False
+            self._manual_lock(db,aid['BotAccountId'],aid.get('BoundTableId') or payload['table_id'])
+            request=db.one("""SELECT RequestId,TableId,BotAccountId FROM scheduler.LiveViewRequest WITH(UPDLOCK,HOLDLOCK)
                 WHERE RequestId=? AND SiteId=:site AND MachineId=:machine AND Status IN ('requested','active')
                     AND ExpiresUtc>SYSUTCDATETIME()""",request_id)
             if not request:
                 return False
-            if db.one('SELECT RequestId FROM scheduler.LiveTableSnapshot WHERE RequestId=?',request_id):
+            snapshot=db.one("SELECT RequestId,JSON_VALUE(PayloadJson,'$.table_id') AS BoundTableId FROM scheduler.LiveTableSnapshot WHERE RequestId=?",request_id)
+            if snapshot and str(request['TableId']).startswith('T') and str(snapshot['BoundTableId'])!=str(payload['table_id']):
+                self._manual_lock(db,request['BotAccountId'],snapshot['BoundTableId'])
+                self._end_live_table_views(db,request['BotAccountId'],snapshot['BoundTableId'])
+                return False
+            if snapshot:
                 db.execute("""UPDATE scheduler.LiveTableSnapshot SET SequenceNumber=SequenceNumber+1,
                     CapturedUtc=SYSUTCDATETIME(),HandId=?,PayloadJson=? WHERE RequestId=?""",str(hand_id or ''),json.dumps(payload),request_id)
             else:
