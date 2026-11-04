@@ -212,8 +212,8 @@ def seed_bluffpoker(cursor, customer_name: str, machine_id: int, usernames: list
             continue
         p = defaults[account_id]
         cursor.execute("""INSERT scheduler.AccountPolicy(BotAccountId,SiteId,StakeTier,PlayingFrequency,MaxPlaytimeMinutes,
-            MaxTables,PostBbChance,RunItTwiceChance,BuyInPolicyJson,IsSynthetic,CredentialRef)
-            VALUES(?,?,'high',?,?,2,?,?,?,0,?)""", account_id, site_id, p["frequency"], p["max_minutes"],
+            MaxTables,PostBbChance,RunItTwiceChance,BuyInPolicyJson,IsSynthetic,IsEnabled,CredentialRef)
+            VALUES(?,?,'high',?,?,2,?,?,?,0,1,?)""", account_id, site_id, p["frequency"], p["max_minutes"],
                        p["post_bb_chance"], p["run_it_twice_chance"], json.dumps({"80": 50, "100": 50}),
                        f"bluffpoker.json:{username}")
         added += 1
