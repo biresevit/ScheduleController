@@ -33,13 +33,13 @@ INSERT @t SELECT * FROM OPENJSON(@tables) WITH(TableId nvarchar(80) '$.id',Table
     StartUtc datetime2(3) '$.start',TournamentState varchar(12) '$.state');
 UPDATE l SET TableName=t.TableName,GameType=t.GameType,TableType=t.TableType,BigBlind=t.BigBlind,MinBuyIn=t.MinBuyIn,MaxBuyIn=t.MaxBuyIn,
     MaxSeats=t.MaxSeats,OccupiedSeats=t.OccupiedSeats,IsOpen=t.IsOpen,ObservedUtc=t.ObservedUtc,FullSnapshotUtc=t.FullSnapshotUtc,
-    StartUtc=t.StartUtc,TournamentState=t.TournamentState,
+    StartUtc=t.StartUtc,TournamentState=t.TournamentState,CurrencyCode=(SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=@site),
     ObserverEpoch=@epoch,ObserverMachineId=@machine,SnapshotSequence=l.SnapshotSequence+1
     FROM scheduler.LobbyTable l JOIN @t t ON l.SiteId=@site AND l.TableId=t.TableId;
 INSERT scheduler.LobbyTable(SiteId,TableId,TableName,GameType,TableType,BigBlind,MinBuyIn,MaxBuyIn,MaxSeats,OccupiedSeats,IsOpen,
     ObservedUtc,FullSnapshotUtc,ObserverEpoch,CurrencyCode,ObserverMachineId,SnapshotSequence,StartUtc,TournamentState)
     SELECT @site,t.TableId,t.TableName,t.GameType,t.TableType,t.BigBlind,t.MinBuyIn,t.MaxBuyIn,t.MaxSeats,t.OccupiedSeats,t.IsOpen,
-        t.ObservedUtc,t.FullSnapshotUtc,@epoch,'DEMO',@machine,1,t.StartUtc,t.TournamentState
+        t.ObservedUtc,t.FullSnapshotUtc,@epoch,(SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=@site),@machine,1,t.StartUtc,t.TournamentState
     FROM @t t WHERE NOT EXISTS(SELECT 1 FROM scheduler.LobbyTable l WHERE l.SiteId=@site AND l.TableId=t.TableId);
 DELETE s FROM scheduler.TableSeat s WHERE s.SiteId=@site AND s.TableId IN (SELECT CONVERT(nvarchar(80),value) FROM OPENJSON(@seatTables));
 INSERT scheduler.TableSeat(SiteId,TableId,SeatIndex,NativePlayerId,Username,BotAccountId,Stack,CurrentBet,InGame,SittingOut,HandId,ObservedUtc)
