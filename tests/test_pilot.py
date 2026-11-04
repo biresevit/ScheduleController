@@ -1,4 +1,5 @@
 import asyncio
+import json
 from datetime import datetime,timedelta,timezone
 from decimal import Decimal
 from types import SimpleNamespace
@@ -88,14 +89,14 @@ def test_idle_session_reconnects_with_same_username(monkeypatch):
     class FakeConnection:
         def __init__(self): self.listeners=[]
     class FakeClient:
-        def __init__(self,settings):
-            self.settings=settings;self.connection=FakeConnection();self.open=AsyncMock()
+        def __init__(self,platform,username,endpoint_url=None):
+            self.settings=SimpleNamespace(username=username);self.connection=FakeConnection();self.open=AsyncMock()
             made.append(self)
     old=SimpleNamespace(close=AsyncMock())
     session=Session.__new__(Session);session.repo=None
-    session.policy={'Username':'kate'};session.client=old
+    session.policy={'Username':'kate'};session.client=old;session.platform=module.EVENBET;session.endpoint=None
     session.stamp=lambda message: None
-    monkeypatch.setattr(module,'EvenBetClient',FakeClient)
+    monkeypatch.setattr(module,'create_client',FakeClient)
     monkeypatch.setattr(asyncio,'sleep',AsyncMock())
     assert asyncio.run(session.reconnect_idle())
     old.close.assert_awaited_once()
@@ -113,7 +114,7 @@ def test_refresh_fails_over_to_second_observer():
     second.client=SimpleNamespace(connection=SimpleNamespace(failure=None),list_tables=AsyncMock(return_value=[]),tables={},
                                   state_versions={},states={},player_id=2,join=AsyncMock(),wait_state=AsyncMock())
     p=Pilot.__new__(Pilot)
-    p.clients={1:first,2:second};p.entries={};p.info={};p.tables=[];p.seats={}
+    p.clients={1:first,2:second};p.entries={};p.info={};p.tables=[];p.seats={};p.config={'site':{'Platform':'EvenBet'}}
     asyncio.run(p.refresh())
     first.client.list_tables.assert_awaited_once()
     second.client.list_tables.assert_awaited_once()
@@ -144,7 +145,7 @@ def test_account_session_opens_on_play_task_and_closes_after_last_entry(monkeypa
     import schedule_controller.pilot as module
     events=[]
     class FakeSession:
-        def __init__(self,policy,decision,rng,repo=None):
+        def __init__(self,policy,decision,rng,repo=None,site=None):
             self.policy=policy
         async def open(self,purpose='play task'):
             events.append(('open',self.policy['Username'],purpose))
@@ -152,7 +153,7 @@ def test_account_session_opens_on_play_task_and_closes_after_last_entry(monkeypa
             events.append(('close',self.policy['Username']))
     monkeypatch.setattr(module,'Session',FakeSession)
     p=Pilot.__new__(Pilot)
-    p.client_lock=asyncio.Lock();p.clients={};p.entries={};p.repo=None
+    p.client_lock=asyncio.Lock();p.clients={};p.entries={};p.repo=None;p.config={'site':{'Platform':'EvenBet'}}
     p.policies={1:{'Username':'monica'}};p.decision=object();p.rng=random.Random(1)
     async def exercise():
         first=await p.session_for(1)
@@ -171,13 +172,13 @@ def test_lobby_refresh_uses_one_temporary_login_then_logs_out(monkeypatch):
         connection=Connection();tables={};states={};state_versions={};player_id=10
         list_tables=AsyncMock(return_value=[])
     class FakeSession:
-        def __init__(self,policy,decision,rng,repo=None):
+        def __init__(self,policy,decision,rng,repo=None,site=None):
             self.policy=policy;self.client=Client();self.failures={};self.ready=asyncio.Event();self.ready.set();self.observed={}
         async def open(self,purpose='play task'): events.append(('open',self.policy['Username'],purpose))
         async def close(self): events.append(('close',self.policy['Username']))
     monkeypatch.setattr(module,'Session',FakeSession)
     p=Pilot.__new__(Pilot)
-    p.clients={};p.entries={};p.info={};p.tables=[];p.seats={}
+    p.clients={};p.entries={};p.info={};p.tables=[];p.seats={};p.config={'site':{'Platform':'EvenBet'}}
     p.policies={1:{'Username':'monica','BotAccountId':1},2:{'Username':'kate','BotAccountId':2}};p.decision=object();p.rng=random.Random(1)
     p.repo=SimpleNamespace(claim_observer=lambda:1,release_observer=lambda account:None)
     asyncio.run(p.refresh())
@@ -228,8 +229,8 @@ def test_reconnect_keeps_surviving_tables_when_another_seat_is_absent(monkeypatc
             candidate.states[tid]={'ti':tid,'s':[{'i':7}] if tid==42 else []}
             for listener in candidate.connection.listeners:listener({'t':'GameState','gameState':candidate.states[tid]})
         candidate.return_from_away=AsyncMock();candidate.player_command=AsyncMock();candidate.join=join;candidate.hero_seat=lambda state:0 if state['s'] else None
-        monkeypatch.setattr(module,'EvenBetClient',lambda settings:candidate);monkeypatch.setattr(asyncio,'sleep',AsyncMock())
-        session=Session.__new__(Session);session.repo=None;session.policy={'Username':'kate'};session.client=SimpleNamespace(tables={42:{},43:{}},close=AsyncMock());old=session.client
+        monkeypatch.setattr(module,'create_client',lambda platform,username,endpoint_url=None:candidate);monkeypatch.setattr(asyncio,'sleep',AsyncMock())
+        session=Session.__new__(Session);session.repo=None;session.policy={'Username':'kate'};session.platform=module.EVENBET;session.endpoint=None;session.client=SimpleNamespace(tables={42:{},43:{}},close=AsyncMock());old=session.client
         session.queues={42:asyncio.Queue(),43:asyncio.Queue()};session.workers={};session.bots={tid:SimpleNamespace(client=old,process=AsyncMock()) for tid in (42,43)};session.failures={};session.observed={}
         assert await session.reconnect_active()
         assert set(session.queues)=={42} and set(session.bots)=={42}
@@ -318,3 +319,15 @@ def test_tournament_leave_unregisters_only_when_the_operator_asked():
     asyncio.run(p.execute_tournament(e,cmd,'leave'))
     assert cmd['status']=='failed' and 'already started' in cmd['result_text'] and e['status']=='seated'
     assert not tourneys.unregister.called
+
+
+def test_bluffpoker_site_sessions_use_the_bluffpoker_client(tmp_path,monkeypatch):
+    from poker_controller.bluffpoker import BluffPokerClient
+    config=tmp_path/'bluffpoker.json'
+    config.write_text(json.dumps({'api_key':'key','origin':'https://site.test','accounts':{'pepe':{'email':'p@test','password':'pw'}}}))
+    monkeypatch.setenv('BLUFFPOKER_CONFIG',str(config))
+    session=Session({'Username':'pepe'},object(),site={'Platform':'BluffPokerPlatform','EndpointUrl':'https://hub.test'})
+    assert isinstance(session.client,BluffPokerClient) and session.client.settings.hub_url=='https://hub.test'
+    assert not hasattr(session,'tourneys') # EvenBet's tournament protocol only
+    evenbet=Session({'Username':'kate'},object(),site={'Platform':'EvenBet'})
+    assert type(evenbet.client).__name__=='EvenBetClient' and hasattr(evenbet,'tourneys')

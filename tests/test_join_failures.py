@@ -20,7 +20,7 @@ def fixture_pilot(failures=0):
     p.sessions=[dict(id='session',account=7,start=p.end-timedelta(hours=2),end=p.end)]
     p.entries={};p.execution_locks={};p.client_lock=asyncio.Lock()
     p.config={'site':{'ConfigVersion':1}}
-    p.decision=SimpleNamespace(require_evenbet_hand_history=AsyncMock())
+    p.decision=SimpleNamespace(require_hand_history=AsyncMock())
     client=SimpleNamespace(tables={42:{'n':'Ring'}},list_tables=AsyncMock())
     c=SimpleNamespace(policy={'Username':'andrew'},failures={},client=client,
         add=AsyncMock(side_effect=KeyError(42)),remove=AsyncMock(),close=AsyncMock(),

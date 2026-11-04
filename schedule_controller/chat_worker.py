@@ -2,6 +2,8 @@
 import asyncio
 import logging
 
+from poker_controller.sites import table_key
+
 log=logging.getLogger(__name__)
 
 
@@ -41,7 +43,7 @@ async def run_chat(pilot):
                 try:
                     if not session or not session.ready.is_set():
                         raise ValueError('The selected bot is not connected to this table.')
-                    await session.client.send_chat(int(command['TableId']),command['Body'])
+                    await session.client.send_chat(table_key(command['TableId']),command['Body'])
                     status,detail='sent','Confirmed in table chat.'
                 except ValueError as exc:
                     status,detail='failed',str(exc)[:1000]

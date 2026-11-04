@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 from poker_controller.manual import action_to_play
+from poker_controller.sites import table_key
 from poker_controller.state import turn_key
 from poker_controller.transport import ProtocolError
 
@@ -106,7 +107,7 @@ async def run_manual(pilot):
             rows=await asyncio.to_thread(pilot.repo.manual_watches)
             active=set()
             for r in rows:
-                aid=r['BotAccountId'];tid=int(r['TableId']);active.add((aid,tid))
+                aid=r['BotAccountId'];tid=table_key(r['TableId']);active.add((aid,tid))
                 session=pilot.clients.get(aid);bot=session.bots.get(tid) if session else None
                 if not bot or not session.ready.is_set():continue
                 # Resume automatic play on switch-off, including when no new

@@ -19,8 +19,8 @@ import random
 import time
 import uuid
 
-from poker_controller.client import EvenBetClient,Settings as ClientSettings
 from poker_controller.bot import Bot
+from poker_controller.sites import EVENBET,create_client,platform_id,table_key
 from poker_controller.decision import PDecision
 from poker_controller.state import amount_scale,cards
 from poker_controller.transport import ProtocolError
@@ -38,9 +38,9 @@ TABLE_IDS={128197714,128016534,128048285,128048284,128053412,
 
 def now(): return datetime.now(timezone.utc)
 def ring_table(entry):
-    """The numeric EvenBet table of a ring entry; None for a tournament entry ('T' + tournament id)."""
+    """The table key of a ring entry (EvenBet: int, BluffPoker: UUID text); None for a tournament entry ('T' + id)."""
     table=str(entry['table'])
-    return None if table.startswith('T') else int(table)
+    return None if table.startswith('T') else table_key(table)
 def guid(): return str(uuid.uuid4())
 def aware(value):
     if value is None: return None
@@ -48,10 +48,12 @@ def aware(value):
 
 
 class Session:
-    def __init__(self,policy,decision,rng=None,repo=None):
+    def __init__(self,policy,decision,rng=None,repo=None,site=None):
         self.policy=policy
         self.repo=repo
-        self.client=EvenBetClient(ClientSettings(username=policy['Username']))
+        self.platform=platform_id((site or {}).get('Platform'))
+        self.endpoint=(site or {}).get('EndpointUrl')
+        self.client=self.new_client()
         self.decision=decision
         self.rng=rng or random.Random()
         self.bots={}
@@ -72,7 +74,12 @@ class Session:
         self.ready=asyncio.Event()
         self.ready.set()
         self.attach_observer(self.client,self.observed)
-        self.tourneys=TournamentPlay(self,log)
+        # EvenBet's tournament protocol; BluffPoker tournaments are not scheduled yet.
+        if self.platform==EVENBET:self.tourneys=TournamentPlay(self,log)
+
+    def new_client(self):
+        """A logged-out client of this account on the site's platform."""
+        return create_client(self.platform,self.policy['Username'],endpoint_url=None if self.platform==EVENBET else self.endpoint)
 
     def attach_observer(self,client,observed):
         # Reconnect candidates must not refresh timestamps on an older client's
@@ -184,7 +191,7 @@ class Session:
         while True:
             try:
                 event=await self.client.connection.next_event()
-                if event.get('t') in TOURNAMENT_TOPICS:
+                if event.get('t') in TOURNAMENT_TOPICS and hasattr(self,'tourneys'):
                     self.tourneys.handle(event)
                 if event.get('t')=='GameState':
                     s=event.get('gameState',event.get('GameState',{})); tid=s.get('ti')
@@ -229,7 +236,7 @@ class Session:
         for delay in (1,3,10):
             try:
                 await self.client.close()
-                self.client=EvenBetClient(ClientSettings(username=self.policy['Username']))
+                self.client=self.new_client()
                 self.observed={}
                 self.attach_observer(self.client,self.observed)
                 await asyncio.sleep(delay)
@@ -254,7 +261,7 @@ class Session:
             candidate=None
             try:
                 await asyncio.sleep(delay)
-                candidate=EvenBetClient(ClientSettings(username=self.policy['Username']))
+                candidate=self.new_client()
                 observed={};self.attach_observer(candidate,observed)
                 await candidate.open();present=[]
                 for tid in table_ids:
@@ -541,13 +548,17 @@ class Pilot:
             min_gap=s['MinJoinGapSeconds'],max_gap=s['MaxJoinGapSeconds'])
         for aid,client in self.clients.items(): client.policy=self.policies[aid]
 
+    @property
+    def platform(self):
+        return platform_id(self.config['site'].get('Platform'))
+
     async def session_for(self,aid):
         """Authenticate an account only when a play command is being executed."""
         async with self.client_lock:
             existing=self.clients.get(aid)
             if existing:
                 return existing
-            session=Session(self.policies[aid],self.decision,self.rng,repo=self.repo)
+            session=Session(self.policies[aid],self.decision,self.rng,repo=self.repo,site=self.config['site'])
             session.on_bust_result=lambda tid,amount,aid=aid:self.bust_result(aid,tid,amount)
             session.on_break_change=lambda tables,away,aid=aid:self.break_change(aid,tables,away)
             if hasattr(session,'tourneys'):session.tourneys.on_event=self.tournament_event
@@ -617,7 +628,7 @@ class Pilot:
                 await self.configuration()
                 scan_account=await asyncio.to_thread(self.repo.claim_observer)
             if scan_account is not None:
-                temporary=Session(self.policies[scan_account],self.decision,self.rng)
+                temporary=Session(self.policies[scan_account],self.decision,self.rng,site=self.config['site'])
                 try:await temporary.open('lobby scan')
                 except BaseException:
                     await asyncio.to_thread(self.repo.release_observer,scan_account)
@@ -630,7 +641,10 @@ class Pilot:
                     continue
                 await candidate.client.list_tables()
                 lobby=list(candidate.client.tables.values())
-                info={t['i']:t for t in lobby if t['i'] in TABLE_IDS and t.get('g') in (72,79) and t.get('p') in (80,85)}
+                # EvenBet's demo lobby is limited to the audited tables; BluffPoker's lobby lists only plain
+                # NLH/PLO ring tables (the client drops tournament and special formats).
+                allowed=TABLE_IDS if self.platform==EVENBET else None
+                info={t['i']:t for t in lobby if (allowed is None or t['i'] in allowed) and t.get('g') in (72,79) and t.get('p') in (80,85)}
                 # Subscribe to every table concurrently instead of one at a time; a lobby
                 # scan has nothing to gain from pacing itself like real table play does.
                 async def join_table(tid):
@@ -655,7 +669,7 @@ class Pilot:
         observer_states=copy.deepcopy(observer.client.states)
         observer_observed=dict(observer.observed)
         # SNGs and MTTs are published as lobby rows too; a failed listing only skips them this round.
-        try:observer_tournaments=await observer.client.list_tournaments()
+        try:observer_tournaments=await observer.client.list_tournaments() if hasattr(observer,'tourneys') else None
         except Exception as exc:
             observer_tournaments=None
             log.warning('Tournament listing failed for %s: %s',observer.policy['Username'],type(exc).__name__)
@@ -800,7 +814,7 @@ class Pilot:
             # The request names the tournament; follow the table the bot plays now (also after a move).
             tid=((getattr(session,'tourneys',None) and session.tourneys.active.get(tournament_id(key))) or {}).get('table')
             return int(tid) if tid else None
-        return int(key)
+        return table_key(key)
 
     async def publish_live_view(self,request):
         aid=request['BotAccountId'];key=str(request['TableId'])
@@ -809,7 +823,7 @@ class Pilot:
         tid=self.live_table_id(request)
         bound=request.get('BoundTableId')
         if tournament and bound and str(tid)!=str(bound):
-            await asyncio.to_thread(self.repo.end_live_table_views,aid,int(bound))
+            await asyncio.to_thread(self.repo.end_live_table_views,aid,table_key(bound))
             return False
         state=session.client.states.get(tid) if session else None
         if not state:
@@ -904,7 +918,7 @@ class Pilot:
     async def execute(self,e,cmd,kind):
         if str(e['table']).startswith('T'):
             return await self.execute_tournament(e,cmd,kind)
-        c=None;tid=int(e['table']);phase='persisting task intent'
+        c=None;tid=table_key(e['table']);phase='persisting task intent'
         if kind=='leave' and e['status'] in ('closed','failed'):
             # The worker already left on its own, e.g. after a bust without a rebuy.
             cmd.update(status='succeeded',result='already_closed');await self.publish();return
@@ -919,7 +933,7 @@ class Pilot:
                     return
                 info=self.info.get(tid) # Retain a snapshot: refresh replaces self.info while login awaits.
                 phase='checking PDecision readiness'
-                await self.decision.require_evenbet_hand_history()
+                await self.decision.require_hand_history(self.platform)
                 phase='logging in'
                 c=await self.session_for(e['account'])
                 if now()>self.end or c.failures: raise RuntimeError('Pilot is ending or account is unhealthy')
@@ -1022,8 +1036,10 @@ class Pilot:
             if await self.block_ended_session(e,cmd):return
             if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
                 e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed');return
+            if self.platform!=EVENBET:
+                raise RuntimeError('Tournament registration is not available for this platform yet')
             phase='checking PDecision readiness'
-            await self.decision.require_evenbet_hand_history()
+            await self.decision.require_hand_history(self.platform)
             phase='logging in'
             c=await self.session_for(e['account'])
             if c.failures:raise RuntimeError('Account connection is unhealthy')
@@ -1172,7 +1188,7 @@ class Pilot:
         for aid,entries in grouped.items():
             session=await self.session_for(aid)
             await session.client.list_tables()
-            lobby={int(t['i']):t for t in session.client.tables.values()}
+            lobby={table_key(t['i']):t for t in session.client.tables.values()}
             for row in entries:
                 if str(row['TableId']).startswith('T'):
                     # A registered or running tournament survives a restart: subscribe again and let the
@@ -1198,7 +1214,7 @@ class Pilot:
                             continue
                     log.info('Restart kept tournament entry: %s / %s',row['Username'],key)
                     continue
-                tid=int(row['TableId'])
+                tid=table_key(row['TableId'])
                 info=lobby.get(tid) or session.client.tables.get(tid) or {'i':tid,'n':str(tid)}
                 status=await session.adopt(tid,info)
                 if status is None:
@@ -1257,7 +1273,7 @@ class Pilot:
                     s=next(s for s in self.sessions if s['id']==e['session'])
                     c=self.clients[e['account']]
                     if ring_table(e) is None: continue # Tournaments are played to the end.
-                    if now()>=s['end'] or int(e['table']) in c.failures or -1 in c.failures:
+                    if now()>=s['end'] or table_key(e['table']) in c.failures or -1 in c.failures:
                         self.start_leave(e)
                 await asyncio.sleep(.25)
         finally:
