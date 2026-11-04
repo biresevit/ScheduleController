@@ -76,9 +76,11 @@ def seed_nenad(cursor, machine_id: int) -> dict:
         raise RuntimeError("Nenad is inactive; do not implicitly reactivate an existing customer")
     site = cursor.execute("SELECT SiteId FROM scheduler.Site WHERE CustomerId=? AND Casino=N'Evenbet'", customer_id).fetchone()
     if site is None:
-        site = cursor.execute("""INSERT scheduler.Site(CustomerId,Casino,Platform,TimeZone,CurrencyCode,EndpointUrl)
-            OUTPUT inserted.SiteId VALUES(?,N'Evenbet',N'EvenBet',N'Europe/Budapest',N'DEMO',
-            N'wss://web.evenbetpoker.com/front')""", customer_id).fetchone()
+        site = cursor.execute("""SET NOCOUNT ON;
+            DECLARE @site TABLE(SiteId int);
+            INSERT scheduler.Site(CustomerId,Casino,Platform,TimeZone,CurrencyCode,EndpointUrl)
+            OUTPUT inserted.SiteId INTO @site VALUES(?,N'Evenbet',N'EvenBet',N'Europe/Budapest',N'DEMO',
+            N'wss://web.evenbetpoker.com/front'); SELECT SiteId FROM @site""", customer_id).fetchone()
         for b in nenad_bands():
             cursor.execute("""INSERT scheduler.StakeBand(SiteId,Tier,MinBigBlind,MaxBigBlind,UpperInclusive,TargetBasisPoints)
                            VALUES(?,?,?,?,?,?)""", site[0], b.tier, b.minimum, b.maximum, b.upper_inclusive, b.basis_points)
