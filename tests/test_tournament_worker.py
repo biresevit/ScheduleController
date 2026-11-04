@@ -266,3 +266,45 @@ def test_concurrent_resumes_attach_a_tournament_table_once():
         assert session.attached == [777] and t.by_table == {777: 42}
         await t.close()
     run(go())
+
+
+@pytest.mark.parametrize('prior_status',['joining','seated','uncertain'])
+def test_restart_seating_before_entry_restoration_is_reconfirmed(prior_status):
+    """Reproduce Monica/Mason: login attaches before pilot entry adoption."""
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from schedule_controller.pilot import Pilot
+
+    async def go():
+        session,t,_=play()
+        session.tourneys=t
+        session.client.player_tables=[{'i':777,'t':42,'n':'Sandstorm'}]
+        session.client.list_tables=AsyncMock()
+        p=Pilot.__new__(Pilot)
+        p.entries={};p.sessions=[];p.policies={7:session.policy};p.clients={7:session}
+        p.close_session_if_idle=AsyncMock(return_value=False)
+        adopted=[];published=[]
+        p.repo=SimpleNamespace(adopt_reconciled_entry=lambda *args:adopted.append(args))
+        async def publish():
+            published.append([(e['status'],e.get('play_table')) for e in p.entries.values()])
+        p.publish=publish
+        t.on_event=p.tournament_event
+        async def session_for(aid):
+            await t.resume() # First seating event arrives with no restored entry.
+            assert not p.entries
+            return session
+        p.session_for=session_for
+        row=dict(BotAccountId=7,EntryId='entry',TableId='T42',Status=prior_status,
+                 BuyInAmount=None,CreatedUtc=NOW,SeatedUtc=None,SessionId=None,Username='kate')
+        await p.reconcile_cloud_entries([row])
+        await asyncio.sleep(0)
+        e=p.entries['entry']
+        assert e['status']=='seated' and e['play_table']=='777' and e['confirmed']
+        assert published[-1]==[('seated','777')]
+        # Reconfirmation must not resend a seat claim, create another bot, or
+        # detach the table (which would end existing live/manual views).
+        assert session.attached==[777] and not session.detached
+        assert [topic for topic,_ in session.client.connection.sent].count('SitDown')==1
+        assert len(adopted)==1
+        await t.close()
+    run(go())

@@ -184,6 +184,10 @@ class TournamentPlay:
         state = self.active.setdefault(tid, {"format": "SNG", "entry_idx": entry_idx, "table": None, "addon_decided": False})
         previous = state.get("table")
         if previous == table and table in self.session.bots:
+            # Login recovery may attach the bot before the pilot restores its
+            # entry. Reconfirm the seat on the later recovery pass, without
+            # selecting the table or starting another table worker.
+            self.emit(tid, "seated", table=table)
             return
         if previous and previous != table:
             # Table balancing: the tournament moved the bot. Stop the old table bot without leaving.
