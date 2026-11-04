@@ -1114,8 +1114,8 @@ class Pilot:
         # Azure owns session lifetimes here: a session outlives its tables and the scheduler
         # closes it at its planned end. The worker must not end sessions when tables close.
         self.cloud=True
-        await self.decision.require_evenbet_hand_history()
         await self.configuration()
+        await self.decision.require_hand_history(self.platform)
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
         chat_task=manual_task=live_task=None
         try:
@@ -1233,8 +1233,8 @@ class Pilot:
             await self.close_session_if_idle(aid)
 
     async def run(self):
-        await self.decision.require_evenbet_hand_history()
         await self.configuration()
+        await self.decision.require_hand_history(self.platform)
         self.end=now()+timedelta(seconds=self.args.seconds)
         try:
             if self.args.probe:
