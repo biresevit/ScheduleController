@@ -533,7 +533,7 @@ class Pilot:
         self.clients={};self.entries={};self.sessions=[];self.accounting={};self.intervals=[];self.sequence=0
         self.info={};self.tables=[];self.seats={};self.pending=[];self.jobs={};self.errors=[]
         self.next_join=self.next_leave=self.last_plan=None;self.saved=None;self.started=False
-        self.decision=PDecision(api_key=os.getenv('PDECISION_API_KEY',''))
+        self.decision=PDecision(os.getenv('PDECISION_URL','http://127.0.0.1:5005'),api_key=os.getenv('PDECISION_API_KEY','')) # a second casino on one PC uses its own PDecision
         self.output=Path(args.output);self.output.mkdir(parents=True,exist_ok=True)
         self.publish_lock=asyncio.Lock()
         self.client_lock=asyncio.Lock()
