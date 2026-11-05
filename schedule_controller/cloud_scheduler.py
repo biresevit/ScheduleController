@@ -13,6 +13,7 @@ import uuid
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
+from .tournament_worker import tournament_id
 from .database import connection_string
 from .planner import Account, Entry, Machine, Settings, Table, plan
 from .rules import Band, Window, target_at
@@ -259,7 +260,7 @@ class CloudScheduler:
             for action in plan.actions:
                 join = SimpleNamespace(account=action.account, machine=action.machine, table=action.tournament,
                                        not_before=action.not_before, soft_limit_override=False)
-                extra = {"format": fmt, "tournament_id": int(action.tournament.removeprefix("T"))}
+                extra = {"format": fmt, "tournament_id": tournament_id(action.tournament)}
                 if self._create_join(db, site, join, policy_by_id[action.account], machine_by_id[action.machine], rng, extra):
                     created += 1
             if created:

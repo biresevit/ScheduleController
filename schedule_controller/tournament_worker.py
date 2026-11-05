@@ -21,11 +21,13 @@ SPIN = 80
 
 
 def lobby_key(tournament_id) -> str:
-    return f"T{int(tournament_id)}"
+    return f"T{tournament_id}"
 
 
-def tournament_id(lobby_table_id: str) -> int:
-    return int(str(lobby_table_id).removeprefix("T"))
+def tournament_id(lobby_table_id: str) -> int | str:
+    """EvenBet tournament ids are numbers; other platforms' (BluffPoker UUIDs) stay text."""
+    text = str(lobby_table_id).removeprefix("T")
+    return int(text) if text.isdigit() else text
 
 
 def parse_start(value) -> datetime | None:

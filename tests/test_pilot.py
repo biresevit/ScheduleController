@@ -328,6 +328,7 @@ def test_bluffpoker_site_sessions_use_the_bluffpoker_client(tmp_path,monkeypatch
     monkeypatch.setenv('BLUFFPOKER_CONFIG',str(config))
     session=Session({'Username':'pepe'},object(),site={'Platform':'BluffPokerPlatform','EndpointUrl':'https://hub.test'})
     assert isinstance(session.client,BluffPokerClient) and session.client.settings.hub_url=='https://hub.test'
-    assert not hasattr(session,'tourneys') # EvenBet's tournament protocol only
+    from schedule_controller.bluffpoker_tournaments import BluffPokerTournaments
+    assert isinstance(session.tourneys,BluffPokerTournaments)
     evenbet=Session({'Username':'kate'},object(),site={'Platform':'EvenBet'})
     assert type(evenbet.client).__name__=='EvenBetClient' and hasattr(evenbet,'tourneys')

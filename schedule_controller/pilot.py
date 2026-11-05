@@ -20,7 +20,7 @@ import time
 import uuid
 
 from poker_controller.bot import Bot
-from poker_controller.sites import EVENBET,create_client,platform_id,table_key
+from poker_controller.sites import BLUFFPOKER,EVENBET,create_client,platform_id,table_key
 from poker_controller.decision import PDecision
 from poker_controller.state import amount_scale,cards
 from poker_controller.transport import ProtocolError
@@ -29,6 +29,7 @@ from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
 from .join_failures import LIMIT_REASON,LIMIT_DESCRIPTION,failure_description
 from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,tournament_id
+from .bluffpoker_tournaments import BluffPokerTournaments,lobby_rows as bluffpoker_tournament_rows
 
 log=logging.getLogger(__name__)
 # Audited ordinary NLH/PLO4 demo tables. No fast-fold, double-board, bomb-pot,
@@ -74,8 +75,8 @@ class Session:
         self.ready=asyncio.Event()
         self.ready.set()
         self.attach_observer(self.client,self.observed)
-        # EvenBet's tournament protocol; BluffPoker tournaments are not scheduled yet.
         if self.platform==EVENBET:self.tourneys=TournamentPlay(self,log)
+        elif self.platform==BLUFFPOKER:self.tourneys=BluffPokerTournaments(self,log)
 
     def new_client(self):
         """A logged-out client of this account on the site's platform."""
@@ -699,7 +700,8 @@ class Pilot:
                 'stack':Decimal(s.get('c',0))/100,'bet':Decimal(s.get('b',0))/100,
                 'in_game':bool(s.get('d')),'away':bool(s.get('f',0)&1),'hand':str(state.get('gi','')),'observed':stamp_state} for i,s in live]
         if observer_tournaments is not None:
-            self.tables.extend(tournament_lobby_rows(observer_tournaments,stamp))
+            rows=bluffpoker_tournament_rows if self.platform==BLUFFPOKER else tournament_lobby_rows
+            self.tables.extend(rows(observer_tournaments,stamp))
         await self.reconcile_observed_entries()
 
     async def reconcile_observed_entries(self):
@@ -813,7 +815,7 @@ class Pilot:
         if key.startswith('T'):
             # The request names the tournament; follow the table the bot plays now (also after a move).
             tid=((getattr(session,'tourneys',None) and session.tourneys.active.get(tournament_id(key))) or {}).get('table')
-            return int(tid) if tid else None
+            return table_key(tid) if tid else None
         return table_key(key)
 
     async def publish_live_view(self,request):
@@ -1036,8 +1038,6 @@ class Pilot:
             if await self.block_ended_session(e,cmd):return
             if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
                 e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed');return
-            if self.platform!=EVENBET:
-                raise RuntimeError('Tournament registration is not available for this platform yet')
             phase='checking PDecision readiness'
             await self.decision.require_hand_history(self.platform)
             phase='logging in'
