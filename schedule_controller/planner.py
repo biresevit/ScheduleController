@@ -147,8 +147,9 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     owners: dict[int, set[int]] = {a.id: ({a.owner_machine} if a.owner_machine is not None else set()) for a in acc.values()}
     for e in active:
         owners[e.account].add(e.machine)
-    current = Counter(acc[e.account].tier for e in active if not acc[e.account].manual)
-    draining = Counter(acc[e.account].tier for e in active if e.status == "draining" and not acc[e.account].manual)
+    # Manual sessions count toward the occupancy target like scheduled ones; only scheduled seats are trimmed.
+    current = Counter(acc[e.account].tier for e in active)
+    draining = Counter(acc[e.account].tier for e in active if e.status == "draining")
     machine_count = Counter(e.machine for e in active)
     account_count = Counter(e.account for e in active)
     concentration = Counter((e.machine, e.table) for e in active)
@@ -230,7 +231,8 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                   "lease needs reconciliation" if a.requires_reconciliation else
                   f"pinned to several machines {pinned}" if len(pinned) > 1 else
                   "session not started" if a.session_start is not None and now < a.session_start else
-                  "session ended" if a.session_end is not None and now >= a.session_end else None)
+                  "session ended" if a.session_end is not None and now >= a.session_end else
+                  f"ring target of {desired[a.tier]} {a.tier} entries reached" if account_count[a.id] and current[a.tier] >= desired[a.tier] else None)
         if reason is None and not any(not m.maintenance and machine_count[m.id] < m.capacity and (not pinned or m.id in pinned)
                                       for m in ready.values()):
             details = [f"{m.id}: enabled={m.enabled} ready={m.ready} maintenance={m.maintenance} "
@@ -255,7 +257,8 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                 or not a.manual and a.eligible_after is not None and now < a.eligible_after
                 or a.manual and a.session_start is not None and now < a.session_start
                 or a.session_end is not None and now >= a.session_end
-                or not a.manual and current[a.tier] >= desired[a.tier]):
+                # a manual session always gets its first table (a scheduled seat then leaves); more only under target
+                or current[a.tier] >= desired[a.tier] and not (a.manual and account_count[a.id] == 0)):
                 continue
             for t in supported.values():
                 if table_tier[t.id] != a.tier or table_count[t.id] >= t.seats or (a.id, t.id) in pairs:
@@ -313,8 +316,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                                      soft_limit_override=not bool(under_limit)))
         result.next_join = due_join
         pairs.add((a.id, t.id))
-        if not a.manual:
-            current[a.tier] += 1
+        current[a.tier] += 1
         account_count[a.id] += 1
         machine_count[m.id] += 1
         table_count[t.id] += 1

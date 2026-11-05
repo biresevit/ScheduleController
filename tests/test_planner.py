@@ -253,7 +253,7 @@ def test_recovery_target_tracks_current_schedule_without_waiting_for_unneeded_en
     assert recovery_target(10,0,2)==0
 
 
-def test_manual_session_plays_even_when_target_is_met_and_on_its_machine():
+def test_manual_session_gets_its_first_table_even_when_target_is_met_and_on_its_machine():
     tables = [Table(str(n), 1, D(".1"), 6, 0, NOW) for n in range(3)]
     machines = [Machine(1, 1, 6, NOW), Machine(2, 1, 6, NOW)]
     manual = Account(2, 1, "low", manual=True, owner_machine=2, session_end=NOW + timedelta(hours=1))
@@ -302,3 +302,16 @@ def test_open_session_without_tables_is_refilled_before_a_new_session_starts():
         result = plan(SETTINGS, NOW, 5, [Account(1, 1, "low"), idle_session], [Machine(1, 1, 6, NOW)], tables, [],
                       random.Random(seed))
         assert result.actions[0].account == 2
+
+
+def test_manual_session_seats_count_toward_the_target_and_scheduled_seats_make_room():
+    tables = [Table(str(n), 1, D(".1"), 6, 0, NOW) for n in range(4)]
+    manual = Account(2, 1, "low", manual=True, session_end=NOW + timedelta(hours=1))
+    # the manual session has its table: no second one while the target (2) is met, and the scheduled seat over it leaves
+    result = run(accounts=[Account(1, 1, "low"), manual], tables=tables, target=2,
+                 entries=[Entry("x", 1, 1, "0", "seated"), Entry("y", 1, 1, "1", "seated"), Entry("z", 2, 1, "2", "seated")])
+    assert [(a.kind, a.account) for a in result.actions] == [("leave", 1)]
+    assert result.manual_blocked == {2: "ring target of 2 low entries reached"}
+    # under the target, the manual session takes more tables
+    result = run(accounts=[Account(1, 1, "low"), manual], tables=tables, target=3, entries=[Entry("z", 2, 1, "2", "seated")])
+    assert result.actions and result.actions[0].account == 2
