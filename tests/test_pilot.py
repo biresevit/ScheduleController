@@ -89,7 +89,7 @@ def test_idle_session_reconnects_with_same_username(monkeypatch):
     class FakeConnection:
         def __init__(self): self.listeners=[]
     class FakeClient:
-        def __init__(self,platform,username,endpoint_url=None):
+        def __init__(self,platform,username,endpoint_url=None,email=None,password=None):
             self.settings=SimpleNamespace(username=username);self.connection=FakeConnection();self.open=AsyncMock()
             made.append(self)
     old=SimpleNamespace(close=AsyncMock())
@@ -229,7 +229,7 @@ def test_reconnect_keeps_surviving_tables_when_another_seat_is_absent(monkeypatc
             candidate.states[tid]={'ti':tid,'s':[{'i':7}] if tid==42 else []}
             for listener in candidate.connection.listeners:listener({'t':'GameState','gameState':candidate.states[tid]})
         candidate.return_from_away=AsyncMock();candidate.player_command=AsyncMock();candidate.join=join;candidate.hero_seat=lambda state:0 if state['s'] else None
-        monkeypatch.setattr(module,'create_client',lambda platform,username,endpoint_url=None:candidate);monkeypatch.setattr(asyncio,'sleep',AsyncMock())
+        monkeypatch.setattr(module,'create_client',lambda platform,username,**kw:candidate);monkeypatch.setattr(asyncio,'sleep',AsyncMock())
         session=Session.__new__(Session);session.repo=None;session.policy={'Username':'kate'};session.platform=module.EVENBET;session.endpoint=None;session.client=SimpleNamespace(tables={42:{},43:{}},close=AsyncMock());old=session.client
         session.queues={42:asyncio.Queue(),43:asyncio.Queue()};session.workers={};session.bots={tid:SimpleNamespace(client=old,process=AsyncMock()) for tid in (42,43)};session.failures={};session.observed={}
         assert await session.reconnect_active()

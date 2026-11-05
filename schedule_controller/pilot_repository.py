@@ -162,7 +162,7 @@ class Repository(ChatRepository,ManualRepository):
         with self.transaction() as db:
             site=db.one("SELECT s.* FROM scheduler.Site s JOIN scheduler.MachineAssignment a ON a.SiteId=s.SiteId JOIN dbo.CustomerMachine m ON m.MachineId=a.MachineId AND m.CustomerId=s.CustomerId JOIN dbo.MachineCasino mc ON mc.MachineId=a.MachineId AND mc.Casino=s.Casino WHERE s.SiteId=:site AND a.MachineId=:machine AND m.IsActive=1")
             if not site: raise RuntimeError('Registered machine assignment for this site not found')
-            accounts=db.rows("SELECT p.*,b.Username,b.IsActive FROM scheduler.AccountPolicy p JOIN dbo.BotAccount b ON b.BotAccountId=p.BotAccountId WHERE p.SiteId=:site AND p.IsSynthetic=0 AND p.DeletedUtc IS NULL")
+            accounts=db.rows("SELECT p.*,b.Username,b.IsActive,b.LoginEmail,b.LoginPassword FROM scheduler.AccountPolicy p JOIN dbo.BotAccount b ON b.BotAccountId=p.BotAccountId WHERE p.SiteId=:site AND p.IsSynthetic=0 AND p.DeletedUtc IS NULL")
             if not accounts: raise RuntimeError('No real accounts configured for this site')
             from zoneinfo import ZoneInfo
             today=datetime.now(ZoneInfo(site['TimeZone'])).date()

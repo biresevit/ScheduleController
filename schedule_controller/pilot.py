@@ -80,7 +80,9 @@ class Session:
 
     def new_client(self):
         """A logged-out client of this account on the site's platform."""
-        return create_client(self.platform,self.policy['Username'],endpoint_url=None if self.platform==EVENBET else self.endpoint)
+        p=self.policy
+        return create_client(self.platform,p['Username'],endpoint_url=None if self.platform==EVENBET else self.endpoint,
+                             email=p.get('LoginEmail'),password=p.get('LoginPassword'))
 
     def attach_observer(self,client,observed):
         # Reconnect candidates must not refresh timestamps on an older client's
