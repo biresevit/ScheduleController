@@ -11,7 +11,7 @@ unregistering (the hub route is not open).
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 from poker_controller.sites import table_key
@@ -21,6 +21,10 @@ from .tournament_worker import lobby_key
 POLL_SECONDS = 5
 OUT = {"ELIMINATED", "WINNER", "CANCELLED"}
 OVER = {"FINISHED", "CANCELLED"}
+# Registration is open while a tournament is SCHEDULED (an SNG stays so until its seats fill) or REGISTERING.
+OPEN = {"SCHEDULED", "REGISTERING"}
+# How long a finished tournament keeps being published as completed, so its lobby row stops showing it running.
+COMPLETED_HOURS = 24
 REGISTERED = {"REGISTERED", "CHECKED_IN", "PLAYING"}
 
 
@@ -31,18 +35,21 @@ def parse_time(value) -> datetime | None:
 
 
 def lobby_rows(tournaments: list[dict], observed: datetime) -> list[dict]:
-    """Lobby rows for the NLH SNGs and MTTs the scheduler may register for (registration open or upcoming)."""
+    """Lobby rows for the NLH SNGs and MTTs the scheduler may register for (registration open or upcoming), and
+    the ones that ended in the last day as completed."""
     rows = []
     for t in tournaments or []:
         kind, status = t.get("type"), t.get("status")
         if kind not in ("SNG", "MTT") or t.get("gameType") != "NLH" or not t.get("id") or not t.get("name"):
             continue
         if status in OVER:
-            continue
-        open_ = status == "REGISTERING" or (status == "RUNNING" and t.get("lateRegOpen") is True)
-        state = "running" if status == "RUNNING" else "registering"
+            ended = parse_time(t.get("actualEndAt")) or parse_time(t.get("scheduledStartAt"))
+            if not ended or ended < observed - timedelta(hours=COMPLETED_HOURS):
+                continue
+        open_ = status in OPEN or (status == "RUNNING" and t.get("lateRegOpen") is True)
+        state = "completed" if status in OVER else "running" if status == "RUNNING" else "registering"
         buy_in = Decimal(str(t.get("buyInTotalChips") or 0))
-        registered = int(t.get("entries") or 0)
+        registered = int(t.get("registeredCount") or t.get("entries") or 0)
         seats = int(t.get("sngMaxSeats") or t.get("maxEntries") or 0) or max(registered, int(t.get("tableSize") or 0), 1)
         rows.append({"id": lobby_key(t["id"]), "name": str(t["name"])[:200], "game": "NLH", "table_type": kind,
                      "bb": max(buy_in, Decimal("0.01")), "minimum": buy_in, "maximum": buy_in,

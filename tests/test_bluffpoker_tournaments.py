@@ -23,7 +23,16 @@ def test_lobby_rows_publish_open_and_upcoming_nlh_tournaments():
     assert [r["id"] for r in rows] == [f"T{SNG}", "Tb"]
     sng, mtt = rows
     assert sng["open"] and sng["table_type"] == "SNG" and sng["seats"] == 6 and sng["occupied"] == 2 and str(sng["bb"]) == "22"
-    assert not mtt["open"] and mtt["tournament_state"] == "registering" and mtt["start"] == NOW and mtt["seats"] == 8
+    assert mtt["open"] and mtt["tournament_state"] == "registering" and mtt["start"] == NOW and mtt["seats"] == 8
+
+
+def test_scheduled_sngs_take_registrations_and_finished_tournaments_publish_as_completed():
+    # BluffPoker lists an SNG as SCHEDULED, without a start time, until its seats fill ("Iscrizioni aperte")
+    rows = lobby_rows([row(status="SCHEDULED", entries=0, registeredCount=3),
+                       row(id="recent", type="MTT", status="FINISHED", actualEndAt="2026-11-05T01:00:00.000Z"),
+                       row(id="old", type="MTT", status="CANCELLED", scheduledStartAt="2026-11-03T01:00:00.000Z")], NOW)
+    assert [(r["id"], r["open"], r["tournament_state"]) for r in rows] == [(f"T{SNG}", True, "registering"), ("Trecent", False, "completed")]
+    assert rows[0]["occupied"] == 3
 
 
 def test_follower_seats_moves_and_finishes_the_account():
