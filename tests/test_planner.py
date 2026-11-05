@@ -315,3 +315,13 @@ def test_manual_session_seats_count_toward_the_target_and_scheduled_seats_make_r
     # under the target, the manual session takes more tables
     result = run(accounts=[Account(1, 1, "low"), manual], tables=tables, target=3, entries=[Entry("z", 2, 1, "2", "seated")])
     assert result.actions and result.actions[0].account == 2
+
+
+def test_paused_joins_still_let_ended_sessions_leave():
+    # Joins paused on the Schedule page: the scheduler plans with max_joins=0.
+    paused = replace(SETTINGS, max_joins=0)
+    ended = Account(1, 1, "low", session_end=NOW - timedelta(minutes=1))
+    result = plan(paused, NOW, 5, [ended, Account(2, 1, "low")], [Machine(1, 1, 6, NOW)],
+                  [Table("a", 1, D(".1"), 6, 1, NOW, observed_accounts=frozenset({1})), Table("b", 1, D(".1"), 6, 0, NOW)],
+                  [Entry("x", 1, 1, "a", "seated")], random.Random(3))
+    assert [(a.kind, a.account) for a in result.actions] == [("leave", 1)]

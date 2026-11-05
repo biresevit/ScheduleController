@@ -27,6 +27,11 @@ def aware(value):
     return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
 
 
+def cancel_paused_joins(db, site_id):
+    """The scheduler's join commands no PC has picked up yet (manual tasks are kept), closed with their entries."""
+    return db.one("EXEC scheduler.CancelPausedJoins @SiteId=?", site_id)["n"]
+
+
 class Rows:
     def __init__(self, cursor): self.cursor = cursor
     def rows(self, sql, *args):
@@ -93,6 +98,13 @@ class CloudScheduler:
             target = target_at(windows_by_format.get("RING", []), stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
             limit_failed_sessions(db, site_id)
+            # Joins paused from the Schedule page: no new ring joins or SNG/MTT registrations, and the scheduler's
+            # joins the PC has not picked up yet are cancelled. Manual tasks, leaves and session ends go on.
+            paused = bool(site.get("JoinsPaused"))
+            if paused:
+                cancelled = cancel_paused_joins(db, site_id)
+                if cancelled:
+                    log.info("Joins paused on site %s: cancelled %s queued join(s)", site_id, cancelled)
             # A worker restart flags every lease on its machine for reconciliation, but only leases
             # with open entries get reconciled, and idle-lease cleanup only covers the current run.
             # Once the new worker is ready, an earlier run's lease whose bot has no open entry cannot
@@ -198,7 +210,7 @@ class CloudScheduler:
             stamp = aware(db.one("SELECT SYSUTCDATETIME() AS now")["now"])
             max_actions = max(site["MaxJoinsPerTick"], site["MaxLeavesPerTick"], 1)
             planning_horizon = max(120, site["MaxJoinGapSeconds"] * max_actions + 30)
-            settings = Settings(site_id, bands, site["CurrencyCode"], site["MaxJoinsPerTick"], site["MaxLeavesPerTick"],
+            settings = Settings(site_id, bands, site["CurrencyCode"], 0 if paused else site["MaxJoinsPerTick"], site["MaxLeavesPerTick"],
                 site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"], tick_seconds=30,
                 planning_horizon_seconds=planning_horizon, heartbeat_seconds=site["HeartbeatTimeoutSeconds"],
                 freshness_seconds=site["TableFreshnessSeconds"])
@@ -234,11 +246,11 @@ class CloudScheduler:
             db.execute("UPDATE scheduler.Site SET NextJoinUtc=?,NextLeaveUtc=?,LastReconciledUtc=?,UpdatedUtc=SYSUTCDATETIME() WHERE SiteId=? AND ConfigVersion=?",
                 next_join, result.next_leave, stamp.replace(tzinfo=None), site_id, site["ConfigVersion"])
             tournament_results = {}
-            if site["SchedulingEnabled"]:
+            if site["SchedulingEnabled"] and not paused:
                 tournament_results = self._plan_tournaments(db, site, stamp, windows_by_format, tournament_accounts,
                     tournament_machines, lobby_rows, policy_by_id, machine_by_id, rng)
                 created += sum(r["created"] for r in tournament_results.values())
-            return {"site_id": site_id, "target": target, "status": "planned", "actions": created,
+            return {"site_id": site_id, "target": target, "status": "joins_paused" if paused else "planned", "actions": created,
                     "reasons": result.reasons, "deficits": result.remaining_deficits, "tournaments": tournament_results}
 
     def _plan_tournaments(self, db, site, stamp, windows_by_format, accounts, machines, lobby_rows, policy_by_id, machine_by_id, rng):
