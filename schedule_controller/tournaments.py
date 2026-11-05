@@ -111,11 +111,15 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
     owners = {a.id: {e.machine for e in entries if e.account == a.id} | ({a.owner_machine} if a.owner_machine is not None else set())
               for a in accounts}
     registered = {(e.account, e.table) for e in entries}
+    # Open entries of this format per account (registered or playing), against the account's limit.
+    format_count = Counter(e.account for e in entries if formats.get(e.table, fmt if str(e.table).startswith("T") else None) == fmt)
+    limit = (lambda a: a.max_sng_entries) if fmt == "SNG" else (lambda a: a.max_mtt_entries)
 
     options = []
     for a in accounts:
         if (not a.enabled or a.synthetic or not a.credentials_ready or a.requires_reconciliation or a.manual
                 or a.drain_for_update or len(owners[a.id]) > 1 or account_count[a.id] >= a.max_tables
+                or format_count[a.id] >= limit(a)
                 or a.eligible_after is not None and now < a.eligible_after.astimezone(timezone.utc)
                 or a.session_end is not None and now >= a.session_end.astimezone(timezone.utc)):
             continue

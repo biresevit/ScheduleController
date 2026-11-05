@@ -27,10 +27,13 @@ class Account:
     eligible_after: datetime | None = None
     session_end: datetime | None = None
     drain_for_update: bool = False
-    # Operator-created session: plays up to max_tables outside the occupancy target,
-    # ignores the post-session cooldown and starts no earlier than session_start.
+    # Operator-created session: always gets its first ring table, more only under the occupancy target (its
+    # tables count toward it), ignores the post-session cooldown and starts no earlier than session_start.
     manual: bool = False
     session_start: datetime | None = None
+    # SNG / MTT entries (registered or playing) the account may hold at the same time.
+    max_sng_entries: int = 1
+    max_mtt_entries: int = 1
 
 
 @dataclass(frozen=True)

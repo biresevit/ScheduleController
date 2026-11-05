@@ -95,3 +95,15 @@ def test_excluded_names_are_never_chosen_ignoring_case():
     only = plan_registrations("SNG", NOW, 5, [account(1)], [machine()], [shootout], [], RANGES,
                               None, 20, 60, 60, 300, random.Random(1), excluded=excluded_names("\n  SHOOTOUT \n\n"))
     assert only.reasons == ["no_open_tournament"]
+
+
+def test_an_account_holds_at_most_its_sng_and_mtt_entry_limits():
+    tournaments = [sng(1, 3), sng(2, 3), mtt(3, 60), mtt(4, 90)]
+    # account 1 is registered for one SNG: with the default limit of 1 it gets no second SNG, but may take an MTT
+    entries = [Entry("e1", 1, 1, "T1")]
+    assert run("SNG", 5, [account(1)], tournaments, entries).reasons == ["no_eligible_account"]
+    assert [a.account for a in run("MTT", 5, [account(1)], tournaments, entries).actions] == [1]
+    # a higher limit allows a second SNG
+    assert [a.tournament for a in run("SNG", 5, [account(1, max_sng_entries=2)], tournaments, entries).actions] == ["T2"]
+    # a registration whose tournament left the lobby still counts
+    assert run("SNG", 5, [account(1)], [sng(2, 3)], [Entry("e1", 1, 1, "Tgone")]).reasons == ["no_eligible_account"]
