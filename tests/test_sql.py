@@ -80,3 +80,30 @@ def test_schedule_rejects_overlaps(database):
             {"Weekday": 1, "StartMinute": 660, "EndMinute": 720, "TargetEntries": 12}]
     with pytest.raises(pyodbc.Error, match="Overlapping"):
         c.execute("EXEC scheduler.SetSchedule @SiteId=?,@WindowsJson=?", seed["site_id"], json.dumps(rows))
+
+
+def test_machine_plays_several_sites_of_its_customer(database):
+    import pyodbc
+    c, seed = database
+    machine, site = seed["machine_id"], seed["site_id"]
+    customer = c.execute("SELECT CustomerId FROM scheduler.Site WHERE SiteId=?", site).fetchone()[0]
+    existing = c.execute("SELECT SiteId FROM scheduler.Site WHERE CustomerId=? AND Casino=N'BluffPoker'", customer).fetchone()
+    if existing:  # start from a machine that plays only the seed site
+        c.execute("DELETE scheduler.MachineAssignment WHERE MachineId=? AND SiteId<>?", machine, site)
+        c.execute("DELETE dbo.MachineCasino WHERE MachineId=? AND Casino=N'BluffPoker'", machine)
+    other = existing[0] if existing else c.execute("""SET NOCOUNT ON;DECLARE @s TABLE(SiteId int);
+        INSERT scheduler.Site(CustomerId,Casino,Platform,TimeZone,CurrencyCode,EndpointUrl) OUTPUT inserted.SiteId INTO @s
+        VALUES(?,N'BluffPoker',N'BluffPokerPlatform',N'Europe/Rome',N'EUR',N'https://example.invalid');SELECT SiteId FROM @s""",
+        customer).fetchone()[0]
+    c.execute("EXEC backoffice.SetMachineSites @CustomerId=?,@MachineId=?,@SiteIds=?,@MaxEntries=7", customer, machine, f"{site},{other}")
+    rows = c.execute("SELECT SiteId,IsEnabled,MaxEntries FROM scheduler.MachineAssignment WHERE MachineId=? ORDER BY SiteId", machine).fetchall()
+    assert [tuple(r) for r in rows] == [(site, True, 7), (other, True, 7)]
+    assert c.execute("SELECT MaxEntries FROM scheduler.MachineCapacity WHERE MachineId=?", machine).fetchone()[0] == 7
+    assert c.execute("SELECT COUNT(*) FROM dbo.CasinoSettings WHERE CustomerId=? AND Casino=N'BluffPoker'", customer).fetchone()[0] == 1
+    c.execute("EXEC backoffice.SetMachineSites @CustomerId=?,@MachineId=?,@SiteIds=?,@MaxEntries=7", customer, machine, str(other))
+    assert not c.execute("SELECT IsEnabled FROM scheduler.MachineAssignment WHERE MachineId=? AND SiteId=?", machine, site).fetchone()[0]
+    assert [r[0] for r in c.execute("SELECT SiteId FROM backoffice.MachineAllowedSite WHERE MachineId=?", machine)] == [other]
+    c.execute("DELETE scheduler.MachineAssignment WHERE MachineId=? AND SiteId=?", machine, other)
+    c.execute("DELETE dbo.MachineCasino WHERE MachineId=? AND Casino=N'BluffPoker'", machine)
+    with pytest.raises(pyodbc.Error):  # last: the error aborts the transaction; the machine no longer plays BluffPoker
+        c.execute("INSERT scheduler.MachineAssignment(SiteId,MachineId) VALUES(?,?)", other, machine)

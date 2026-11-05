@@ -163,8 +163,12 @@ class CloudScheduler:
                 ring_tables = p["MaxTables"] - tournament_by_account[aid]
                 accounts.append(account if ring_tables == p["MaxTables"] else
                                 replace(account, max_tables=max(1, ring_tables), enabled=account.enabled and ring_tables > 0))
-            machine_rows = db.rows("SELECT * FROM scheduler.MachineAssignment WHERE SiteId=?", site_id)
-            tournament_machines = [Machine(m["MachineId"], site_id, m["MaxEntries"], aware(m["LastHeartbeatUtc"] or datetime.min),
+            # One entry limit per PC, shared by all of its poker sites: this site gets what the others leave.
+            machine_rows = db.rows("""SELECT a.*,COALESCE(c.MaxEntries,a.MaxEntries)-(SELECT COUNT(*) FROM scheduler.Entry e
+                    WHERE e.MachineId=a.MachineId AND e.SiteId<>a.SiteId AND e.IsOpen=1) AS SiteCapacity
+                FROM scheduler.MachineAssignment a LEFT JOIN scheduler.MachineCapacity c ON c.MachineId=a.MachineId
+                WHERE a.SiteId=?""", site_id)
+            tournament_machines = [Machine(m["MachineId"], site_id, max(0, m["SiteCapacity"]), aware(m["LastHeartbeatUtc"] or datetime.min),
                 ready=bool(m["IsReady"]), enabled=bool(m["IsEnabled"]),maintenance=bool(m["MaintenanceTaskId"])) for m in machine_rows]
             machines = [replace(m, capacity=max(0, m.capacity - tournament_by_machine[m.id])) for m in tournament_machines]
             machine_by_id = {m["MachineId"]: m for m in machine_rows}

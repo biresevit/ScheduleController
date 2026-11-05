@@ -79,6 +79,21 @@ from .chat_repository import ChatRepository
 from .manual_repository import ManualRepository
 
 
+@retry_deadlocks
+def machine_sites(machine_id):
+    """The poker sites the PC's worker runs: those the PC plays, and a site taken off it until its tables are left."""
+    import pyodbc
+    conn=pyodbc.connect(connection_string(),timeout=15)
+    try:
+        rows=conn.cursor().execute("""SELECT a.SiteId FROM scheduler.MachineAssignment a
+            JOIN dbo.CustomerMachine m ON m.MachineId=a.MachineId AND m.IsActive=1
+            WHERE a.MachineId=? AND (EXISTS(SELECT 1 FROM backoffice.MachineAllowedSite s WHERE s.MachineId=a.MachineId AND s.SiteId=a.SiteId)
+                OR EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.SiteId=a.SiteId AND e.MachineId=a.MachineId AND e.IsOpen=1))
+            ORDER BY a.SiteId""",machine_id).fetchall()
+        return [r[0] for r in rows]
+    finally: conn.close()
+
+
 class Repository(ChatRepository,ManualRepository):
     def __init__(self,epoch,site_id=1,machine_id=1):
         self.epoch=epoch;self.site_id=int(site_id);self.machine_id=int(machine_id)
@@ -145,7 +160,7 @@ class Repository(ChatRepository,ManualRepository):
     @retry_deadlocks
     def configuration(self):
         with self.transaction() as db:
-            site=db.one("SELECT s.* FROM scheduler.Site s JOIN scheduler.MachineAssignment a ON a.SiteId=s.SiteId JOIN dbo.CustomerMachine m ON m.MachineId=a.MachineId AND m.CustomerId=s.CustomerId AND m.Casino=s.Casino WHERE s.SiteId=:site AND a.MachineId=:machine AND m.IsActive=1")
+            site=db.one("SELECT s.* FROM scheduler.Site s JOIN scheduler.MachineAssignment a ON a.SiteId=s.SiteId JOIN dbo.CustomerMachine m ON m.MachineId=a.MachineId AND m.CustomerId=s.CustomerId JOIN dbo.MachineCasino mc ON mc.MachineId=a.MachineId AND mc.Casino=s.Casino WHERE s.SiteId=:site AND a.MachineId=:machine AND m.IsActive=1")
             if not site: raise RuntimeError('Registered machine assignment for this site not found')
             accounts=db.rows("SELECT p.*,b.Username,b.IsActive FROM scheduler.AccountPolicy p JOIN dbo.BotAccount b ON b.BotAccountId=p.BotAccountId WHERE p.SiteId=:site AND p.IsSynthetic=0 AND p.DeletedUtc IS NULL")
             if not accounts: raise RuntimeError('No real accounts configured for this site')
@@ -326,7 +341,7 @@ class Repository(ChatRepository,ManualRepository):
                     db.execute("UPDATE scheduler.StakeBand SET TargetBasisPoints=? WHERE SiteId=:site AND Tier=?",b['TargetBasisPoints'],b['Tier'])
                 windows=[{k:r[k] for k in ('Weekday','StartMinute','EndMinute','TargetEntries')} for r in saved['windows']]
                 db.execute("EXEC scheduler.SetSchedule @SiteId=:site,@WindowsJson=?",json.dumps(windows))
-            db.execute("UPDATE scheduler.MachineAssignment SET IsReady=0,IsEnabled=0 WHERE MachineId=:machine AND WorkerEpoch=?",self.epoch)
+            db.execute("UPDATE scheduler.MachineAssignment SET IsReady=0,IsEnabled=0 WHERE SiteId=:site AND MachineId=:machine AND WorkerEpoch=?",self.epoch)
 
     @retry_deadlocks
     def confirm_absent(self,account_id,table_id):
@@ -371,7 +386,7 @@ class Repository(ChatRepository,ManualRepository):
         with self.transaction() as db:
             owned=db.one("SELECT WorkerEpoch FROM scheduler.MachineAssignment WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=:site AND MachineId=:machine")
             if not owned or str(owned['WorkerEpoch']).lower()!=str(self.epoch).lower(): raise RuntimeError('Worker epoch lost')
-            db.execute("UPDATE scheduler.MachineAssignment SET LastHeartbeatUtc=SYSUTCDATETIME(),IsReady=?,LastSequence=LastSequence+1 WHERE MachineId=:machine",ready)
+            db.execute("UPDATE scheduler.MachineAssignment SET LastHeartbeatUtc=SYSUTCDATETIME(),IsReady=?,LastSequence=LastSequence+1 WHERE SiteId=:site AND MachineId=:machine",ready)
             db.execute("UPDATE backoffice.MachineMetadata SET LastAgentUtc=SYSUTCDATETIME() WHERE MachineId=:machine")
             if last_plan:
                 db.execute("UPDATE scheduler.Site SET NextJoinUtc=?,NextLeaveUtc=?,LastReconciledUtc=? WHERE SiteId=:site",utc(next_join),utc(next_leave),utc(last_plan))

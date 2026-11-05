@@ -19,8 +19,8 @@ def supports_forcing(agent_version):
 OLD_AGENT='This PC runs an updater agent older than 1.0.13, which cannot force-stop; rerun PC setup to upgrade it.'
 
 
-def unconfirmed_absence(db,site_id,machine_id,placeholder='?'):
-    """Only complete, fresh seat snapshots can prove an uncertain entry absent."""
+def unconfirmed_absence(db,machine_id,placeholder='?'):
+    """Only complete, fresh seat snapshots can prove an uncertain entry absent, on every poker site of the PC."""
     sql="""SELECT e.EntryId,e.Status,l.FullSnapshotUtc,
         CASE WHEN l.ObserverMachineId=e.MachineId AND l.ObserverEpoch=a.WorkerEpoch AND l.FullSnapshotUtc>=DATEADD(second,-60,SYSUTCDATETIME())
           AND (SELECT COUNT(*) FROM scheduler.TableSeat s WHERE s.SiteId=e.SiteId AND s.TableId=e.TableId)=l.OccupiedSeats
@@ -29,8 +29,8 @@ def unconfirmed_absence(db,site_id,machine_id,placeholder='?'):
         FROM scheduler.Entry e JOIN dbo.BotAccount b ON b.BotAccountId=e.BotAccountId
         JOIN scheduler.MachineAssignment a ON a.SiteId=e.SiteId AND a.MachineId=e.MachineId
         LEFT JOIN scheduler.LobbyTable l ON l.SiteId=e.SiteId AND l.TableId=e.TableId
-        WHERE e.SiteId=? AND e.MachineId=? AND e.IsOpen=1"""
-    rows=db.rows(sql.replace('?',placeholder),site_id,machine_id)
+        WHERE e.MachineId=? AND e.IsOpen=1"""
+    rows=db.rows(sql.replace('?',placeholder),machine_id)
     return bool(rows) and all(r['Status']=='uncertain' and r['Absent'] for r in rows)
 
 
@@ -85,18 +85,18 @@ def advance(db,cid,rollout,task,stamp,serial):
     # Fresh agents may install without a worker only when no application
     # release or open session/entry journal exists. Never bypass live seats.
     bootstrap=(not task['CurrentReleaseId'] and task.get('AgentStage') in ('awaiting_install','staged') and not worker_fresh
-        and not db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1',sid,mid)
-        and not db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE SiteId=? AND MachineId=? AND IsOpen=1',sid,mid))
+        and not db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1',mid)
+        and not db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE MachineId=? AND IsOpen=1',mid))
     if status=='queued':
         if not agent_fresh or not (worker_fresh or bootstrap): return
         if db.one('SELECT TaskId FROM scheduler.MachineUpdateTask WHERE MachineId=? AND StartedUtc IS NOT NULL AND CompletedUtc IS NULL AND TaskId<>?',mid,tid):return
         if serial and db.one("SELECT TaskId FROM scheduler.MachineUpdateTask WHERE StartedUtc IS NOT NULL AND CompletedUtc IS NULL AND IndependentInstall=0 AND TaskId<>? AND RolloutId IN(SELECT RolloutId FROM scheduler.UpdateRollout WHERE CustomerId=?)",tid,cid): return
-        count=db.one("SELECT COUNT(*) AS n FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1 AND Status IN ('seated','sitting_out','draining')",sid,mid)['n']
+        count=db.one("SELECT COUNT(*) AS n FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1 AND Status IN ('seated','sitting_out','draining')",mid)['n']
         db.execute("UPDATE scheduler.MachineUpdateTask SET Status='preparing',StartedUtc=?,UpdatedUtc=?,OriginalEntries=?,Detail='Downloading and verifying the release; sessions continue.' WHERE TaskId=?",now,now,count,tid)
         db.execute("UPDATE scheduler.UpdateRollout SET Status='running',UpdatedUtc=? WHERE RolloutId=?",now,rid)
     elif status=='preparing':
         if task['Staged'] and agent_fresh and (worker_fresh or bootstrap):
-            count=db.one("SELECT COUNT(*) AS n FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1 AND Status IN ('seated','sitting_out','draining')",sid,mid)['n']
+            count=db.one("SELECT COUNT(*) AS n FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1 AND Status IN ('seated','sitting_out','draining')",mid)['n']
             if bootstrap:
                 db.execute("UPDATE scheduler.MachineUpdateTask SET Status='stopping',UpdatedUtc=?,OriginalEntries=?,Detail='Installing applications on a new machine.' WHERE TaskId=?",now,count,tid)
             elif rollout['Immediate'] and supports_forcing(task.get('AgentVersion')):
@@ -108,24 +108,24 @@ def advance(db,cid,rollout,task,stamp,serial):
                 db.execute("UPDATE scheduler.MachineUpdateTask SET Status='draining',UpdatedUtc=?,OriginalEntries=?,Detail=? WHERE TaskId=?",now,count,OLD_AGENT,tid)
             else:
                 db.execute("UPDATE scheduler.MachineUpdateTask SET Status='draining',UpdatedUtc=?,OriginalEntries=?,Detail='Finishing one bot session at a time.' WHERE TaskId=?",now,count,tid)
-            db.execute('UPDATE scheduler.MachineAssignment SET MaintenanceTaskId=? WHERE SiteId=? AND MachineId=?',tid,sid,mid)
+            db.execute('UPDATE scheduler.MachineAssignment SET MaintenanceTaskId=? WHERE MachineId=?',tid,mid)
     elif status=='forcing' and not supports_forcing(task.get('AgentVersion')):
         db.execute("UPDATE scheduler.MachineUpdateTask SET Status='draining',UpdatedUtc=?,Detail=? WHERE TaskId=?",now,OLD_AGENT,tid)
     elif status=='draining':
-        counts=db.one("SELECT SUM(CASE WHEN Status='uncertain' THEN 1 ELSE 0 END) AS uncertain,COUNT(*) AS total,COUNT(DISTINCT BotAccountId) AS accounts FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1",sid,mid)
+        counts=db.one("SELECT SUM(CASE WHEN Status='uncertain' THEN 1 ELSE 0 END) AS uncertain,COUNT(*) AS total,COUNT(DISTINCT BotAccountId) AS accounts FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1",mid)
         remaining=counts['total'];uncertain=counts['uncertain'] or 0
         prefix=OLD_AGENT+' ' if rollout['Immediate'] else ''
         db.execute('UPDATE scheduler.MachineUpdateTask SET Detail=? WHERE TaskId=?',prefix+f"Finishing one session at a time: {counts['accounts']} sessions, {remaining-uncertain} confirmed entries and {uncertain} unconfirmed entries remain.",tid)
-        if task['Staged'] and agent_fresh and worker_fresh and unconfirmed_absence(db,sid,mid):
+        if task['Staged'] and agent_fresh and worker_fresh and unconfirmed_absence(db,mid):
             db.execute("UPDATE scheduler.MachineUpdateTask SET Status='reconciling',UpdatedUtc=?,Detail='Confirmed sessions ended; reconciling absent, unconfirmed entries before installation.' WHERE TaskId=?",now,tid)
             return
         # Cancelled reservations may have a future session that never logged
         # in. Close only sessions whose full entry journal is already closed.
         db.execute("""UPDATE s SET IsOpen=0,ActualEndUtc=CASE WHEN StartedUtc>? THEN StartedUtc ELSE ? END,EndReason='software_update'
-            FROM scheduler.AccountSession s WHERE s.SiteId=? AND s.MachineId=? AND s.IsOpen=1
-              AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.SessionId=s.SessionId AND e.IsOpen=1)""",now,now,sid,mid)
-        open_entry=db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1',sid,mid)
-        open_session=db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE SiteId=? AND MachineId=? AND IsOpen=1',sid,mid)
+            FROM scheduler.AccountSession s WHERE s.MachineId=? AND s.IsOpen=1
+              AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.SessionId=s.SessionId AND e.IsOpen=1)""",now,now,mid)
+        open_entry=db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1',mid)
+        open_session=db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE MachineId=? AND IsOpen=1',mid)
         if not open_entry and not open_session and task['Staged'] and agent_fresh and worker_fresh:
             db.execute("UPDATE scheduler.MachineUpdateTask SET Status='stopping',UpdatedUtc=?,Detail='Sessions ended. Ready to restart applications.' WHERE TaskId=?",now,tid)
     elif status=='resuming':
@@ -173,14 +173,14 @@ def tick_idle_installations(db,customer_id,stamp):
                 # between the empty-journal check and the maintenance fence.
                 db.one('SELECT SiteId FROM scheduler.Site WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=?',sid)
                 if task.get('MaintenanceTaskId') not in (None,tid):continue
-                if db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE SiteId=? AND MachineId=? AND IsOpen=1',sid,mid):continue
-                if db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE SiteId=? AND MachineId=? AND IsOpen=1',sid,mid):continue
+                if db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1',mid):continue
+                if db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE MachineId=? AND IsOpen=1',mid):continue
                 if db.one('SELECT TaskId FROM scheduler.MachineUpdateTask WHERE MachineId=? AND StartedUtc IS NOT NULL AND CompletedUtc IS NULL AND TaskId<>?',mid,tid):continue
                 if status=='queued':
                     db.execute("""UPDATE scheduler.MachineUpdateTask SET IndependentInstall=1,Status='preparing',
                         StartedUtc=?,UpdatedUtc=?,OriginalEntries=0,
                         Detail='Idle PC: downloading and verifying independently of traffic updates.' WHERE TaskId=?""",now,now,tid)
-                    db.execute('UPDATE scheduler.MachineAssignment SET MaintenanceTaskId=? WHERE SiteId=? AND MachineId=?',tid,sid,mid)
+                    db.execute('UPDATE scheduler.MachineAssignment SET MaintenanceTaskId=? WHERE MachineId=?',tid,mid)
                     db.execute("UPDATE scheduler.UpdateRollout SET Status='running',UpdatedUtc=? WHERE RolloutId=?",now,rid)
                 elif task['Staged']:
                     db.execute("UPDATE scheduler.MachineUpdateTask SET Status='stopping',UpdatedUtc=?,Detail='No open entries or sessions. Installing applications.' WHERE TaskId=?",now,tid)

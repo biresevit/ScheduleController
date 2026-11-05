@@ -534,7 +534,7 @@ class Pilot:
         self.clients={};self.entries={};self.sessions=[];self.accounting={};self.intervals=[];self.sequence=0
         self.info={};self.tables=[];self.seats={};self.pending=[];self.jobs={};self.errors=[]
         self.next_join=self.next_leave=self.last_plan=None;self.saved=None;self.started=False
-        self.decision=PDecision(os.getenv('PDECISION_URL','http://127.0.0.1:5005'),api_key=os.getenv('PDECISION_API_KEY','')) # a second casino on one PC uses its own PDecision
+        self.decision=PDecision(os.getenv('PDECISION_URL','http://127.0.0.1:5005'),api_key=os.getenv('PDECISION_API_KEY','')) # one PDecision serves every poker site of the PC
         self.output=Path(args.output);self.output.mkdir(parents=True,exist_ok=True)
         self.publish_lock=asyncio.Lock()
         self.client_lock=asyncio.Lock()
@@ -1132,7 +1132,7 @@ class Pilot:
             live_task=asyncio.create_task(self.run_live_views())
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
             next_claim=next_telemetry=0.0
-            while (not self.args.seconds or now()<self.end) and not (self.output/'stop').exists():
+            while (not self.args.seconds or now()<self.end) and not self.stopping():
                 tick=time.monotonic()
                 if tick>=next_refresh:
                     await self.refresh();await self.publish()
@@ -1179,6 +1179,12 @@ class Pilot:
             self.clients.clear()
             await self.decision.close()
             log.info('Cloud worker stopped. Status: %s',self.output/'status.json')
+
+    def stopping(self):
+        # A PC playing several poker sites runs one Pilot per site: the worker's stop marker stops them all, and the
+        # worker stops one site's Pilot when the site is taken off the PC.
+        event=getattr(self.args,'stop_event',None)
+        return bool(event and event.is_set()) or Path(getattr(self.args,'stop_file',None) or self.output/'stop').exists()
 
     async def reconcile_cloud_entries(self,rows):
         """Prove old-epoch seats against Evenbet before making this worker ready."""

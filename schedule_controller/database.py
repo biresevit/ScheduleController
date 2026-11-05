@@ -154,8 +154,8 @@ def seed_bluffpoker(cursor, customer_name: str, machine_id: int, usernames: list
         raise RuntimeError(f"Active customer {customer_name!r} not found")
     customer_id = customer[0]
     machine = cursor.execute("SELECT CustomerId,Casino FROM dbo.CustomerMachine WHERE MachineId=? AND IsActive=1", machine_id).fetchone()
-    if not machine or machine[0] != customer_id or machine[1] != "BluffPoker":
-        raise RuntimeError(f"Machine {machine_id} must be an active BluffPoker registration of {customer_name}")
+    if not machine or machine[0] != customer_id:
+        raise RuntimeError(f"Machine {machine_id} must be an active registration of {customer_name}")
 
     # Accounts: BotAccount is per casino; only the listed bots remain. One check and one delete for the rest.
     keep = ",".join("?" * len(names))
@@ -195,10 +195,11 @@ def seed_bluffpoker(cursor, customer_name: str, machine_id: int, usernames: list
             cursor.execute("""INSERT scheduler.ScheduleWindow(SiteId,Weekday,StartMinute,EndMinute,TargetEntries,Format)
                               VALUES(?,?,0,1439,4,'RING')""", site_id, weekday)
             windows += 1
-    assignment = cursor.execute("SELECT SiteId FROM scheduler.MachineAssignment WHERE MachineId=?", machine_id).fetchone()
-    if assignment and assignment[0] != site_id:
-        raise RuntimeError("Machine already has a different scheduling assignment")
-    if not assignment:
+    # The machine may already play other poker sites of the customer: BluffPoker is added to them.
+    cursor.execute("""INSERT dbo.MachineCasino(MachineId,Casino,Platform) SELECT ?,N'BluffPoker',N'BluffPokerPlatform'
+                      WHERE NOT EXISTS(SELECT 1 FROM dbo.MachineCasino WHERE MachineId=? AND Casino=N'BluffPoker')""",
+                   machine_id, machine_id)
+    if not cursor.execute("SELECT 1 FROM scheduler.MachineAssignment WHERE MachineId=? AND SiteId=?", machine_id, site_id).fetchone():
         cursor.execute("""INSERT scheduler.MachineAssignment(MachineId,SiteId,MaxEntries,DecisionUrl)
                           VALUES(?,?,4,N'http://127.0.0.1:5005')""", machine_id, site_id)
 

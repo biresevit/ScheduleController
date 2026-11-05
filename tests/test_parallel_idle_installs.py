@@ -21,8 +21,8 @@ class Database:
         raise AssertionError(sql)
     def one(self,sql,*args):
         if 'SELECT SiteId FROM scheduler.Site' in sql:return {'SiteId':1}
-        if 'SELECT TOP(1) EntryId' in sql:return {'EntryId':'open'} if args[1] in self.entries else None
-        if 'SELECT TOP(1) SessionId' in sql:return {'SessionId':'open'} if args[1] in self.sessions else None
+        if 'SELECT TOP(1) EntryId' in sql:return {'EntryId':'open'} if args[0] in self.entries else None
+        if 'SELECT TOP(1) SessionId' in sql:return {'SessionId':'open'} if args[0] in self.sessions else None
         if 'SELECT TaskId' in sql:return {'TaskId':'other'} if args[0] in self.active else None
         raise AssertionError(sql)
     def execute(self,sql,*args):self.statements.append((sql,args))
