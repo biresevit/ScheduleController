@@ -54,6 +54,8 @@ class Session:
         self.repo=repo
         self.platform=platform_id((site or {}).get('Platform'))
         self.endpoint=(site or {}).get('EndpointUrl')
+        # BluffPoker's site-wide client values, stored with the site; the PC then needs no bluffpoker.json
+        self.client_settings={'api_key':(site or {}).get('ClientApiKey'),'origin':(site or {}).get('ClientOrigin')}
         self.client=self.new_client()
         self.decision=decision
         self.rng=rng or random.Random()
@@ -82,7 +84,7 @@ class Session:
         """A logged-out client of this account on the site's platform."""
         p=self.policy
         return create_client(self.platform,p['Username'],endpoint_url=None if self.platform==EVENBET else self.endpoint,
-                             email=p.get('LoginEmail'),password=p.get('LoginPassword'))
+                             email=p.get('LoginEmail'),password=p.get('LoginPassword'),**getattr(self,'client_settings',{}))
 
     def attach_observer(self,client,observed):
         # Reconnect candidates must not refresh timestamps on an older client's

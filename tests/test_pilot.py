@@ -89,7 +89,7 @@ def test_idle_session_reconnects_with_same_username(monkeypatch):
     class FakeConnection:
         def __init__(self): self.listeners=[]
     class FakeClient:
-        def __init__(self,platform,username,endpoint_url=None,email=None,password=None):
+        def __init__(self,platform,username,endpoint_url=None,**kw):
             self.settings=SimpleNamespace(username=username);self.connection=FakeConnection();self.open=AsyncMock()
             made.append(self)
     old=SimpleNamespace(close=AsyncMock())
