@@ -116,3 +116,12 @@ def test_only_another_traffic_update_blocks_a_busy_pc(other_is_idle):
     tick_rollouts(db,db.now)
     prepared=any("Status='preparing'" in sql for sql,_ in db.statements)
     assert prepared==other_is_idle
+
+
+def test_a_rollout_is_not_completed_while_an_idle_pc_is_still_installing():
+    from schedule_controller.update_rollouts import complete_if_done
+    db=Database();complete_if_done(db,'rollout',db.now.replace(tzinfo=None))
+    sql,args=db.statements[-1]
+    # the completion is guarded by every task of the rollout, independent idle installs included
+    assert "Status='completed'" in sql and 'NOT EXISTS' in sql and 'IndependentInstall' not in sql
+    assert args[1:]==('rollout','rollout')

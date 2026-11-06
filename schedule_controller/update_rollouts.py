@@ -49,7 +49,7 @@ def tick_rollouts(db,stamp):
                 WHERE CustomerId=? AND Status IN ('queued','running') AND Immediate=1 AND NotBeforeUtc<=? ORDER BY CreatedUtc""",cid,now):
             tasks=db.rows(TASKS+' ORDER BY t.Position',rollout['RolloutId'])
             if not tasks:
-                db.execute("UPDATE scheduler.UpdateRollout SET Status='completed',UpdatedUtc=? WHERE RolloutId=?",now,rollout['RolloutId']);continue
+                complete_if_done(db,rollout['RolloutId'],now);continue
             for task in tasks:advance(db,cid,rollout,task,stamp,serial=False)
         # A paused rollout blocks further traffic interruptions. Empty PCs in
         # other, unpaused rollouts have already been handled independently.
@@ -62,8 +62,15 @@ def tick_rollouts(db,stamp):
         if not rollout: continue
         task=db.one(TASKS.replace('SELECT','SELECT TOP(1)',1)+' ORDER BY t.Position',rollout['RolloutId'])
         if not task:
-            db.execute("UPDATE scheduler.UpdateRollout SET Status='completed',UpdatedUtc=? WHERE RolloutId=?",now,rollout['RolloutId']);continue
+            complete_if_done(db,rollout['RolloutId'],now);continue
         advance(db,cid,rollout,task,stamp,serial=True)
+
+
+def complete_if_done(db,rid,now):
+    """A rollout is completed once none of its PCs is still installing, idle PCs installing on their own included."""
+    db.execute("""UPDATE scheduler.UpdateRollout SET Status='completed',UpdatedUtc=? WHERE RolloutId=?
+        AND NOT EXISTS(SELECT 1 FROM scheduler.MachineUpdateTask t WHERE t.RolloutId=?
+            AND t.Status NOT IN ('completed','cancelled','failed','rolled_back'))""",now,rid,rid)
 
 
 TASKS="""SELECT t.*,a.LastHeartbeatUtc,a.IsReady,g.LastHeartbeatUtc AS AgentHeartbeat,
