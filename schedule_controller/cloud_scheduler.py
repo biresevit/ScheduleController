@@ -127,7 +127,7 @@ class CloudScheduler:
                 site_id).rowcount
             if ended > 0:
                 log.info("Closed %s session(s) that reached their planned end with no open tables", ended)
-            policies = db.rows("""SELECT p.*,b.IsActive,COALESCE(d.SessionSeconds,0) PlayedSeconds,
+            policies = db.rows("""SELECT p.*,b.IsActive,CONVERT(bit,CASE WHEN b.LoginEmail IS NOT NULL AND b.LoginPassword IS NOT NULL THEN 1 ELSE 0 END) HasLogin,COALESCE(d.SessionSeconds,0) PlayedSeconds,
                 l.MachineId OwnerMachine,l.RequiresReconciliation,s.SessionId,s.PlannedEndUtc,
                 s.IsManual SessionManual,s.StartedUtc SessionStart,s.MachineId SessionMachine,
                 prior.ActualEndUtc PreviousEndUtc
@@ -166,7 +166,7 @@ class CloudScheduler:
                 owner = p["SessionMachine"] if p["SessionId"] else p["OwnerMachine"]
                 account = Account(aid, site_id, p["StakeTier"], p["PlayingFrequency"], int(p["PlayedSeconds"]),
                     p["MaxPlaytimeMinutes"], p["MaxTables"], owner,
-                    enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"]),
+                    enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"] or p.get("HasLogin")),
                     synthetic=bool(p["IsSynthetic"]), requires_reconciliation=bool(p["RequiresReconciliation"]),
                     eligible_after=previous+timedelta(minutes=p["SessionCooldownMinutes"]) if previous else None,
                     session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts,
