@@ -48,6 +48,12 @@ def aware(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+def observed_ring_table(table):
+    """Ring tables published to the lobby (Live Tables): NLH, PLO4 and PLO5, no-limit or pot-limit. The scheduler
+    decides separately which of them bots join (planner: NLH and PLO4 only)."""
+    return table.get('g') in (72,79,88) and table.get('p') in (80,85)
+
+
 class Session:
     def __init__(self,policy,decision,rng=None,repo=None,site=None):
         self.policy=policy
@@ -626,7 +632,8 @@ class Pilot:
         last_error=None
         # A single account socket must never be a controller-wide dependency.
         candidates=sorted(self.clients.values(),key=lambda c: bool(c.failures or c.client.connection.failure))
-        if not any(not c.failures and not c.client.connection.failure for c in candidates):
+        # A disabled PC logs no account in just to scan the lobby; seated accounts still read their own tables.
+        if not any(not c.failures and not c.client.connection.failure for c in candidates) and                 await asyncio.to_thread(getattr(self.repo,'machine_enabled',lambda:True)):
             scan_account=await asyncio.to_thread(self.repo.claim_observer)
             if scan_account is not None and scan_account not in self.policies:
                 await asyncio.to_thread(self.repo.release_observer,scan_account)
@@ -649,7 +656,7 @@ class Pilot:
                 # EvenBet's demo lobby is limited to the audited tables; BluffPoker's lobby lists only plain
                 # NLH/PLO ring tables (the client drops tournament and special formats).
                 allowed=TABLE_IDS if self.platform==EVENBET else None
-                info={t['i']:t for t in lobby if (allowed is None or t['i'] in allowed) and t.get('g') in (72,79) and t.get('p') in (80,85)}
+                info={t['i']:t for t in lobby if (allowed is None or t['i'] in allowed) and observed_ring_table(t)}
                 # Subscribe to every table concurrently instead of one at a time; a lobby
                 # scan has nothing to gain from pacing itself like real table play does.
                 async def join_table(tid):

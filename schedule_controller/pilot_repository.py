@@ -152,6 +152,13 @@ class Repository(ChatRepository,ManualRepository):
             return row['BotAccountId'] if row else None
 
     @retry_deadlocks
+    def machine_enabled(self):
+        """False when the PC is switched off in the backoffice (or this site is taken off it)."""
+        with self.transaction() as db:
+            row=db.one("SELECT IsEnabled FROM scheduler.MachineAssignment WHERE SiteId=:site AND MachineId=:machine")
+            return bool(row and row['IsEnabled'])
+
+    @retry_deadlocks
     def release_observer(self,account):
         with self.transaction() as db:
             db.execute("""DELETE l FROM scheduler.AccountLease l WHERE l.SiteId=:site AND l.MachineId=:machine AND l.WorkerEpoch=? AND l.BotAccountId=?

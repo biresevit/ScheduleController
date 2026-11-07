@@ -332,3 +332,21 @@ def test_bluffpoker_site_sessions_use_the_bluffpoker_client(tmp_path,monkeypatch
     assert isinstance(session.tourneys,BluffPokerTournaments)
     evenbet=Session({'Username':'kate'},object(),site={'Platform':'EvenBet'})
     assert type(evenbet.client).__name__=='EvenBetClient' and hasattr(evenbet,'tourneys')
+
+
+def test_disabled_pc_logs_no_account_in_for_a_lobby_scan(monkeypatch):
+    import schedule_controller.pilot as module
+    p=Pilot.__new__(Pilot)
+    p.clients={};p.entries={};p.policies={1:{'Username':'monica','BotAccountId':1}};p.info={};p.tables=[];p.seats={}
+    p.repo=SimpleNamespace(machine_enabled=lambda:False,
+        claim_observer=lambda:(_ for _ in ()).throw(AssertionError('A disabled PC must not claim a scan account')))
+    monkeypatch.setattr(module,'Session',lambda *args,**kw:(_ for _ in ()).throw(AssertionError('No login on a disabled PC')))
+    asyncio.run(p.refresh())
+    assert p.tables==[] and p.info=={}
+
+
+def test_plo5_tables_are_published_to_the_lobby():
+    from schedule_controller.pilot import observed_ring_table
+    assert observed_ring_table({'g':88,'p':85})  # PLO5 pot limit (BluffPoker), shown in Live Tables
+    assert observed_ring_table({'g':72,'p':80}) and observed_ring_table({'g':79,'p':85})
+    assert not observed_ring_table({'g':73,'p':80})
