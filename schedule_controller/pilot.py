@@ -744,7 +744,9 @@ class Pilot:
         if closed_accounts:self.accrue()
 
     def accrue(self):
-        stamp=now()
+        # AccountInterval stores milliseconds (datetime2(3)) and requires EndUtc>StartUtc: two accruals within the
+        # same millisecond made an empty interval that failed the whole publish and restarted the site (2026-11-07).
+        stamp=now();stamp=stamp.replace(microsecond=stamp.microsecond//1000*1000)
         counts=Counter(e['account'] for e in self.entries.values() if e['status'] in ('seated','sitting_out','draining'))
         for aid,(start,count) in list(self.accounting.items()):
             if stamp>start and count:

@@ -419,6 +419,8 @@ class Repository(ChatRepository,ManualRepository):
             from .rules import split_interval
             for span in intervals:
                 if db.one('SELECT IntervalId FROM scheduler.AccountInterval WHERE IntervalId=?',span['id']): continue
+                # an empty interval at millisecond precision has nothing to account and would violate EndUtc>StartUtc
+                if span['end'].replace(microsecond=span['end'].microsecond//1000*1000)<=span['start'].replace(microsecond=span['start'].microsecond//1000*1000): continue
                 db.execute("INSERT scheduler.AccountInterval(IntervalId,SiteId,BotAccountId,MachineId,WorkerEpoch,SequenceNumber,StartUtc,EndUtc,EntryCount) VALUES(?,:site,?,:machine,?,?,?,?,?)",span['id'],span['account'],self.epoch,span['sequence'],utc(span['start']),utc(span['end']),span['entries'])
                 for day,seconds in split_interval(span['start'],span['end'],'Europe/Budapest').items():
                     count=int(seconds)
