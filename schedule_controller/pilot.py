@@ -756,9 +756,22 @@ class Pilot:
         async with self.publish_lock:
             self.accrue()
             spans=copy.deepcopy(self.intervals)
+            # Closed entries and sessions stay in memory all day, and the journal writes each one row by row: on a
+            # PC far from the database, re-sending a day's worth took ~25 s per publish, so the lobby reached the
+            # database already stale and Live tables and the scheduler often saw no fresh tables. Active ones are
+            # always sent (their leases are renewed); closed ones only until the same state has been written once.
+            sent=self.__dict__.setdefault('published_closed',{})
+            def unsent(kind,item,closed):
+                return not closed or sent.get((kind,item['id']))!=json.dumps(item,default=str,sort_keys=True)
+            entries=[e for e in self.entries.values() if unsent('entry',e,e['status'] in ('closed','failed'))]
+            sessions=[s for s in self.sessions if unsent('session',s,bool(s.get('closed')))]
+            entries=copy.deepcopy(entries);sessions=copy.deepcopy(sessions)
             await asyncio.to_thread(self.repo.publish,copy.deepcopy(self.tables),copy.deepcopy(self.seats),
-                copy.deepcopy(list(self.entries.values())),copy.deepcopy(self.sessions),spans,ready=ready,
+                entries,sessions,spans,ready=ready,
                 next_join=self.next_join,next_leave=self.next_leave,last_plan=self.last_plan)
+            for kind,items,closed in (('entry',entries,lambda e:e['status'] in ('closed','failed')),('session',sessions,lambda s:bool(s.get('closed')))):
+                for item in items:
+                    if closed(item):sent[(kind,item['id'])]=json.dumps(item,default=str,sort_keys=True)
             done={s['id'] for s in spans};self.intervals=[s for s in self.intervals if s['id'] not in done]
             summary={'controller_version':getattr(self.args,'controller_version',None),'at':now().isoformat(),'epoch':self.epoch,'target':self.args.target,
                 'entries':Counter(e['status'] for e in self.entries.values()),
