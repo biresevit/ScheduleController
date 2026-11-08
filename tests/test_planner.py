@@ -145,7 +145,7 @@ def test_populated_table_is_preferred_without_being_mandatory():
     for seed in range(1000):
         result=plan(SETTINGS,NOW,1,[Account(1,1,'low')],[Machine(1,1,6,NOW)],tables,[],random.Random(seed))
         populated+=result.actions[0].table=='busy'
-    assert 930<populated<990
+    assert 980<populated<1000
 
 
 def test_cancel_reserved_joins_before_seated_departures_and_keep_departure_capacity():
@@ -325,3 +325,14 @@ def test_paused_joins_still_let_ended_sessions_leave():
                   [Table("a", 1, D(".1"), 6, 1, NOW, observed_accounts=frozenset({1})), Table("b", 1, D(".1"), 6, 0, NOW)],
                   [Entry("x", 1, 1, "a", "seated")], random.Random(3))
     assert [(a.kind, a.account) for a in result.actions] == [("leave", 1)]
+
+
+def test_one_pc_fills_a_table_it_already_plays_before_opening_an_empty_one():
+    # Simo: one PC, 20 bots spread one per table. A table with one of our bots now beats an empty one.
+    accounts=[Account(1,1,'low',enabled=False),Account(2,1,'low')]
+    tables=[Table('ours',1,D('.1'),6,1,NOW,observed_accounts=frozenset({1})),Table('empty',1,D('.1'),6,0,NOW)]
+    joined=0
+    for seed in range(1000):
+        result=plan(SETTINGS,NOW,2,accounts,[Machine(1,1,20,NOW)],tables,[Entry('x',1,1,'ours')],random.Random(seed))
+        joined+=result.actions[0].table=='ours'
+    assert joined>900

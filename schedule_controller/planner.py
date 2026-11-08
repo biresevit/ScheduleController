@@ -294,23 +294,26 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         chosen = rng.choices(list(available), weights=[FREQUENCY_WEIGHTS[a.frequency] /
                           (1 + a.played_seconds / 3600) for a in available.values()], k=1)[0]
         choices=[o for o in options if o[0].id == chosen]
-        # Two of our accounts from one PC at one table share an IP and a single
-        # point of failure; take another table or PC whenever one is available.
-        apart=[o for o in choices if not concentration[o[2].id, o[1].id]]
-        if apart:
-            choices=apart
+        # Two of our accounts from one PC at one table share an IP and a single point of failure: for a given
+        # table, take a PC that has no account there whenever one is available. This chooses the PC, never the
+        # table: avoiding the table spread a one-PC customer's bots one per table (Simo, 2026-11-08).
+        by_table={}
+        for o in choices:
+            by_table.setdefault(o[1].id,[]).append(o)
+        choices=[o for opts in by_table.values() for o in ([x for x in opts if not concentration[x[2].id, x[1].id]] or opts)]
         # A new login goes to the least loaded PC; its later tables stay there.
         if not owners[chosen]:
             load=lambda m: machine_count[m.id] / m.capacity
             lightest=min(load(o[2]) for o in choices)
             choices=[o for o in choices if load(o[2]) == lightest]
-        # Prefer active/populated tables without making the choice deterministic.
+        # Fill tables that already have players (bots or humans) before opening empty ones, without making the
+        # choice deterministic: a 6-max table with 2 players weighs about 40 times an empty one.
         def table_weight(o):
             _,t,m=o
-            population=(table_count[t.id]+1)**2
-            spread=1+4*concentration[m.id,t.id]
+            occupied=table_count[t.id]
+            free_after=max(0,t.seats-occupied-1)
             capacity=max(1,m.capacity-machine_count[m.id])
-            return population*capacity/spread
+            return (occupied+1)**3/(free_after+1)*capacity
         a,t,m=rng.choices(choices,weights=[table_weight(o) for o in choices],k=1)[0]
         due_join += random_gap()
         if due_join >= now + timedelta(seconds=horizon_seconds):
