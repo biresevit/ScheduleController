@@ -171,7 +171,8 @@ class CloudScheduler:
                     eligible_after=previous+timedelta(minutes=p["SessionCooldownMinutes"]) if previous else None,
                     session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts,
                     manual=manual,session_start=aware(p["SessionStart"]) if manual else None,
-                    max_sng_entries=p["MaxSngEntries"],max_mtt_entries=p["MaxMttEntries"])
+                    max_sng_entries=p["MaxSngEntries"],max_mtt_entries=p["MaxMttEntries"],
+                    games=frozenset(g for g in str(p.get("AllowedGames") or "NLH,PLO4,PLO5").split(",") if g))
                 tournament_accounts.append(account)
                 ring_tables = p["MaxTables"] - tournament_by_account[aid]
                 accounts.append(account if ring_tables == p["MaxTables"] else

@@ -336,3 +336,13 @@ def test_one_pc_fills_a_table_it_already_plays_before_opening_an_empty_one():
         result=plan(SETTINGS,NOW,2,accounts,[Machine(1,1,20,NOW)],tables,[Entry('x',1,1,'ours')],random.Random(seed))
         joined+=result.actions[0].table=='ours'
     assert joined>900
+
+
+def test_plo5_tables_are_joined_by_accounts_that_play_plo5_only():
+    plo5=[Table('p5',1,D('.1'),6,0,NOW,game='PLO5')]
+    assert run(accounts=[Account(1,1,'low')],tables=plo5).actions[0].table=='p5'
+    assert not run(accounts=[Account(1,1,'low',games=frozenset({'NLH','PLO4'}))],tables=plo5).actions
+    mixed=[Table('nlh',1,D('.1'),6,0,NOW),Table('p5',1,D('.1'),6,0,NOW,game='PLO5')]
+    for seed in range(50):
+        result=plan(SETTINGS,NOW,1,[Account(1,1,'low',games=frozenset({'PLO5'}))],[Machine(1,1,6,NOW)],mixed,[],random.Random(seed))
+        assert result.actions[0].table=='p5'

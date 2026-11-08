@@ -10,6 +10,10 @@ from decimal import Decimal
 from .rules import Band, FREQUENCY_WEIGHTS, TIERS, require_aware, stake_targets
 
 
+# Game formats bots can play (PDecision strategy and the worker's hand mapping support all three).
+GAMES = ("NLH", "PLO4", "PLO5")
+
+
 @dataclass(frozen=True)
 class Account:
     id: int
@@ -34,6 +38,8 @@ class Account:
     # SNG / MTT entries (registered or playing) the account may hold at the same time.
     max_sng_entries: int = 1
     max_mtt_entries: int = 1
+    # Game formats the account plays, at ring tables and in tournaments.
+    games: frozenset = frozenset(GAMES)
 
 
 @dataclass(frozen=True)
@@ -166,7 +172,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
 
     ready = {m.id: m for m in mach.values() if m.enabled and m.ready and m.capacity > 0
              and fresh(m.heartbeat, settings.heartbeat_seconds)}
-    supported = {t.id: t for t in tab.values() if t.open and t.game in ("NLH", "PLO4")
+    supported = {t.id: t for t in tab.values() if t.open and t.game in GAMES
                  and t.currency == settings.currency and fresh(t.observed, settings.freshness_seconds)}
     table_tier = {t.id: next((b.tier for b in settings.bands if b.contains(t.big_blind)), None)
                   for t in supported.values()}
@@ -264,7 +270,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                 or current[a.tier] >= desired[a.tier] and not (a.manual and account_count[a.id] == 0)):
                 continue
             for t in supported.values():
-                if table_tier[t.id] != a.tier or table_count[t.id] >= t.seats or (a.id, t.id) in pairs:
+                if table_tier[t.id] != a.tier or table_count[t.id] >= t.seats or (a.id, t.id) in pairs or t.game not in a.games:
                     continue
                 for m in ready.values():
                     if m.maintenance or machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:

@@ -94,6 +94,11 @@ class TournamentPlay:
         """A person's reaction time before a cashier decision."""
         await asyncio.sleep(self.session.rng.uniform(low, high))
 
+    def limit(self, kind, fmt):
+        """The account's maximum rebuys / re-entries per tournament (kind 'Rebuys' or 'Reentries'), per format."""
+        value = self.policy.get(f"Max{'Mtt' if fmt == 'MTT' else 'Sng'}{kind}")
+        return 3 if value is None and kind == "Rebuys" else 1 if value is None else int(value)
+
     def chance(self, column, default):
         value = self.policy.get(column)
         return default if value is None else float(value)
@@ -242,8 +247,10 @@ class TournamentPlay:
             await self.session.detach_table(table)
             self.by_table.pop(table, None)
         status = state.get("status") or {}
-        # Re-entry, when the tournament still allows it, is decided with the tournament rebuy chance.
+        # Re-entry, when the tournament still allows it and the account's re-entry limit is not used up, is decided
+        # with the tournament rebuy chance. entry_idx counts the re-entries already taken.
         if (status.get("isReEntryPeriodActive") and status.get("reEntryAllowedPersonal")
+                and int(state.get("entry_idx") or 0) < self.limit("Reentries", state.get("format"))
                 and self.session.rng.random() < self.chance("RebuyTournamentChance", .5)):
             await self.pause(3, 10)
             try:
@@ -304,10 +311,13 @@ class TournamentPlay:
         if not (status.get("isRebuyPeriodActive") and status.get("rebuyAllowedPersonal")):
             return
         entry_idx = int(state.get("entry_idx") or 0)
-        if self.session.rng.random() < self.chance("RebuyTournamentChance", .5):
+        allowed = state.get("rebuys", 0) < self.limit("Rebuys", state.get("format"))
+        if allowed and self.session.rng.random() < self.chance("RebuyTournamentChance", .5):
             reply = await self.client.connection.request("RebuyRequest", tournamentId=tid, type=REBUY,
                                                          playerEntryIdx=entry_idx, chipsAmount=int(state.get("rebuy_chips") or 0))
             ok = reply.get("success") or "planned" in str(reply.get("text", ""))
+            if ok:
+                state["rebuys"] = state.get("rebuys", 0) + 1
             self.log.info("TOURNAMENT REBUY %s tournament=%s ok=%s", self.policy["Username"], tid, bool(ok))
         else:
             await self.client.connection.request("TournamentPlayerCommand", command=DECLINE_REBUY, tournamentId=tid,

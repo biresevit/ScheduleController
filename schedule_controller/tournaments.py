@@ -96,6 +96,7 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
     def fresh(stamp: datetime, seconds: int) -> bool:
         return (now - stamp.astimezone(timezone.utc)).total_seconds() <= seconds
 
+    # Tournaments stay NLH only: PDecision's PLO tournament play is not verified. Ring tables take all of GAMES.
     open_tournaments = [t for t in tournaments if t.format == fmt and t.state == "registering" and t.game == "NLH"
                         and not is_excluded(t.name, excluded) and fresh(t.observed, freshness_seconds)
                         and (t.registered < t.max_players if fmt == "SNG" else
@@ -123,7 +124,8 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
                 or a.eligible_after is not None and now < a.eligible_after.astimezone(timezone.utc)
                 or a.session_end is not None and now >= a.session_end.astimezone(timezone.utc)):
             continue
-        fitting = [t for t in open_tournaments if fits(t.buy_in, ranges.get(a.tier)) and (a.id, t.id) not in registered]
+        fitting = [t for t in open_tournaments if fits(t.buy_in, ranges.get(a.tier)) and (a.id, t.id) not in registered
+                   and t.game in a.games]
         if not fitting:
             continue
         for m in ready.values():

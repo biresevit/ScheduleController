@@ -107,3 +107,9 @@ def test_an_account_holds_at_most_its_sng_and_mtt_entry_limits():
     assert [a.tournament for a in run("SNG", 5, [account(1, max_sng_entries=2)], tournaments, entries).actions] == ["T2"]
     # a registration whose tournament left the lobby still counts
     assert run("SNG", 5, [account(1)], [sng(2, 3)], [Entry("e1", 1, 1, "Tgone")]).reasons == ["no_eligible_account"]
+
+
+def test_tournament_registration_follows_the_accounts_games():
+    nlh = sng(1, 2)
+    assert run("SNG", 1, [account(1)], [nlh]).actions
+    assert not run("SNG", 1, [account(1, games=frozenset({"PLO4", "PLO5"}))], [nlh]).actions

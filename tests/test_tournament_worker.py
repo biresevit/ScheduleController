@@ -308,3 +308,22 @@ def test_restart_seating_before_entry_restoration_is_reconfirmed(prior_status):
         assert len(adopted)==1
         await t.close()
     run(go())
+
+
+def test_rebuys_and_reentries_stop_at_the_accounts_limits():
+    async def go():
+        replies = {"RebuyRequest": {"success": True}, "RegisterInTournament": {"success": True}}
+        session, t, _ = play(replies, policy={"RebuyTournamentChance": 1, "MaxMttRebuys": 1, "MaxSngReentries": 0})
+        t.active[9] = {"format": "MTT", "entry_idx": 0, "table": 501, "rebuy_chips": 1000, "addon_decided": False,
+                       "status": {"isRebuyPeriodActive": True, "rebuyAllowedPersonal": True}}
+        await t.rebuy(9)
+        await t.rebuy(9)
+        sent = [m for m, _ in session.client.connection.sent]
+        assert sent == ["RebuyRequest", "TournamentPlayerCommand"]  # one rebuy, then declined at the limit
+        t.active[8] = {"format": "SNG", "entry_idx": 0, "table": 502, "addon_decided": False,
+                       "status": {"isReEntryPeriodActive": True, "reEntryAllowedPersonal": True}}
+        t.by_table[502] = 8
+        await t.on_end(8, 502, 4)
+        assert not any(m == "RegisterInTournament" for m, _ in session.client.connection.sent)
+        await t.close()
+    run(go())
