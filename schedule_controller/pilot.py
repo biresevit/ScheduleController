@@ -48,6 +48,15 @@ def aware(value):
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
 
 
+# Accounts whose seats are proven at the same time after a restart.
+RECONCILE_CONCURRENCY = 6
+
+
+def rate_limited(exc):
+    """A poker site's rate-limit answer (HTTP 429, RATE_LIMITED / RATE_LIMIT_EXCEEDED)."""
+    return getattr(exc,'status',None)==429 or 'RATE_LIMIT' in str(getattr(exc,'code','') or exc)
+
+
 def observed_ring_table(table):
     """Ring tables published to the lobby (Live Tables): NLH, PLO4 and PLO5, no-limit or pot-limit. The scheduler
     decides separately which of them bots join (planner: NLH and PLO4 only)."""
@@ -564,8 +573,16 @@ class Pilot:
         return platform_id(self.config['site'].get('Platform'))
 
     async def session_for(self,aid):
-        """Authenticate an account only when a play command is being executed."""
+        """Authenticate an account only when a play command is being executed.
+
+        One lock per account: logins of different accounts run at the same time (restart reconciliation of 40+
+        accounts must finish while BluffPoker still holds their seats), the same account never logs in twice."""
         async with self.client_lock:
+            existing=self.clients.get(aid)
+            if existing:
+                return existing
+            lock=self.__dict__.setdefault('account_locks',{}).setdefault(aid,asyncio.Lock())
+        async with lock:
             existing=self.clients.get(aid)
             if existing:
                 return existing
@@ -671,13 +688,21 @@ class Pilot:
                 last_error=exc
                 log.warning('Lobby observer failed for %s: %s',
                             candidate.policy['Username'],type(exc).__name__)
+                # Every other account would get the same answer and only prolong the limit (34 failed scans
+                # in a row on machine 5, 2026-11-08 06:17).
+                if rate_limited(exc):
+                    break
         if observer is None:
             if temporary: await temporary.close()
             if temporary:await asyncio.to_thread(self.repo.release_observer,temporary.policy['BotAccountId'])
             if not candidates:
                 self.info={};self.tables=[];self.seats={}
                 return
-            raise RuntimeError('No healthy lobby observer') from last_error
+            # The bots keep playing: only this lobby snapshot is missing. Stopping the site here dropped every
+            # seat (BluffPoker keeps a disconnected seat ~29 s) because of a lobby rate limit (machine 5, 06:17).
+            log.warning('Lobby scan skipped this round, no observer could list the lobby: %s',
+                        type(last_error).__name__ if last_error else 'no answer')
+            return
         observer_states=copy.deepcopy(observer.client.states)
         observer_observed=dict(observer.observed)
         # SNGs and MTTs are published as lobby rows too; a failed listing only skips them this round.
@@ -1149,6 +1174,7 @@ class Pilot:
             await self.reconcile_cloud_entries(recovery)
             await asyncio.to_thread(self.repo.finish_cloud_worker_reconciliation)
             self.started=True
+            self.args.ready=True  # read by run_sites: a run that got ready restarts quickly after a failure
             log.info('Cloud worker ready after reconciling %s prior entries; entry capacity is enforced by the Azure scheduler',len(recovery))
             await self.refresh();await self.publish()
             from .chat_worker import run_chat
@@ -1213,56 +1239,73 @@ class Pilot:
         return bool(event and event.is_set()) or Path(getattr(self.args,'stop_file',None) or self.output/'stop').exists()
 
     async def reconcile_cloud_entries(self,rows):
-        """Prove old-epoch seats against Evenbet before making this worker ready."""
+        """Prove old-epoch seats against the poker site before making this worker ready.
+
+        BluffPoker keeps a disconnected seat about 29 s: accounts are reconciled in parallel, and the lobby is listed
+        once for all of them (one listing per account rate-limited the hub and arrived too late for the later seats)."""
         grouped={}
         for row in rows:
             grouped.setdefault(row['BotAccountId'],[]).append(row)
-        for aid,entries in grouped.items():
-            session=await self.session_for(aid)
-            await session.client.list_tables()
-            lobby={table_key(t['i']):t for t in session.client.tables.values()}
-            for row in entries:
-                if str(row['TableId']).startswith('T'):
-                    # A registered or running tournament survives a restart: subscribe again and let the
-                    # server's seating messages re-attach the table bot.
-                    eid=str(row['EntryId']);key=str(row['TableId']);status=row['Status'] if row['Status'] in ('joining','seated') else 'joining'
-                    await asyncio.to_thread(self.repo.adopt_reconciled_entry,row['EntryId'],status)
-                    self.entries[eid]={'id':eid,'account':aid,'table':key,'status':status,'buy_in':row['BuyInAmount'],
-                        'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),'commands':[],
-                        'session':str(row['SessionId']) if row.get('SessionId') else None}
-                    session.tourneys.active.setdefault(tournament_id(key),{'format':'SNG','entry_idx':0,'table':None,'addon_decided':False})
-                    try:await session.tourneys.resume()
-                    except Exception as exc:log.warning('Tournament resume failed for %s / %s: %s',row['Username'],key,exc)
-                    # A registration EvenBet no longer holds (unregistered or cancelled) and that has no
-                    # table is over: close it so it stops counting toward the tournament target.
-                    if status=='joining' and not session.tourneys.active.get(tournament_id(key),{}).get('table'):
-                        try:registered=await session.tourneys.registered_tournaments()
-                        except Exception as exc:
-                            registered=None;log.warning('Tournament registrations unknown for %s: %s',row['Username'],exc)
-                        if registered is not None and tournament_id(key) not in registered:
-                            self.entries[eid].update(status='closed',closed=now(),confirmed=now())
-                            session.tourneys.forget(tournament_id(key))
-                            log.info('Restart closed tournament entry no longer registered: %s / %s',row['Username'],key)
-                            continue
-                    log.info('Restart kept tournament entry: %s / %s',row['Username'],key)
-                    continue
-                tid=table_key(row['TableId'])
-                info=lobby.get(tid) or session.client.tables.get(tid) or {'i':tid,'n':str(tid)}
-                status=await session.adopt(tid,info)
-                if status is None:
-                    await asyncio.to_thread(self.repo.close_reconciled_entry,row['EntryId'])
-                    log.info('Restart reconciliation confirmed absent: %s / %s',row['Username'],tid)
-                    continue
+        shared={'lobby':None};lobby_lock=asyncio.Lock();slots=asyncio.Semaphore(RECONCILE_CONCURRENCY)
+        async def lobby_for(session):
+            async with lobby_lock:
+                if shared['lobby'] is None:
+                    await session.client.list_tables()
+                    shared['lobby']={table_key(t['i']):dict(t) for t in session.client.tables.values()}
+            return shared['lobby']
+        async def one(aid,entries):
+            async with slots:
+                await self.reconcile_account(aid,entries,lobby_for)
+        results=await asyncio.gather(*(one(aid,entries) for aid,entries in grouped.items()),return_exceptions=True)
+        failed=[r for r in results if isinstance(r,BaseException)]
+        if failed:
+            raise failed[0]
+
+    async def reconcile_account(self,aid,entries,lobby_for):
+        session=await self.session_for(aid)
+        lobby=await lobby_for(session)
+        for row in entries:
+            if str(row['TableId']).startswith('T'):
+                # A registered or running tournament survives a restart: subscribe again and let the
+                # server's seating messages re-attach the table bot.
+                eid=str(row['EntryId']);key=str(row['TableId']);status=row['Status'] if row['Status'] in ('joining','seated') else 'joining'
                 await asyncio.to_thread(self.repo.adopt_reconciled_entry,row['EntryId'],status)
-                eid=str(row['EntryId'])
-                self.entries[eid]={'id':eid,'account':aid,'table':str(row['TableId']),'status':status,
-                    'buy_in':row['BuyInAmount'],'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),
-                    'confirmed':now(),'session':str(row['SessionId']) if row['SessionId'] else None,'commands':[]}
-                if row['SessionId'] and not any(str(s['id'])==str(row['SessionId']) for s in self.sessions):
-                    self.sessions.append({'id':str(row['SessionId']),'account':aid,
-                        'start':aware(row['StartedUtc']),'end':aware(row['PlannedEndUtc'])})
-                log.info('Restart reconciliation adopted seat: %s / %s (%s)',row['Username'],tid,status)
-            await self.close_session_if_idle(aid)
+                self.entries[eid]={'id':eid,'account':aid,'table':key,'status':status,'buy_in':row['BuyInAmount'],
+                    'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),'commands':[],
+                    'session':str(row['SessionId']) if row.get('SessionId') else None}
+                session.tourneys.active.setdefault(tournament_id(key),{'format':'SNG','entry_idx':0,'table':None,'addon_decided':False})
+                try:await session.tourneys.resume()
+                except Exception as exc:log.warning('Tournament resume failed for %s / %s: %s',row['Username'],key,exc)
+                # A registration EvenBet no longer holds (unregistered or cancelled) and that has no
+                # table is over: close it so it stops counting toward the tournament target.
+                if status=='joining' and not session.tourneys.active.get(tournament_id(key),{}).get('table'):
+                    try:registered=await session.tourneys.registered_tournaments()
+                    except Exception as exc:
+                        registered=None;log.warning('Tournament registrations unknown for %s: %s',row['Username'],exc)
+                    if registered is not None and tournament_id(key) not in registered:
+                        self.entries[eid].update(status='closed',closed=now(),confirmed=now())
+                        session.tourneys.forget(tournament_id(key))
+                        log.info('Restart closed tournament entry no longer registered: %s / %s',row['Username'],key)
+                        continue
+                log.info('Restart kept tournament entry: %s / %s',row['Username'],key)
+                continue
+            tid=table_key(row['TableId'])
+            info=dict(lobby.get(tid) or session.client.tables.get(tid) or {'i':tid,'n':str(tid)})
+            status=await session.adopt(tid,info)
+            if status is None:
+                await asyncio.to_thread(self.repo.close_reconciled_entry,row['EntryId'])
+                log.info('Restart reconciliation confirmed absent: %s / %s',row['Username'],tid)
+                continue
+            await asyncio.to_thread(self.repo.adopt_reconciled_entry,row['EntryId'],status)
+            eid=str(row['EntryId'])
+            self.entries[eid]={'id':eid,'account':aid,'table':str(row['TableId']),'status':status,
+                'buy_in':row['BuyInAmount'],'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),
+                'confirmed':now(),'session':str(row['SessionId']) if row['SessionId'] else None,'commands':[]}
+            if row['SessionId'] and not any(str(s['id'])==str(row['SessionId']) for s in self.sessions):
+                self.sessions.append({'id':str(row['SessionId']),'account':aid,
+                    'start':aware(row['StartedUtc']),'end':aware(row['PlannedEndUtc'])})
+            log.info('Restart reconciliation adopted seat: %s / %s (%s)',row['Username'],tid,status)
+        await self.close_session_if_idle(aid)
 
     async def run(self):
         await self.configuration()

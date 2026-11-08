@@ -350,3 +350,49 @@ def test_plo5_tables_are_published_to_the_lobby():
     assert observed_ring_table({'g':88,'p':85})  # PLO5 pot limit (BluffPoker), shown in Live Tables
     assert observed_ring_table({'g':72,'p':80}) and observed_ring_table({'g':79,'p':85})
     assert not observed_ring_table({'g':73,'p':80})
+
+
+def _observer(name,error):
+    c=SimpleNamespace(policy={'Username':name},failures={},ready=asyncio.Event(),observed={})
+    c.ready.set()
+    c.client=SimpleNamespace(connection=SimpleNamespace(failure=None),list_tables=AsyncMock(side_effect=error),tables={},player_id=name)
+    return c
+
+
+def test_a_failed_lobby_scan_keeps_the_site_and_its_last_snapshot():
+    # Every observer failing used to raise 'No healthy lobby observer' and stop the site with all its seats.
+    p=Pilot.__new__(Pilot)
+    p.clients={1:_observer('monica',ConnectionError()),2:_observer('kate',ConnectionError())}
+    p.entries={};p.info={'t':{}};p.tables=[{'id':'t'}];p.seats={'t':[]};p.config={'site':{'Platform':'BluffPoker'}}
+    asyncio.run(p.refresh())
+    assert p.tables==[{'id':'t'}] and p.seats=={'t':[]}
+
+
+def test_a_rate_limited_lobby_scan_stops_at_the_first_account():
+    from poker_controller.bluffpoker import BluffPokerError
+    limited=BluffPokerError('RATE_LIMIT_EXCEEDED',status=429,topic='tables',uncertain=True)
+    p=Pilot.__new__(Pilot)
+    p.clients={1:_observer('monica',limited),2:_observer('kate',ConnectionError())}
+    p.entries={};p.info={};p.tables=[];p.seats={};p.config={'site':{'Platform':'BluffPoker'}}
+    asyncio.run(p.refresh())
+    p.clients[1].client.list_tables.assert_awaited_once()
+    p.clients[2].client.list_tables.assert_not_awaited()
+
+
+def test_restart_reconciliation_lists_the_lobby_once_and_runs_accounts_together():
+    running=[];peak=[0];listings=[]
+    p=Pilot.__new__(Pilot)
+    async def session_for(aid):
+        async def list_tables():
+            listings.append(aid)
+        return SimpleNamespace(client=SimpleNamespace(list_tables=list_tables,tables={'7':{'i':'7','n':'Vienna'}}))
+    async def reconcile_account(aid,entries,lobby_for):
+        running.append(aid);peak[0]=max(peak[0],len(running))
+        lobby=await lobby_for(await session_for(aid))
+        assert 7 in lobby
+        await asyncio.sleep(.01)
+        running.remove(aid)
+    p.session_for=session_for;p.reconcile_account=reconcile_account
+    rows=[{'BotAccountId':a,'TableId':'7'} for a in range(1,13)]
+    asyncio.run(p.reconcile_cloud_entries(rows))
+    assert len(listings)==1 and peak[0]>1
