@@ -346,3 +346,13 @@ def test_plo5_tables_are_joined_by_accounts_that_play_plo5_only():
     for seed in range(50):
         result=plan(SETTINGS,NOW,1,[Account(1,1,'low',games=frozenset({'PLO5'}))],[Machine(1,1,6,NOW)],mixed,[],random.Random(seed))
         assert result.actions[0].table=='p5'
+
+
+def test_an_empty_format_still_gets_joins_next_to_busy_tables():
+    # Every PLO5 table empty, NLH tables busy: the game is chosen first, so PLO5 still gets about half the joins.
+    tables=[Table('busy',1,D('.1'),6,4,NOW),Table('p5',1,D('.1'),6,0,NOW,game='PLO5')]
+    plo5=0
+    for seed in range(1000):
+        result=plan(SETTINGS,NOW,1,[Account(1,1,'low')],[Machine(1,1,6,NOW)],tables,[],random.Random(seed))
+        plo5+=result.actions[0].table=='p5'
+    assert 420<plo5<580

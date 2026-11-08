@@ -307,6 +307,13 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         for o in choices:
             by_table.setdefault(o[1].id,[]).append(o)
         choices=[o for opts in by_table.values() for o in ([x for x in opts if not concentration[x[2].id, x[1].id]] or opts)]
+        # Game format first, at even odds among the account's formats with a table to join, then the table: the
+        # fill-populated-tables weight below would otherwise never open an empty format (PLO5 stayed unplayed while
+        # every PLO5 table was empty, Simo 2026-11-08).
+        formats=sorted({o[1].game for o in choices})
+        if len(formats)>1:
+            game=rng.choice(formats)
+            choices=[o for o in choices if o[1].game==game]
         # A new login goes to the least loaded PC; its later tables stay there.
         if not owners[chosen]:
             load=lambda m: machine_count[m.id] / m.capacity
