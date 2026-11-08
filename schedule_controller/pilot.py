@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import tempfile
 import time
 import uuid
 
@@ -46,6 +47,42 @@ def guid(): return str(uuid.uuid4())
 def aware(value):
     if value is None: return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
+
+
+class WorkerLock:
+    """An operating-system lock per machine and site, held while a cloud worker runs on this PC.
+
+    Windows releases it as soon as the holding process exits, also when it crashes, so whoever acquires it knows
+    the previous worker of this machine and site is gone."""
+
+    def __init__(self,machine_id,site_id,folder=None):
+        self.path=Path(folder or tempfile.gettempdir())/f'pokersuite-worker-{machine_id}-{site_id}.lock'
+        self.handle=None
+
+    def acquire(self):
+        try:
+            self.path.parent.mkdir(parents=True,exist_ok=True)
+            handle=open(self.path,'a+b')
+        except OSError:
+            return False
+        try:
+            if os.name=='nt':
+                import msvcrt
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(),msvcrt.LK_NBLCK,1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return False
+        self.handle=handle
+        return True
+
+    def release(self):
+        if self.handle:
+            try:self.handle.close()
+            finally:self.handle=None
 
 
 # Accounts whose seats are proven at the same time after a restart.
@@ -1170,7 +1207,11 @@ class Pilot:
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
         chat_task=manual_task=live_task=None
         try:
-            recovery=await asyncio.to_thread(self.repo.start_cloud_worker)
+            # Holding the PC's worker lock proves the worker behind a fresh heartbeat has exited: a crashed worker
+            # used to block its replacement for 90 s, and BluffPoker gives up a disconnected seat after ~29 s.
+            self.worker_lock=WorkerLock(getattr(self.args,'machine_id',None),getattr(self.args,'site_id',None))
+            gone=self.worker_lock.acquire()
+            recovery=await asyncio.to_thread(self.repo.start_cloud_worker,gone) if gone else                 await asyncio.to_thread(self.repo.start_cloud_worker)
             await self.reconcile_cloud_entries(recovery)
             await asyncio.to_thread(self.repo.finish_cloud_worker_reconciliation)
             self.started=True
@@ -1231,6 +1272,7 @@ class Pilot:
             self.clients.clear()
             await self.decision.close()
             log.info('Cloud worker stopped. Status: %s',self.output/'status.json')
+            if getattr(self,'worker_lock',None):self.worker_lock.release()
 
     def stopping(self):
         # A PC playing several poker sites runs one Pilot per site: the worker's stop marker stops them all, and the

@@ -193,13 +193,16 @@ class Repository(ChatRepository,ManualRepository):
             db.execute("UPDATE backoffice.MachineMetadata SET HostName=?,LastAgentUtc=SYSUTCDATETIME(),Version=Version+1 WHERE MachineId=:machine",socket.gethostname())
 
     @retry_deadlocks
-    def start_cloud_worker(self):
-        """Fence the old epoch and return every entry that needs live reconciliation."""
+    def start_cloud_worker(self,previous_worker_gone=False):
+        """Fence the old epoch and return every entry that needs live reconciliation.
+
+        previous_worker_gone: this PC holds the worker lock of its machine and site (WorkerLock), so the worker
+        behind a still-fresh heartbeat has exited (e.g. crashed) and need not be waited out."""
         with self.transaction() as db:
             machine=db.one("SELECT * FROM scheduler.MachineAssignment WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=:site AND MachineId=:machine")
             if not machine: raise RuntimeError('Machine assignment not found')
             cutoff=datetime.now(timezone.utc).replace(tzinfo=None)-timedelta(seconds=90)
-            if machine['LastHeartbeatUtc'] and machine['IsReady'] and machine['LastHeartbeatUtc']>cutoff:
+            if not previous_worker_gone and machine['LastHeartbeatUtc'] and machine['IsReady'] and machine['LastHeartbeatUtc']>cutoff:
                 raise RuntimeError('Machine has a live worker')
             entries=db.rows("""SELECT e.EntryId,e.BotAccountId,b.Username,e.TableId,e.Status,e.BuyInAmount,
                     e.CreatedUtc,e.SeatedUtc,e.LastConfirmedUtc,e.SessionId,s.StartedUtc,s.PlannedEndUtc

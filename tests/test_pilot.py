@@ -396,3 +396,32 @@ def test_restart_reconciliation_lists_the_lobby_once_and_runs_accounts_together(
     rows=[{'BotAccountId':a,'TableId':'7'} for a in range(1,13)]
     asyncio.run(p.reconcile_cloud_entries(rows))
     assert len(listings)==1 and peak[0]>1
+
+
+def test_worker_lock_is_exclusive_and_released(tmp_path):
+    from schedule_controller.pilot import WorkerLock
+    first=WorkerLock(5,1006,tmp_path);second=WorkerLock(5,1006,tmp_path);other=WorkerLock(5,1,tmp_path)
+    assert first.acquire()
+    assert not second.acquire()  # a worker of this machine and site is still running
+    assert other.acquire()  # another site of the PC has its own lock
+    first.release()
+    assert second.acquire()  # the previous worker is gone: its replacement need not wait out the heartbeat
+    second.release();other.release()
+
+
+def test_crashed_worker_lock_is_released_with_its_process(tmp_path):
+    import subprocess,sys,textwrap
+    from pathlib import Path
+    code=textwrap.dedent(f"""
+        import sys;sys.path.insert(0,r'{Path(__file__).resolve().parents[1]}')
+        from schedule_controller.pilot import WorkerLock
+        assert WorkerLock(9,9,r'{tmp_path}').acquire()
+        print('held',flush=True)
+        import os;os._exit(3)  # dies without releasing anything
+    """)
+    out=subprocess.run([sys.executable,'-c',code],capture_output=True,text=True,timeout=60)
+    assert 'held' in out.stdout, out.stderr
+    from schedule_controller.pilot import WorkerLock
+    lock=WorkerLock(9,9,tmp_path)
+    assert lock.acquire()
+    lock.release()
