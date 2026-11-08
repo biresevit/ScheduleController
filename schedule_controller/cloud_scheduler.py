@@ -224,7 +224,8 @@ class CloudScheduler:
             settings = Settings(site_id, bands, site["CurrencyCode"], 0 if paused else site["MaxJoinsPerTick"], site["MaxLeavesPerTick"],
                 site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"], tick_seconds=30,
                 planning_horizon_seconds=planning_horizon, heartbeat_seconds=site["HeartbeatTimeoutSeconds"],
-                freshness_seconds=site["TableFreshnessSeconds"])
+                freshness_seconds=site["TableFreshnessSeconds"],
+                extra_table_percent=int(site.get("ExtraTableChancePercent") if site.get("ExtraTableChancePercent") is not None else 30))
             rng = random.Random(f"{self.seed}:{site_id}:{stamp:%Y%m%d%H%M%S}")
             result = plan(settings, stamp, target, accounts, machines, tables, entries, rng,
                 next_join=aware(site["NextJoinUtc"]), next_leave=aware(site["NextLeaveUtc"]),

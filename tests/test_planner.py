@@ -356,3 +356,28 @@ def test_an_empty_format_still_gets_joins_next_to_busy_tables():
         result=plan(SETTINGS,NOW,1,[Account(1,1,'low')],[Machine(1,1,6,NOW)],tables,[],random.Random(seed))
         plo5+=result.actions[0].table=='p5'
     assert 420<plo5<580
+
+
+
+def test_extra_table_chance_adds_tables_to_playing_accounts():
+    from dataclasses import replace as _replace
+    import random as _random
+    from schedule_controller import planner as _p
+    now = datetime(2026, 11, 8, 20, 0, tzinfo=timezone.utc)
+    bands = BANDS
+    accounts = [_p.Account(i, 1, "low", max_tables=3) for i in range(1, 41)]
+    machines = [_p.Machine(1, 1, 100, now)]
+    tables = [_p.Table(f"t{i}", 1, D(".1"), 6, 2, now) for i in range(40)]
+    entries = [_p.Entry(f"e{i}", i, 1, f"t{i}") for i in range(1, 11)]  # accounts 1-10 play one table each
+    def joins(percent):
+        settings = _p.Settings(1, bands, max_joins=1, extra_table_percent=percent, tick_seconds=30)
+        extra = total = 0
+        for seed in range(400):
+            plan = _p.plan(settings, now, 100, accounts, machines, tables, entries, _random.Random(seed))
+            made = [a for a in plan.actions if a.kind == "join"]
+            total += len(made)
+            extra += sum(1 for a in made if a.account <= 10)
+        return extra / total
+    assert joins(0) == 0                      # old behaviour: always a new login
+    assert 0.2 <= joins(30) <= 0.42           # about 30% of the joins
+    assert joins(100) == 1

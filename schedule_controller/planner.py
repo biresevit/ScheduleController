@@ -89,6 +89,8 @@ class Settings:
     planning_horizon_seconds: int | None = None
     heartbeat_seconds: int = 60
     freshness_seconds: int = 45
+    # Percent chance that a join adds a table to an account already playing instead of logging in another one.
+    extra_table_percent: int = 0
 
 
 @dataclass(frozen=True)
@@ -281,9 +283,16 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         manual_options = [o for o in options if o[0].manual]
         if manual_options:
             options = manual_options
-        # Establish one session for each available account before assigning
-        # second and third tables, so new logins come before extra tables. The
-        # daily playtime preference only orders accounts with equal table counts.
+        # A new login, or (extra_table_percent of the time) another table for an account already playing, the one
+        # with the fewest tables first. Only logging in new accounts left nearly every bot on a single table when a
+        # site has many accounts (Simo, 2026-11-08). The daily playtime preference orders accounts within the group.
+        playing = [o for o in options if account_count[o[0].id] > 0]
+        idle = [o for o in options if account_count[o[0].id] == 0]
+        if playing and (not idle or settings.extra_table_percent > 0
+                        and rng.random() * 100 < settings.extra_table_percent):
+            options = playing
+        elif idle:
+            options = idle
         least_tables = min(account_count[o[0].id] for o in options)
         options = [o for o in options if account_count[o[0].id] == least_tables]
         under_limit = [o for o in options if o[0].played_seconds < o[0].max_minutes * 60]
