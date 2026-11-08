@@ -19,6 +19,14 @@ def supports_forcing(agent_version):
 OLD_AGENT='This PC runs an updater agent older than 1.0.13, which cannot force-stop; rerun PC setup to upgrade it.'
 
 
+# A tournament registration whose tournament has not started (and does not start within 15 minutes) does not
+# hold back a drain: the poker site keeps it through the restart and the new worker adopts it. Waiting for it
+# would delay the update until the tournament ended (machine 5, 2026-11-08: MTTs at 20:00 and the next day).
+KEPT_REGISTRATION="""(e.TableId LIKE 'T%' AND e.Status='joining' AND EXISTS(SELECT 1 FROM scheduler.LobbyTable l
+    WHERE l.SiteId=e.SiteId AND l.TableId=e.TableId AND l.TournamentState='registering'
+      AND l.StartUtc>DATEADD(minute,15,SYSUTCDATETIME())))"""
+
+
 def unconfirmed_absence(db,machine_id,placeholder='?'):
     """Only complete, fresh seat snapshots can prove an uncertain entry absent, on every poker site of the PC."""
     sql="""SELECT e.EntryId,e.Status,l.FullSnapshotUtc,
@@ -119,19 +127,22 @@ def advance(db,cid,rollout,task,stamp,serial):
     elif status=='forcing' and not supports_forcing(task.get('AgentVersion')):
         db.execute("UPDATE scheduler.MachineUpdateTask SET Status='draining',UpdatedUtc=?,Detail=? WHERE TaskId=?",now,OLD_AGENT,tid)
     elif status=='draining':
-        counts=db.one("SELECT SUM(CASE WHEN Status='uncertain' THEN 1 ELSE 0 END) AS uncertain,COUNT(*) AS total,COUNT(DISTINCT BotAccountId) AS accounts FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1",mid)
+        counts=db.one(f"SELECT SUM(CASE WHEN Status='uncertain' THEN 1 ELSE 0 END) AS uncertain,COUNT(*) AS total,COUNT(DISTINCT BotAccountId) AS accounts FROM scheduler.Entry e WHERE MachineId=? AND IsOpen=1 AND NOT {KEPT_REGISTRATION}",mid)
+        kept=db.one(f"SELECT COUNT(*) AS n FROM scheduler.Entry e WHERE MachineId=? AND IsOpen=1 AND {KEPT_REGISTRATION}",mid)['n']
         remaining=counts['total'];uncertain=counts['uncertain'] or 0
         prefix=OLD_AGENT+' ' if rollout['Immediate'] else ''
-        db.execute('UPDATE scheduler.MachineUpdateTask SET Detail=? WHERE TaskId=?',prefix+f"Finishing one session at a time: {counts['accounts']} sessions, {remaining-uncertain} confirmed entries and {uncertain} unconfirmed entries remain.",tid)
+        suffix=f" {kept} tournament registrations are kept through the update." if kept else ''
+        db.execute('UPDATE scheduler.MachineUpdateTask SET Detail=? WHERE TaskId=?',prefix+f"Finishing one session at a time: {counts['accounts']} sessions, {remaining-uncertain} confirmed entries and {uncertain} unconfirmed entries remain."+suffix,tid)
         if task['Staged'] and agent_fresh and worker_fresh and unconfirmed_absence(db,mid):
             db.execute("UPDATE scheduler.MachineUpdateTask SET Status='reconciling',UpdatedUtc=?,Detail='Confirmed sessions ended; reconciling absent, unconfirmed entries before installation.' WHERE TaskId=?",now,tid)
             return
         # Cancelled reservations may have a future session that never logged
-        # in. Close only sessions whose full entry journal is already closed.
-        db.execute("""UPDATE s SET IsOpen=0,ActualEndUtc=CASE WHEN StartedUtc>? THEN StartedUtc ELSE ? END,EndReason='software_update'
+        # in. Close only sessions whose full entry journal is already closed, apart from kept registrations
+        # (the restarted worker adopts those, as after an Immediate update).
+        db.execute(f"""UPDATE s SET IsOpen=0,ActualEndUtc=CASE WHEN StartedUtc>? THEN StartedUtc ELSE ? END,EndReason='software_update'
             FROM scheduler.AccountSession s WHERE s.MachineId=? AND s.IsOpen=1
-              AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.SessionId=s.SessionId AND e.IsOpen=1)""",now,now,mid)
-        open_entry=db.one('SELECT TOP(1) EntryId FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1',mid)
+              AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.SessionId=s.SessionId AND e.IsOpen=1 AND NOT {KEPT_REGISTRATION})""",now,now,mid)
+        open_entry=db.one(f'SELECT TOP(1) EntryId FROM scheduler.Entry e WHERE MachineId=? AND IsOpen=1 AND NOT {KEPT_REGISTRATION}',mid)
         open_session=db.one('SELECT TOP(1) SessionId FROM scheduler.AccountSession WHERE MachineId=? AND IsOpen=1',mid)
         if not open_entry and not open_session and task['Staged'] and agent_fresh and worker_fresh:
             db.execute("UPDATE scheduler.MachineUpdateTask SET Status='stopping',UpdatedUtc=?,Detail='Sessions ended. Ready to restart applications.' WHERE TaskId=?",now,tid)
