@@ -74,7 +74,8 @@ def fits(buy_in: Decimal, buy_in_range) -> bool:
 def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Account], machines: list[Machine],
                        tournaments: list[Tournament], entries: list[Entry], ranges: dict,
                        next_time: datetime | None, min_gap: int, max_gap: int, heartbeat_seconds: int,
-                       freshness_seconds: int, rng: random.Random, excluded=()) -> TournamentPlan:
+                       freshness_seconds: int, rng: random.Random, excluded=(),
+                       capacity_entries: list[Entry] | None = None) -> TournamentPlan:
     """Plan at most one registration for `fmt`.
 
     entries: every open entry of the site (ring and tournament), for table limits and PC capacity.
@@ -108,7 +109,8 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
     ready = {m.id: m for m in machines if m.enabled and m.ready and not m.maintenance and m.capacity > 0
              and fresh(m.heartbeat, heartbeat_seconds)}
     account_count = Counter(e.account for e in entries)
-    machine_count = Counter(e.machine for e in entries)
+    # PC capacity: every open entry except MTT registrations whose tournament is still far away (capacity_entries).
+    machine_count = Counter(e.machine for e in (entries if capacity_entries is None else capacity_entries))
     owners = {a.id: {e.machine for e in entries if e.account == a.id} | ({a.owner_machine} if a.owner_machine is not None else set())
               for a in accounts}
     registered = {(e.account, e.table) for e in entries}

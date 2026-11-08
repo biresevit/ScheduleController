@@ -42,6 +42,14 @@ class Rows:
     def execute(self, sql, *args): return self.cursor.execute(sql, *args)
 
 
+# An MTT registration only takes a place on its PC from 30 minutes before the tournament starts: until then it uses
+# no table, CPU or connection, and MTTs are often registered hours ahead (machine 5, 2026-11-08: 28 waiting
+# registrations held 28 of its 100 entries, so ring tables stopped at ~51). When several start together the PC can
+# briefly be above its maximum; the planner then joins no ring table until leaves bring it back under.
+MTT_REGISTRATION_WAITING = """(e.Status='joining' AND EXISTS(SELECT 1 FROM scheduler.LobbyTable w
+    WHERE w.SiteId=e.SiteId AND w.TableId=e.TableId AND w.TableType='MTT' AND w.TournamentState='registering'
+      AND w.StartUtc>DATEADD(minute,30,SYSUTCDATETIME())))"""
+
 class CloudScheduler:
     """Plans every enabled site under a per-site SQL application lock."""
     def __init__(self, connect=None, seed=1701):
@@ -140,11 +148,12 @@ class CloudScheduler:
                 WHERE p.SiteId=? AND p.DeletedUtc IS NULL""", local_day, site_id)
             # Tournament entries (SNG/MTT) are planned separately and never left; for ring planning
             # they only use up each account's table limit and each PC's capacity.
-            tournament_entries = db.rows("""SELECT e.BotAccountId,e.MachineId FROM scheduler.Entry e
+            tournament_entries = db.rows(f"""SELECT e.BotAccountId,e.MachineId,
+                    CASE WHEN {MTT_REGISTRATION_WAITING} THEN 1 ELSE 0 END AS Waiting FROM scheduler.Entry e
                 JOIN scheduler.LobbyTable t ON t.SiteId=e.SiteId AND t.TableId=e.TableId
                 WHERE e.SiteId=? AND e.IsOpen=1 AND t.TableType IN ('SNG','MTT')""", site_id)
             tournament_by_account = Counter(r["BotAccountId"] for r in tournament_entries)
-            tournament_by_machine = Counter(r["MachineId"] for r in tournament_entries)
+            tournament_by_machine = Counter(r["MachineId"] for r in tournament_entries if not r["Waiting"])
             draining_accounts=set()
             for machine in maintenance:
                 update=db.one("SELECT r.Status FROM scheduler.MachineUpdateTask t JOIN scheduler.UpdateRollout r ON r.RolloutId=t.RolloutId WHERE t.TaskId=?",machine['MaintenanceTaskId'])
@@ -178,8 +187,9 @@ class CloudScheduler:
                 accounts.append(account if ring_tables == p["MaxTables"] else
                                 replace(account, max_tables=max(1, ring_tables), enabled=account.enabled and ring_tables > 0))
             # One entry limit per PC, shared by all of its poker sites: this site gets what the others leave.
-            machine_rows = db.rows("""SELECT a.*,COALESCE(c.MaxEntries,a.MaxEntries)-(SELECT COUNT(*) FROM scheduler.Entry e
-                    WHERE e.MachineId=a.MachineId AND e.SiteId<>a.SiteId AND e.IsOpen=1) AS SiteCapacity
+            machine_rows = db.rows(f"""SELECT a.*,COALESCE(c.MaxEntries,a.MaxEntries)-(SELECT COUNT(*) FROM scheduler.Entry e
+                    WHERE e.MachineId=a.MachineId AND e.SiteId<>a.SiteId AND e.IsOpen=1
+                      AND NOT {MTT_REGISTRATION_WAITING}) AS SiteCapacity
                 FROM scheduler.MachineAssignment a LEFT JOIN scheduler.MachineCapacity c ON c.MachineId=a.MachineId
                 WHERE a.SiteId=?""", site_id)
             tournament_machines = [Machine(m["MachineId"], site_id, max(0, m["SiteCapacity"]), aware(m["LastHeartbeatUtc"] or datetime.min),
@@ -269,11 +279,13 @@ class CloudScheduler:
         for fmt, column in (("SNG", "NextSngUtc"), ("MTT", "NextMttUtc")):
             target = target_at(windows_by_format.get(fmt, []), stamp, site["TimeZone"])
             # Re-read open entries so a registration planned just before counts toward this one.
-            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"])
-                       for e in db.rows("SELECT * FROM scheduler.Entry WHERE SiteId=? AND IsOpen=1", site_id)]
+            rows = db.rows(f"""SELECT e.*,CASE WHEN {MTT_REGISTRATION_WAITING} THEN 1 ELSE 0 END AS Waiting
+                FROM scheduler.Entry e WHERE e.SiteId=? AND e.IsOpen=1""", site_id)
+            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"]) for e in rows]
+            holding = [entry for entry, row in zip(entries, rows) if not row["Waiting"]]
             plan = plan_registrations(fmt, stamp, target, accounts, machines, tournaments, entries, ranges,
                 aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
-                site["HeartbeatTimeoutSeconds"], freshness, rng, excluded)
+                site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding)
             created = 0
             for action in plan.actions:
                 join = SimpleNamespace(account=action.account, machine=action.machine, table=action.tournament,

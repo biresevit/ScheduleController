@@ -113,3 +113,15 @@ def test_tournament_registration_follows_the_accounts_games():
     nlh = sng(1, 2)
     assert run("SNG", 1, [account(1)], [nlh]).actions
     assert not run("SNG", 1, [account(1, games=frozenset({"PLO4", "PLO5"}))], [nlh]).actions
+
+
+def test_far_away_mtt_registrations_do_not_fill_the_pc():
+    # The PC (capacity 2) holds two registrations for an MTT hours away: with them counted it is full.
+    entries = [Entry("e1", 2, 1, "T9", "joining"), Entry("e2", 3, 1, "T9", "joining")]
+    tournaments = [sng(1, 3)]
+    full = plan_registrations("SNG", NOW, 5, [account(1)], [machine(capacity=2)], tournaments, entries, RANGES,
+                              None, 20, 60, 60, 300, random.Random(1))
+    assert full.actions == []
+    waiting_excluded = plan_registrations("SNG", NOW, 5, [account(1)], [machine(capacity=2)], tournaments, entries,
+                                          RANGES, None, 20, 60, 60, 300, random.Random(1), capacity_entries=[])
+    assert [a.account for a in waiting_excluded.actions] == [1]
