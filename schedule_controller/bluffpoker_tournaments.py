@@ -5,12 +5,16 @@ player's tournament state (GET /player/tournaments/:id/state) says where the ser
 (myTableId), how the field stands (playersRemaining, info.entries, info.placesPaid) and when the account is out
 (myRegistrationStatus ELIMINATED / WINNER, myFinalPosition). One follower per tournament polls that state.
 
-Not supported yet: rebuys, add-ons and re-entries (decided by BluffPoker's own clock: the bot plays on), and
-unregistering (the hub route is not open).
+Re-entry, rebuy and add-on (BluffPoker API of 2026-11-09): the state lists what the server accepts right now
+(myReEntry, myRebuy, myAddOn, null = not offered). After an elimination the bot re-enters or takes a busted
+rebuy, within the account's per-tournament limits and with its tournament rebuy chance; a seated rebuy (low
+stack) and the add-on are decided once per offer. Registration has no idempotency key and is never retried
+blindly; rebuy and add-on are retried only with the same key. Unregistering is not available (route not open).
 """
 from __future__ import annotations
 
 import asyncio
+import uuid
 from datetime import datetime, timedelta
 from decimal import Decimal
 
@@ -158,13 +162,158 @@ class BluffPokerTournaments:
         info = reply.get("info") or {}
         state.update(players_left=reply.get("playersRemaining"), players_total=info.get("entries"),
                      places_paid=info.get("placesPaid"))
-        if reply.get("myRegistrationStatus") in OUT or reply.get("status") in OVER:
+        mine = reply.get("myRegistrationStatus")
+        if mine == "ELIMINATED" and reply.get("status") == "RUNNING" and await self.buy_back(tid, reply):
+            return  # re-entered or rebought: the follower opens the table the server seats the account at
+        if mine in OUT or reply.get("status") in OVER:
             await self.on_end(tid, reply.get("myFinalPosition"))
             return
+        state.pop("bought_back_at", None)
         table = reply.get("myTableId")
         if table:
             await self.on_seated(tid, table_key(table))
         self.refresh_table_info(tid)
+        if mine == "PLAYING":
+            await self.offers_while_playing(tid, reply)
+
+    # ---- re-entry, rebuy, add-on -----------------------------------------------------------------------------
+
+    def limit(self, kind, fmt):
+        """The account's maximum rebuys / re-entries per tournament (kind 'Rebuys' or 'Reentries'), per format."""
+        value = self.policy.get(f"Max{'Mtt' if fmt == 'MTT' else 'Sng'}{kind}")
+        return 3 if value is None and kind == "Rebuys" else 1 if value is None else int(value)
+
+    def chance(self, column, default):
+        value = self.policy.get(column)
+        return default if value is None else float(value)
+
+    async def pause(self, low, high):
+        await asyncio.sleep(self.session.rng.uniform(low, high))
+
+    async def affordable(self, offer) -> bool:
+        try:
+            summary = await self.client.balance()
+        except Exception as exc:
+            self.log.warning("Balance unknown for %s: %s", self.policy["Username"], exc)
+            return True  # the hub refuses with INSUFFICIENT_CHIPS and charges nothing
+        cost = int(offer.get("priceChips") or 0) + int(offer.get("feeChips") or 0)
+        return int(summary.get("available") or 0) >= cost
+
+    async def buy_back(self, tid: str, reply: dict) -> bool:
+        """Eliminated in a running tournament: re-enter or take a busted rebuy, once per elimination. True while
+        the account is (being) bought back in, so the tournament is not ended."""
+        state = self.active[tid]
+        if state.get("bought_back_at") is not None:
+            # The hub seats the new entry asynchronously; the state may still read ELIMINATED for a moment.
+            if asyncio.get_running_loop().time() - state["bought_back_at"] < 60:
+                return True
+            state.pop("bought_back_at", None)
+        if state.get("elimination_decided"):
+            return False
+        state["elimination_decided"] = True
+        table = state.get("table")
+        if table:
+            await self.session.detach_table(table)
+            self.by_table.pop(table, None)
+            await self.client.forget_table(table)
+            state["table"] = None
+        fmt = state.get("format")
+        rebuy, reentry = reply.get("myRebuy"), reply.get("myReEntry")
+        # Alternatives (rebuy price and rebuyMax, or re-entry price and reEntryMax): one of them, never both.
+        if rebuy and state.get("rebuys", 0) < self.limit("Rebuys", fmt):
+            kind, offer = "rebuy", rebuy
+        elif reentry and state.get("reentries", 0) < self.limit("Reentries", fmt):
+            kind, offer = "reentry", reentry
+        else:
+            return False
+        if self.session.rng.random() >= self.chance("RebuyTournamentChance", .5):
+            self.log.info("TOURNAMENT NO %s %s tournament=%s", kind.upper(), self.policy["Username"], tid)
+            return False
+        if not await self.affordable(offer):
+            self.log.info("TOURNAMENT %s %s tournament=%s: balance too low", kind.upper(), self.policy["Username"], tid)
+            return False
+        await self.pause(3, 10)
+        ok = await (self.rebuy(tid, busted=True) if kind == "rebuy" else self.reenter(tid))
+        if ok:
+            state["reentries" if kind == "reentry" else "rebuys"] = state.get("reentries" if kind == "reentry" else "rebuys", 0) + 1
+            state["bought_back_at"] = asyncio.get_running_loop().time()
+            state.pop("elimination_decided", None)
+            self.emit(tid, kind, price=offer.get("priceChips"), fee=offer.get("feeChips"), chips=offer.get("chips"))
+        return ok
+
+    async def reenter(self, tid: str) -> bool:
+        """Re-entry is a registration of an eliminated player: no idempotency key, so never retried blindly. After
+        an unclear answer the state tells whether it went through (doc 2.6)."""
+        try:
+            reply = await self.client.register_tournament(tid)
+            self.log.info("TOURNAMENT REENTRY %s tournament=%s debited=%s stack=%s", self.policy["Username"], tid,
+                          reply.get("debitedChips"), reply.get("stackChips"))
+            return True
+        except Exception as exc:
+            if getattr(exc, "terminal", False) and getattr(exc, "code", "") != "ALREADY_REGISTERED":
+                self.log.info("TOURNAMENT REENTRY refused for %s / %s: %s", self.policy["Username"], tid, getattr(exc, "code", exc))
+                return False
+            state = await self.client.tournament_state(tid)
+            done = state.get("myRegistrationStatus") == "PLAYING" or bool(state.get("myTableId")) or (state.get("myStack") or 0) > 0
+            self.log.info("TOURNAMENT REENTRY %s tournament=%s unclear answer (%s); state says %s", self.policy["Username"],
+                          tid, getattr(exc, "code", type(exc).__name__), "done" if done else "not done")
+            return done
+
+    async def purchase(self, tid: str, kind: str) -> bool:
+        """A rebuy or add-on: one key per purchase, retried only with that key (doc 3.6)."""
+        call = self.client.tournament_rebuy if kind == "rebuy" else self.client.tournament_addon
+        key = f"{kind}-{uuid.uuid4()}"
+        for attempt in range(6):
+            try:
+                reply = await call(tid, key)
+            except Exception as exc:
+                if getattr(exc, "terminal", False):
+                    self.log.info("TOURNAMENT %s refused for %s / %s: %s", kind.upper(), self.policy["Username"], tid,
+                                  getattr(exc, "code", exc))
+                    return False
+                await asyncio.sleep(2 + attempt * 2)  # timeout or 5xx: the same key, never a second purchase
+                continue
+            if reply.get("refunded"):
+                self.log.info("TOURNAMENT %s refunded for %s / %s", kind.upper(), self.policy["Username"], tid)
+                return False
+            if reply.get("applied"):
+                self.log.info("TOURNAMENT %s %s tournament=%s chips=%s debited=%s", kind.upper(), self.policy["Username"],
+                              tid, reply.get("chips"), reply.get("debitedChips"))
+                return True
+            await asyncio.sleep(3)  # charged, not yet at the table: ask again with the same key
+        self.log.warning("TOURNAMENT %s not confirmed for %s / %s after retries", kind.upper(), self.policy["Username"], tid)
+        return False
+
+    async def rebuy(self, tid: str, busted: bool = False) -> bool:
+        return await self.purchase(tid, "rebuy")
+
+    async def offers_while_playing(self, tid: str, reply: dict):
+        """A seated rebuy (low stack) and the add-on, each decided once while the server offers it."""
+        state = self.active[tid]
+        fmt = state.get("format")
+        offer = reply.get("myRebuy")
+        if not offer:
+            state.pop("rebuy_offer_decided", None)
+        elif not state.get("rebuy_offer_decided"):
+            state["rebuy_offer_decided"] = True
+            if (state.get("rebuys", 0) < self.limit("Rebuys", fmt)
+                    and self.session.rng.random() < self.chance("RebuyTournamentChance", .5)
+                    and await self.affordable(offer)):
+                await self.pause(2, 6)
+                if await self.rebuy(tid):
+                    state["rebuys"] = state.get("rebuys", 0) + 1
+                    self.emit(tid, "rebuy", price=offer.get("priceChips"), fee=offer.get("feeChips"), chips=offer.get("chips"))
+            else:
+                self.log.info("TOURNAMENT NO REBUY %s tournament=%s", self.policy["Username"], tid)
+        addon = reply.get("myAddOn")
+        if addon and not state.get("addon_decided"):
+            state["addon_decided"] = True
+            if self.session.rng.random() < self.chance("AddonChance", .5) and await self.affordable(addon):
+                await self.pause(2, 15)
+                if await self.purchase(tid, "addon"):
+                    self.emit(tid, "addon", price=addon.get("priceChips"), fee=addon.get("feeChips"), chips=addon.get("chips"))
+            else:
+                self.log.info("TOURNAMENT NO ADD-ON %s tournament=%s", self.policy["Username"], tid)
 
     async def on_seated(self, tid: str, table):
         state = self.active[tid]
@@ -206,7 +355,8 @@ class BluffPokerTournaments:
                 "ante": None}
 
     def on_bust(self, table):
-        """Busted at a tournament table: BluffPoker ends the tournament for the account (no rebuy yet)."""
+        """Busted at a tournament table: the hub marks the account ELIMINATED a moment later; the follower then
+        decides on a re-entry or busted rebuy (doc 6: the state, not the socket, is the source of truth)."""
         self.log.info("TOURNAMENT BUST %s table=%s", self.policy["Username"], table)
 
     async def close(self):

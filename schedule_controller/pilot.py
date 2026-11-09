@@ -661,6 +661,10 @@ class Pilot:
         elif event=='finished':
             self.accrue();e.update(status='closed',closed=now(),confirmed=now());self.accrue()
             log.info('FINISHED %s tournament=%s place=%s',self.policies[aid]['Username'],key,details.get('place'))
+        elif event in ('reentry','rebuy','addon'):
+            # The entry stays open: a re-entry or rebuy keeps the bot in the same tournament.
+            e.update(confirmed=now())
+            log.info('%s %s tournament=%s %s',event.upper(),self.policies[aid]['Username'],key,details)
         async def persist():
             try:
                 await self.publish()
