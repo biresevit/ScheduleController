@@ -415,6 +415,14 @@ class Repository(ChatRepository,ManualRepository):
                 for cmd in e.get('commands',[]):
                     is_open=cmd['status'] in ('pending','claimed','uncertain')
                     if not db.one('SELECT CommandId FROM scheduler.Command WHERE CommandId=?',cmd['id']):
+                        if is_open:
+                            # A command the worker started itself (e.g. leaving a busted seat) is being carried out
+                            # now; one the scheduler planned for the same entry and kind but no worker has claimed
+                            # yet is superseded. Inserting next to it broke the one-open-command rule: the save
+                            # failed on every publish and stopped the site (machine 5, 2026-11-09 01:10).
+                            db.execute("""UPDATE scheduler.Command SET Status='cancelled',IsOpen=0,ResultCode='superseded',
+                                ResultText='The PC already carries out this task for the bot.',UpdatedUtc=SYSUTCDATETIME()
+                                WHERE EntryId=? AND Kind=? AND IsOpen=1 AND Status='pending'""",e['id'],cmd['kind'])
                         db.execute("INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc) VALUES(?,:site,?,:machine,?,?,?,?,?,'{}',?,?)",cmd['id'],e['id'],self.epoch,cmd['kind'],cmd['status'],is_open,cmd['version'],utc(cmd['due']),utc(cmd['due']+timedelta(minutes=3)))
                     db.execute('UPDATE scheduler.Command SET Status=?,IsOpen=?,ResultCode=?,ResultText=?,UpdatedUtc=SYSUTCDATETIME() WHERE CommandId=?',cmd['status'],is_open,cmd.get('result'),cmd.get('result_text'),cmd['id'])
             active_accounts={e['account'] for e in entries if e['status'] not in ('closed','failed')}

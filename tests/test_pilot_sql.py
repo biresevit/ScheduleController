@@ -99,3 +99,28 @@ def test_account_absence_reconciles_all_uncertain_entries(repo):
     with repo.transaction() as db:
         assert db.one('SELECT COUNT(*) AS n FROM scheduler.Entry WHERE BotAccountId=? AND IsOpen=1',aid)['n']==0
         assert db.one('SELECT BotAccountId FROM scheduler.AccountLease WHERE BotAccountId=?',aid) is None
+
+
+def test_worker_leave_supersedes_a_pending_scheduler_leave(repo):
+    c=repo.configuration();aid=next(a['BotAccountId'] for a in c['accounts'] if a['Username']=='monica')
+    with repo.transaction() as db:   # this test's worker owns the machine for the rolled-back transaction (no start():
+        db.execute("UPDATE scheduler.MachineAssignment SET WorkerEpoch=? WHERE SiteId=:site AND MachineId=:machine",repo.epoch)  # it needs an idle site)
+    stamp=datetime.now(timezone.utc)
+    table='pilot-test-'+str(uuid.uuid4());sid=str(uuid.uuid4());eid=str(uuid.uuid4())
+    sessions=[dict(id=sid,account=aid,start=stamp,end=stamp+timedelta(minutes=30))]
+    tables=[dict(id=table,name='Rollback fixture',game='NLH',bb=2,minimum=40,maximum=400,seats=6,occupied=1,open=True,observed=stamp,snapshot=stamp)]
+    join=dict(id=str(uuid.uuid4()),kind='join',status='succeeded',version=c['site']['ConfigVersion'],due=stamp)
+    entries=[dict(id=eid,account=aid,table=table,status='seated',created=stamp,seated=stamp,confirmed=stamp,session=sid,commands=[join])]
+    repo.publish_lobby(tables,{})
+    repo.publish(tables,{},entries,sessions,[])
+    planned=str(uuid.uuid4())
+    with repo.transaction() as db:   # the scheduler plans a paced leave for the stopped session
+        db.execute("""INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc)
+            VALUES(?,:site,?,:machine,?,'leave','pending',1,?,'{}',DATEADD(minute,5,SYSUTCDATETIME()),DATEADD(minute,15,SYSUTCDATETIME()))""",
+            planned,eid,repo.epoch,c['site']['ConfigVersion'])
+    own=dict(id=str(uuid.uuid4()),kind='leave',status='claimed',version=c['site']['ConfigVersion'],due=stamp)  # the seat busted
+    entries[0].update(status='draining');entries[0]['commands'].append(own)
+    repo.publish(tables,{},entries,sessions,[])   # used to fail: duplicate open leave
+    with repo.transaction() as db:
+        assert db.one('SELECT IsOpen,ResultCode FROM scheduler.Command WHERE CommandId=?',planned)=={'IsOpen':False,'ResultCode':'superseded'}
+        assert db.one('SELECT IsOpen FROM scheduler.Command WHERE CommandId=?',own['id'])['IsOpen']
