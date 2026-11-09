@@ -381,3 +381,11 @@ def test_extra_table_chance_adds_tables_to_playing_accounts():
     assert joins(0) == 0                      # old behaviour: always a new login
     assert 0.2 <= joins(30) <= 0.42           # about 30% of the joins
     assert joins(100) == 1
+
+
+def test_tournaments_only_account_never_joins_a_ring_table():
+    only = Account(1, 1, "low", games=frozenset({"TOURNAMENTS"}))
+    table = Table("t1", 1, D(".1"), 6, 2, NOW)
+    plan_ = plan(Settings(1, BANDS, min_gap=20, max_gap=20, tick_seconds=30), NOW, 5, [only],
+                 [Machine(1, 1, 10, NOW)], [table], [], random.Random(1))
+    assert [a for a in plan_.actions if a.kind == "join"] == []

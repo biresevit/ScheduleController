@@ -125,3 +125,11 @@ def test_far_away_mtt_registrations_do_not_fill_the_pc():
     waiting_excluded = plan_registrations("SNG", NOW, 5, [account(1)], [machine(capacity=2)], tournaments, entries,
                                           RANGES, None, 20, 60, 60, 300, random.Random(1), capacity_entries=[])
     assert [a.account for a in waiting_excluded.actions] == [1]
+
+
+def test_tournaments_only_account_registers_for_tournaments():
+    only = account(1, games=frozenset({"TOURNAMENTS"}))
+    plan = run("SNG", 1, [only], [sng(1, 3)])
+    assert [a.account for a in plan.actions] == [1]
+    plo = account(2, games=frozenset({"PLO4", "PLO5"}))
+    assert run("SNG", 1, [plo], [sng(1, 3)]).actions == []

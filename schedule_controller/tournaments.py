@@ -38,6 +38,9 @@ class Tournament:
     name: str = ""
 
 
+# AllowedGames value of an account that plays only SNGs and MTTs (no ring table matches it).
+TOURNAMENTS_ONLY = "TOURNAMENTS"
+
 def excluded_names(text) -> list[str]:
     """The site's excluded tournament names: one per line, blank lines ignored."""
     return [line.strip() for line in str(text or "").splitlines() if line.strip()]
@@ -127,7 +130,7 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
                 or a.session_end is not None and now >= a.session_end.astimezone(timezone.utc)):
             continue
         fitting = [t for t in open_tournaments if fits(t.buy_in, ranges.get(a.tier)) and (a.id, t.id) not in registered
-                   and t.game in a.games]
+                   and (t.game in a.games or TOURNAMENTS_ONLY in a.games)]
         if not fitting:
             continue
         for m in ready.values():
