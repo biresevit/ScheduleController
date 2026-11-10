@@ -51,6 +51,8 @@ class Machine:
     ready: bool = True
     enabled: bool = True
     maintenance: bool = False
+    # When this PC's latest login (join command) is due, on any site: the next one waits min_gap after it.
+    last_join: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -91,6 +93,15 @@ class Settings:
     freshness_seconds: int = 45
     # Percent chance that a join adds a table to an account already playing instead of logging in another one.
     extra_table_percent: int = 0
+    # Pace that grows with the target (None or 0: the fixed min_gap..max_gap pace between any two joins). Joins
+    # cover the sessions that end (target / session_minutes) plus the shortfall spread over fill_minutes; leaves
+    # likewise cover rotation plus any excess. Never slower than the fixed pace, never faster than
+    # site_joins_per_minute for the site, and min_gap becomes the minimum between two logins on one PC.
+    fill_minutes: int | None = None
+    session_minutes: float = 150
+    site_joins_per_minute: int = 60
+    # Safety bound on the actions one pass may plan when the pace scales.
+    max_actions_per_tick: int = 200
 
 
 @dataclass(frozen=True)
@@ -187,9 +198,30 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         fraction=rng.betavariate(.65,.65) if settings.min_gap!=settings.max_gap else 0
         return timedelta(milliseconds=round(1000*(settings.min_gap+fraction*(settings.max_gap-settings.min_gap))))
 
+    scaled = bool(settings.fill_minutes) and settings.fill_minutes > 0
+    # A fixed gap between joins caps a site at ~90 joins an hour, fewer than the sessions that end each hour once
+    # the target is large (Simo plateaued near 75 of 100 on 2026-11-09). Scale the pace with the target instead.
+    churn_per_hour = target * 60 / max(1.0, settings.session_minutes)
+
+    def paced_gap(shortfall: int) -> timedelta:
+        classic = random_gap()
+        if not scaled:
+            return classic
+        rate = churn_per_hour + shortfall * 60 / settings.fill_minutes
+        if rate <= 0:
+            return classic
+        # Random around the mean (0.5x..1.5x), mixing bursts and pauses like the fixed pace does.
+        fast = timedelta(seconds=3600 / rate * (.5 + rng.betavariate(.65, .65)))
+        floor = timedelta(seconds=60 / max(1, settings.site_joins_per_minute))
+        return max(min(classic, fast), floor)
+
+    def budget(configured: int) -> int:
+        return 0 if configured <= 0 else max(configured, settings.max_actions_per_tick) if scaled else configured
+    join_budget, leave_budget = budget(settings.max_joins), budget(settings.max_leaves)
+
     def schedule_departure(e: Entry) -> bool:
         nonlocal due_leave
-        if len(planned_entry_ids) >= settings.max_leaves:
+        if len(planned_entry_ids) >= leave_budget:
             return False
         if e.status != "reserved" and e.machine not in ready:
             return False
@@ -198,7 +230,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         # repeatedly discarding long gaps until a shorter one fits.
         if due_leave>now+timedelta(seconds=settings.tick_seconds):
             return False
-        candidate_due = due_leave + random_gap()
+        candidate_due = due_leave + paced_gap(max(0, sum(current.values()) - target))
         if candidate_due >= now + timedelta(seconds=horizon_seconds):
             return False
         due_leave = candidate_due
@@ -217,7 +249,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                       and now >= acc[e.account].session_end.astimezone(timezone.utc)))),
                      key=lambda e: (acc[e.account].session_end or now, e.status != "reserved", e.account, e.id))
     for e in expired:
-        if len(planned_entry_ids) >= settings.max_leaves:
+        if len(planned_entry_ids) >= leave_budget:
             break
         schedule_departure(e)
     if planned_entry_ids:
@@ -229,7 +261,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                              and e.status in ("reserved", "seated", "sitting_out") and e.id not in planned_entry_ids),
                             key=lambda e: (e.status != "reserved", -acc[e.account].played_seconds, e.id))
         for e in candidates[:excess]:
-            if len(planned_entry_ids) >= settings.max_leaves:
+            if len(planned_entry_ids) >= leave_budget:
                 break
             schedule_departure(e)
             # Leave capacity is retained until confirmation. Do not replace in this pass.
@@ -257,7 +289,10 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
             result.manual_blocked[a.id] = reason
 
     due_join = max(now, next_join or now)
-    for _ in range(settings.max_joins):
+    # Earliest moment each PC may log in again (scaled pace only; the fixed pace spaces every join already).
+    pc_free = {m.id: m.last_join.astimezone(timezone.utc) + timedelta(seconds=settings.min_gap)
+               for m in ready.values() if m.last_join is not None}
+    for _ in range(join_budget):
         if due_join>now+timedelta(seconds=settings.tick_seconds):
             break
         options = []
@@ -280,6 +315,15 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                     options.append((a, t, m))
         if not options:
             break
+        if scaled:
+            # Draw the gap first: the PCs still inside their own login gap at that moment sit this join out.
+            candidate = due_join + paced_gap(max(0, target - sum(current.values())))
+            free = lambda o: pc_free.get(o[2].id, candidate)
+            if not any(free(o) <= candidate for o in options):
+                candidate = min(free(o) for o in options)
+            if candidate > now + timedelta(seconds=settings.tick_seconds) or candidate >= now + timedelta(seconds=horizon_seconds):
+                break
+            options = [o for o in options if free(o) <= candidate]
         manual_options = [o for o in options if o[0].manual]
         if manual_options:
             options = manual_options
@@ -337,7 +381,11 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
             capacity=max(1,m.capacity-machine_count[m.id])
             return (occupied+1)**3/(free_after+1)*capacity
         a,t,m=rng.choices(choices,weights=[table_weight(o) for o in choices],k=1)[0]
-        due_join += random_gap()
+        if scaled:
+            due_join = candidate
+            pc_free[m.id] = candidate + timedelta(seconds=settings.min_gap)
+        else:
+            due_join += random_gap()
         if due_join >= now + timedelta(seconds=horizon_seconds):
             break
         result.actions.append(Action("join", a.id, m.id, t.id, due_join,

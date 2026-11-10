@@ -194,7 +194,12 @@ class CloudScheduler:
                 WHERE a.SiteId=?""", site_id)
             tournament_machines = [Machine(m["MachineId"], site_id, max(0, m["SiteCapacity"]), aware(m["LastHeartbeatUtc"] or datetime.min),
                 ready=bool(m["IsReady"]), enabled=bool(m["IsEnabled"]),maintenance=bool(m["MaintenanceTaskId"])) for m in machine_rows]
-            machines = [replace(m, capacity=max(0, m.capacity - tournament_by_machine[m.id])) for m in tournament_machines]
+            # Each PC's latest login on any site, for the per-PC gap of the scaled pace.
+            last_joins = {r["MachineId"]: aware(r["LastJoin"]) for r in db.rows("""SELECT c.MachineId,MAX(c.NotBeforeUtc) LastJoin
+                FROM scheduler.Command c JOIN scheduler.MachineAssignment a ON a.MachineId=c.MachineId AND a.SiteId=?
+                WHERE c.Kind='join' AND c.NotBeforeUtc>=DATEADD(minute,-30,SYSUTCDATETIME()) GROUP BY c.MachineId""", site_id)}
+            machines = [replace(m, capacity=max(0, m.capacity - tournament_by_machine[m.id]), last_join=last_joins.get(m.id))
+                        for m in tournament_machines]
             machine_by_id = {m["MachineId"]: m for m in machine_rows}
             lobby_rows = db.rows("SELECT * FROM scheduler.LobbyTable WHERE SiteId=?", site_id)
             table_rows = [t for t in lobby_rows if (t.get("TableType") or "RING") == "RING"]
@@ -226,6 +231,17 @@ class CloudScheduler:
                 planning_horizon_seconds=planning_horizon, heartbeat_seconds=site["HeartbeatTimeoutSeconds"],
                 freshness_seconds=site["TableFreshnessSeconds"],
                 extra_table_percent=int(site.get("ExtraTableChancePercent") if site.get("ExtraTableChancePercent") is not None else 30))
+            # The scaled pace backs off to the fixed one for five minutes after the poker site rate-limits a login.
+            rate_limited = db.one("""SELECT COUNT(*) AS n FROM scheduler.Command WHERE SiteId=? AND Kind='join'
+                AND CreatedUtc>=DATEADD(minute,-30,SYSUTCDATETIME()) AND UpdatedUtc>=DATEADD(minute,-5,SYSUTCDATETIME())
+                AND ResultText LIKE '%RATE[_]LIMIT%'""", site_id)["n"]
+            if rate_limited:
+                log.info("Site %s: %s login(s) rate-limited in the last 5 minutes; using the fixed join pace", site_id, rate_limited)
+            lengths = [((p.get("SessionMinMinutes") or 60) + (p.get("SessionMaxMinutes") or 240)) / 2
+                       for p in policies if p["IsEnabled"] and p["IsActive"]]
+            settings = replace(settings, fill_minutes=0 if rate_limited else int(site.get("FillMinutes") or 0),
+                session_minutes=sum(lengths) / len(lengths) if lengths else 150,
+                site_joins_per_minute=int(site.get("SiteJoinsPerMinute") or 60))
             rng = random.Random(f"{self.seed}:{site_id}:{stamp:%Y%m%d%H%M%S}")
             result = plan(settings, stamp, target, accounts, machines, tables, entries, rng,
                 next_join=aware(site["NextJoinUtc"]), next_leave=aware(site["NextLeaveUtc"]),

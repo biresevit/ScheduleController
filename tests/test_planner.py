@@ -389,3 +389,65 @@ def test_tournaments_only_account_never_joins_a_ring_table():
     plan_ = plan(Settings(1, BANDS, min_gap=20, max_gap=20, tick_seconds=30), NOW, 5, [only],
                  [Machine(1, 1, 10, NOW)], [table], [], random.Random(1))
     assert [a for a in plan_.actions if a.kind == "join"] == []
+
+
+def _scaled(**kwargs):
+    base = dict(min_gap=20, max_gap=60, tick_seconds=30, planning_horizon_seconds=210, fill_minutes=45,
+                session_minutes=150, site_joins_per_minute=60)
+    base.update(kwargs)
+    return Settings(1, BANDS, **base)
+
+
+def _crowd(n_accounts=300, n_tables=40, n_machines=1, capacity=10000):
+    accounts = [Account(i, 1, "low", max_tables=4) for i in range(1, n_accounts + 1)]
+    tables = [Table(f"t{i}", 1, D(".1"), 6, 0, NOW) for i in range(n_tables)]
+    machines = [Machine(m, 1, capacity, NOW) for m in range(1, n_machines + 1)]
+    return accounts, tables, machines
+
+
+def test_scaled_pace_joins_faster_for_a_large_target_and_never_slower_than_fixed():
+    accounts, tables, machines = _crowd(n_machines=10)
+    big = plan(_scaled(), NOW, 1000, accounts, machines, tables, [], random.Random(1))
+    joins = [a for a in big.actions if a.kind == "join"]
+    # 1000 short: (400 + 1333) joins an hour -> ~2 s apart, so a 30 s pass plans far more than the old three.
+    assert len(joins) > 6
+    assert all(a.not_before <= NOW + timedelta(seconds=30) for a in joins)
+    # One PC never logs in twice within min_gap.
+    by_pc = {}
+    for a in joins:
+        by_pc.setdefault(a.machine, []).append(a.not_before)
+    for stamps in by_pc.values():
+        stamps.sort()
+        assert all(b - a >= timedelta(seconds=20) for a, b in zip(stamps, stamps[1:]))
+    # A small target keeps today's pace: no gap above the fixed maximum.
+    small = plan(_scaled(), NOW, 5, accounts[:5], machines[:1], tables[:5], [], random.Random(1))
+    assert [a.kind for a in small.actions] == ["join"]
+    assert small.actions[0].not_before - NOW <= timedelta(seconds=60)
+
+
+def test_scaled_pace_respects_the_site_ceiling_and_pc_gap():
+    accounts, tables, machines = _crowd(n_machines=30)
+    result = plan(_scaled(site_joins_per_minute=6), NOW, 5000, accounts, machines, tables, [], random.Random(2))
+    stamps = sorted(a.not_before for a in result.actions if a.kind == "join")
+    assert all(b - a >= timedelta(seconds=10) for a, b in zip(stamps, stamps[1:]))
+    # One PC with a login 5 s ago waits out its 20 s gap.
+    one = [Machine(1, 1, 10000, NOW, last_join=NOW - timedelta(seconds=5))]
+    waited = plan(_scaled(), NOW, 1000, accounts, one, tables, [], random.Random(2))
+    first = min(a.not_before for a in waited.actions if a.kind == "join")
+    assert first >= NOW + timedelta(seconds=15)
+
+
+def test_scaled_pace_keeps_pauses_and_zero_fill_is_the_fixed_pace():
+    accounts, tables, machines = _crowd()
+    paused = plan(_scaled(max_joins=0), NOW, 1000, accounts, machines, tables, [], random.Random(3))
+    assert not [a for a in paused.actions if a.kind == "join"]
+    fixed = plan(_scaled(fill_minutes=0, max_joins=3), NOW, 1000, accounts, machines, tables, [], random.Random(3))
+    assert len([a for a in fixed.actions if a.kind == "join"]) <= 3
+
+
+def test_scaled_pace_rotates_many_ended_sessions_per_pass():
+    accounts, tables, machines = _crowd(n_machines=10)
+    ended = [replace(a, owner_machine=1 + a.id % 10, session_end=NOW - timedelta(minutes=1)) for a in accounts[:300]]
+    entries = [Entry(f"e{a.id}", a.id, a.owner_machine, f"t{a.id % 40}") for a in ended]
+    result = plan(_scaled(), NOW, 3000, ended + accounts[300:], machines, tables, entries, random.Random(4))
+    assert len([a for a in result.actions if a.kind == "leave"]) > 3
