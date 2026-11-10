@@ -685,6 +685,7 @@ class Pilot:
         return True
 
     async def refresh(self):
+        scan_started=time.monotonic()
         observer=None
         temporary=None
         last_error=None
@@ -779,6 +780,8 @@ class Pilot:
         if observer_tournaments is not None:
             rows=bluffpoker_tournament_rows if self.platform==BLUFFPOKER else tournament_lobby_rows
             self.tables.extend(rows(observer_tournaments,stamp))
+        took=time.monotonic()-scan_started
+        (log.warning if took>10 else log.debug)('Lobby scan of %s tables took %.1f s',len(self.tables),took)
         await self.reconcile_observed_entries()
 
     async def reconcile_observed_entries(self):
@@ -841,9 +844,18 @@ class Pilot:
             entries=[e for e in self.entries.values() if unsent('entry',e,e['status'] in ('closed','failed'))]
             sessions=[s for s in self.sessions if unsent('session',s,bool(s.get('closed')))]
             entries=copy.deepcopy(entries);sessions=copy.deepcopy(sessions)
-            await asyncio.to_thread(self.repo.publish,copy.deepcopy(self.tables),copy.deepcopy(self.seats),
+            # The lobby goes out once per scan (refresh() builds a new list), not again with every join or leave step.
+            fresh_lobby=self.tables is not self.__dict__.get('published_tables')
+            tables,seats=(copy.deepcopy(self.tables),copy.deepcopy(self.seats)) if fresh_lobby else ([],{})
+            started=time.monotonic()
+            await asyncio.to_thread(self.repo.publish,tables,seats,
                 entries,sessions,spans,ready=ready,
                 next_join=self.next_join,next_leave=self.next_leave,last_plan=self.last_plan)
+            took=time.monotonic()-started
+            if fresh_lobby:self.published_tables=self.tables
+            # The scheduler treats tables older than ~45 s and heartbeats older than 60 s as stale.
+            (log.warning if took>10 else log.debug)('Published %s lobby tables, %s entries, %s sessions and %s intervals in %.1f s',
+                len(tables),len(entries),len(sessions),len(spans),took)
             for kind,items,closed in (('entry',entries,lambda e:e['status'] in ('closed','failed')),('session',sessions,lambda s:bool(s.get('closed')))):
                 for item in items:
                     if closed(item):sent[(kind,item['id'])]=json.dumps(item,default=str,sort_keys=True)

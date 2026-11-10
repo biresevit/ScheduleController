@@ -49,6 +49,141 @@ INSERT scheduler.TableSeat(SiteId,TableId,SeatIndex,NativePlayerId,Username,BotA
         InGame bit '$.in_game',SittingOut bit '$.away',HandId nvarchar(80) '$.hand',ObservedUtc datetime2(3) '$.observed');"""
 
 
+# One batch for the whole journal, in the order and with the rules of the former row-by-row writes.
+JOURNAL_SQL="""SET NOCOUNT ON;
+DECLARE @site int=:site,@machine int=:machine,@epoch uniqueidentifier=?,@ready bit=?,@hasPlan bit=?,
+    @nextJoin datetime2(3)=?,@nextLeave datetime2(3)=?,@lastPlan datetime2(3)=?,
+    @sessions nvarchar(max)=?,@entries nvarchar(max)=?,@commands nvarchar(max)=?,@leases nvarchar(max)=?,
+    @intervals nvarchar(max)=?,@days nvarchar(max)=?;
+UPDATE scheduler.MachineAssignment SET LastHeartbeatUtc=SYSUTCDATETIME(),IsReady=@ready,LastSequence=LastSequence+1
+    WHERE SiteId=@site AND MachineId=@machine;
+UPDATE backoffice.MachineMetadata SET LastAgentUtc=SYSUTCDATETIME() WHERE MachineId=@machine;
+IF @hasPlan=1
+    UPDATE scheduler.Site SET NextJoinUtc=@nextJoin,NextLeaveUtc=@nextLeave,LastReconciledUtc=@lastPlan WHERE SiteId=@site;
+
+DECLARE @s TABLE(SessionId uniqueidentifier PRIMARY KEY,BotAccountId int,StartedUtc datetime2(3),PlannedEndUtc datetime2(3),
+    ActualEndUtc datetime2(3),EndReason nvarchar(80));
+INSERT @s SELECT * FROM OPENJSON(@sessions) WITH(SessionId uniqueidentifier '$.id',BotAccountId int '$.account',
+    StartedUtc datetime2(3) '$.start',PlannedEndUtc datetime2(3) '$.end',ActualEndUtc datetime2(3) '$.closed',EndReason nvarchar(80) '$.reason');
+-- Only ever close an existing session; the scheduler may already have closed it, and must never see it reopened.
+UPDATE x SET ActualEndUtc=s.ActualEndUtc,IsOpen=0,EndReason=COALESCE(x.EndReason,s.EndReason)
+    FROM scheduler.AccountSession x JOIN @s s ON s.SessionId=x.SessionId WHERE x.IsOpen=1 AND s.ActualEndUtc IS NOT NULL;
+INSERT scheduler.AccountSession(SessionId,SiteId,BotAccountId,MachineId,WorkerEpoch,StartedUtc,PlannedEndUtc,ActualEndUtc,IsOpen,EndReason)
+    SELECT s.SessionId,@site,s.BotAccountId,@machine,@epoch,s.StartedUtc,s.PlannedEndUtc,s.ActualEndUtc,
+        CASE WHEN s.ActualEndUtc IS NULL THEN 1 ELSE 0 END,s.EndReason
+    FROM @s s WHERE NOT EXISTS(SELECT 1 FROM scheduler.AccountSession x WHERE x.SessionId=s.SessionId);
+
+DECLARE @e TABLE(EntryId uniqueidentifier PRIMARY KEY,BotAccountId int,TableId nvarchar(80),Status varchar(12),IsOpen bit,
+    BuyInAmount decimal(19,4),CreatedUtc datetime2(3),SeatedUtc datetime2(3),ClosedUtc datetime2(3),LastConfirmedUtc datetime2(3),
+    SessionId uniqueidentifier,PlayTableId nvarchar(80));
+INSERT @e SELECT * FROM OPENJSON(@entries) WITH(EntryId uniqueidentifier '$.id',BotAccountId int '$.account',TableId nvarchar(80) '$.table',
+    Status varchar(12) '$.status',IsOpen bit '$.open',BuyInAmount decimal(19,4) '$.buy_in',CreatedUtc datetime2(3) '$.created',
+    SeatedUtc datetime2(3) '$.seated',ClosedUtc datetime2(3) '$.closed',LastConfirmedUtc datetime2(3) '$.confirmed',
+    SessionId uniqueidentifier '$.session',PlayTableId nvarchar(80) '$.play_table');
+INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,IsOpen,CreatedUtc)
+    SELECT e.EntryId,@site,e.BotAccountId,@machine,@epoch,e.TableId,e.Status,e.IsOpen,e.CreatedUtc
+    FROM @e e WHERE NOT EXISTS(SELECT 1 FROM scheduler.Entry x WHERE x.EntryId=e.EntryId);
+-- PlayTableId: the tournament table a registered bot currently plays (NULL for ring entries).
+UPDATE x SET Status=e.Status,IsOpen=e.IsOpen,BuyInAmount=e.BuyInAmount,SeatedUtc=e.SeatedUtc,ClosedUtc=e.ClosedUtc,
+    LastConfirmedUtc=e.LastConfirmedUtc,SessionId=e.SessionId,PlayTableId=e.PlayTableId
+    FROM scheduler.Entry x JOIN @e e ON e.EntryId=x.EntryId;
+
+DECLARE @c TABLE(CommandId uniqueidentifier PRIMARY KEY,EntryId uniqueidentifier,Kind varchar(5),Status varchar(10),IsOpen bit,
+    ConfigVersion bigint,NotBeforeUtc datetime2(3),ExpiresUtc datetime2(3),ResultCode nvarchar(80),ResultText nvarchar(1000),IsNew bit);
+INSERT @c SELECT c.*,CASE WHEN EXISTS(SELECT 1 FROM scheduler.Command x WHERE x.CommandId=c.CommandId) THEN 0 ELSE 1 END
+    FROM OPENJSON(@commands) WITH(CommandId uniqueidentifier '$.id',EntryId uniqueidentifier '$.entry',Kind varchar(5) '$.kind',
+    Status varchar(10) '$.status',IsOpen bit '$.open',ConfigVersion bigint '$.version',NotBeforeUtc datetime2(3) '$.due',
+    ExpiresUtc datetime2(3) '$.expires',ResultCode nvarchar(80) '$.result',ResultText nvarchar(1000) '$.result_text') c;
+UPDATE x SET Status=c.Status,IsOpen=c.IsOpen,ResultCode=c.ResultCode,ResultText=c.ResultText,UpdatedUtc=SYSUTCDATETIME()
+    FROM scheduler.Command x JOIN @c c ON c.CommandId=x.CommandId WHERE c.IsNew=0;
+-- A command the worker started itself (e.g. leaving a busted seat) is being carried out now; one the scheduler planned
+-- for the same entry and kind but no worker has claimed yet is superseded. Inserting next to it broke the
+-- one-open-command rule: the save failed on every publish and stopped the site (machine 5, 2026-11-09 01:10).
+UPDATE x SET Status='cancelled',IsOpen=0,ResultCode='superseded',ResultText='The PC already carries out this task for the bot.',
+    UpdatedUtc=SYSUTCDATETIME()
+    FROM scheduler.Command x WHERE x.IsOpen=1 AND x.Status='pending'
+        AND EXISTS(SELECT 1 FROM @c c WHERE c.IsNew=1 AND c.IsOpen=1 AND c.EntryId=x.EntryId AND c.Kind=x.Kind)
+        AND NOT EXISTS(SELECT 1 FROM @c c WHERE c.CommandId=x.CommandId);
+INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,ConfigVersion,PayloadJson,NotBeforeUtc,
+    ExpiresUtc,ResultCode,ResultText,UpdatedUtc)
+    SELECT c.CommandId,@site,c.EntryId,@machine,@epoch,c.Kind,c.Status,c.IsOpen,c.ConfigVersion,'{}',c.NotBeforeUtc,c.ExpiresUtc,
+        c.ResultCode,c.ResultText,SYSUTCDATETIME()
+    FROM @c c WHERE c.IsNew=1;
+
+DECLARE @l TABLE(BotAccountId int PRIMARY KEY,Uncertain bit);
+INSERT @l SELECT * FROM OPENJSON(@leases) WITH(BotAccountId int '$.account',Uncertain bit '$.uncertain');
+INSERT scheduler.AccountLease(BotAccountId,SiteId,MachineId,WorkerEpoch,LeaseToken,LeaseUntilUtc,LastConfirmedUtc)
+    SELECT l.BotAccountId,@site,@machine,@epoch,NEWID(),DATEADD(second,90,SYSUTCDATETIME()),SYSUTCDATETIME()
+    FROM @l l WHERE NOT EXISTS(SELECT 1 FROM scheduler.AccountLease x WHERE x.BotAccountId=l.BotAccountId);
+UPDATE x SET LeaseUntilUtc=DATEADD(second,90,SYSUTCDATETIME()),LastConfirmedUtc=SYSUTCDATETIME(),RequiresReconciliation=l.Uncertain
+    FROM scheduler.AccountLease x JOIN @l l ON l.BotAccountId=x.BotAccountId WHERE x.WorkerEpoch=@epoch;
+-- A cancelled first join has no session yet, but still owns a lease. Retain leases for uncertain/open entries;
+-- release only this worker's leases once the persisted journal confirms no entries remain.
+DELETE l FROM scheduler.AccountLease l WHERE l.SiteId=@site AND l.WorkerEpoch=@epoch
+    AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1);
+
+DECLARE @i TABLE(IntervalId uniqueidentifier PRIMARY KEY,BotAccountId int,SequenceNumber bigint,StartUtc datetime2(3),EndUtc datetime2(3),EntryCount int);
+INSERT @i SELECT * FROM OPENJSON(@intervals) WITH(IntervalId uniqueidentifier '$.id',BotAccountId int '$.account',
+    SequenceNumber bigint '$.sequence',StartUtc datetime2(3) '$.start',EndUtc datetime2(3) '$.end',EntryCount int '$.entries');
+DECLARE @new TABLE(IntervalId uniqueidentifier PRIMARY KEY);
+-- A retried publish must not account an interval twice.
+INSERT scheduler.AccountInterval(IntervalId,SiteId,BotAccountId,MachineId,WorkerEpoch,SequenceNumber,StartUtc,EndUtc,EntryCount)
+    OUTPUT inserted.IntervalId INTO @new
+    SELECT i.IntervalId,@site,i.BotAccountId,@machine,@epoch,i.SequenceNumber,i.StartUtc,i.EndUtc,i.EntryCount
+    FROM @i i WHERE NOT EXISTS(SELECT 1 FROM scheduler.AccountInterval x WHERE x.IntervalId=i.IntervalId);
+DECLARE @day TABLE(BotAccountId int,LocalDate date,SessionSeconds bigint,EntrySeconds bigint,PRIMARY KEY(BotAccountId,LocalDate));
+INSERT @day SELECT d.BotAccountId,d.LocalDate,SUM(d.Seconds),SUM(d.EntrySeconds)
+    FROM OPENJSON(@days) WITH(IntervalId uniqueidentifier '$.interval',BotAccountId int '$.account',LocalDate date '$.day',
+        Seconds bigint '$.seconds',EntrySeconds bigint '$.entry_seconds') d
+    JOIN @new n ON n.IntervalId=d.IntervalId GROUP BY d.BotAccountId,d.LocalDate;
+UPDATE x SET SessionSeconds=x.SessionSeconds+d.SessionSeconds,EntrySeconds=x.EntrySeconds+d.EntrySeconds,UpdatedUtc=SYSUTCDATETIME()
+    FROM scheduler.AccountDay x JOIN @day d ON x.SiteId=@site AND x.BotAccountId=d.BotAccountId AND x.LocalDate=d.LocalDate;
+INSERT scheduler.AccountDay(SiteId,BotAccountId,LocalDate,SessionSeconds,EntrySeconds)
+    SELECT @site,d.BotAccountId,d.LocalDate,d.SessionSeconds,d.EntrySeconds FROM @day d
+    WHERE NOT EXISTS(SELECT 1 FROM scheduler.AccountDay x WHERE x.SiteId=@site AND x.BotAccountId=d.BotAccountId AND x.LocalDate=d.LocalDate);"""
+
+
+def stamp_ms(value):
+    """ISO text at millisecond precision, the columns' precision, for OPENJSON."""
+    value=utc(value)
+    return value.isoformat(timespec='milliseconds') if value else None
+
+
+def journal_payload(entries,sessions,intervals):
+    """The JSON parameters of JOURNAL_SQL: sessions, entries, commands, leases, intervals and their local days."""
+    from .rules import split_interval
+    ms=lambda v:v.replace(microsecond=v.microsecond//1000*1000)
+    session_rows={str(s['id']):dict(id=str(s['id']),account=s['account'],start=stamp_ms(s['start']),end=stamp_ms(s['end']),
+                                     closed=stamp_ms(s['closed']) if s.get('closed') else None,reason=s.get('reason'))
+                  for s in sessions}
+    entry_rows={};command_rows={}
+    for e in entries:
+        opened=e['status'] not in ('closed','failed')
+        entry_rows[str(e['id'])]=dict(id=str(e['id']),account=e['account'],table=str(e['table']),status=e['status'],open=opened,
+            buy_in=e.get('buy_in'),created=stamp_ms(e['created']),seated=stamp_ms(e.get('seated')),closed=stamp_ms(e.get('closed')),
+            confirmed=stamp_ms(e.get('confirmed')),session=None if e.get('session') is None else str(e['session']),
+            play_table=None if e.get('play_table') is None else str(e['play_table']))
+        for cmd in e.get('commands',[]):
+            command_rows[str(cmd['id'])]=dict(id=str(cmd['id']),entry=str(e['id']),kind=cmd['kind'],status=cmd['status'],
+                open=cmd['status'] in ('pending','claimed','uncertain'),version=cmd['version'],due=stamp_ms(cmd['due']),
+                expires=stamp_ms(cmd['due']+timedelta(minutes=3)),result=cmd.get('result'),result_text=cmd.get('result_text'))
+    active={e['account'] for e in entries if e['status'] not in ('closed','failed')}
+    leases=[dict(account=a,uncertain=any(e['account']==a and e['status']=='uncertain' for e in entries)) for a in sorted(active)]
+    interval_rows={};days=[]
+    for span in intervals:
+        # an empty interval at millisecond precision has nothing to account and would violate EndUtc>StartUtc
+        if ms(span['end'])<=ms(span['start']) or str(span['id']) in interval_rows: continue
+        interval_rows[str(span['id'])]=dict(id=str(span['id']),account=span['account'],sequence=span['sequence'],
+            start=stamp_ms(span['start']),end=stamp_ms(span['end']),entries=span['entries'])
+        for day,seconds in split_interval(span['start'],span['end'],'Europe/Budapest').items():
+            count=int(seconds)
+            if count:
+                days.append(dict(interval=str(span['id']),account=span['account'],day=str(day),seconds=count,
+                                 entry_seconds=count*span['entries']))
+    dump=lambda rows:json.dumps(list(rows),default=str)
+    return (dump(session_rows.values()),dump(entry_rows.values()),dump(command_rows.values()),dump(leases),
+            dump(interval_rows.values()),dump(days))
+
 def utc(value):
     return value.replace(tzinfo=None) if value else None
 
@@ -393,62 +528,19 @@ class Repository(ChatRepository,ManualRepository):
 
     @retry_deadlocks
     def publish(self,tables,seats,entries,sessions,intervals,*,ready=True,next_join=None,next_leave=None,last_plan=None):
+        """Lobby first (entries reference its tables), then the journal in one set-based batch.
+
+        The journal used to be written row by row: about 800 round trips at 90 entries (machine 5, 2026-11-09),
+        25-40 s per publish from a PC far from the database. The lobby rows, stamped at scan time, then reached
+        the database already stale and the heartbeat looked as old, so the scheduler stopped planning joins.
+        """
+        if tables or seats:
+            self.publish_lobby(tables,seats)
+        payload=journal_payload(entries,sessions,intervals)
         with self.transaction() as db:
             owned=db.one("SELECT WorkerEpoch FROM scheduler.MachineAssignment WITH(UPDLOCK,HOLDLOCK) WHERE SiteId=:site AND MachineId=:machine")
             if not owned or str(owned['WorkerEpoch']).lower()!=str(self.epoch).lower(): raise RuntimeError('Worker epoch lost')
-            db.execute("UPDATE scheduler.MachineAssignment SET LastHeartbeatUtc=SYSUTCDATETIME(),IsReady=?,LastSequence=LastSequence+1 WHERE SiteId=:site AND MachineId=:machine",ready)
-            db.execute("UPDATE backoffice.MachineMetadata SET LastAgentUtc=SYSUTCDATETIME() WHERE MachineId=:machine")
-            if last_plan:
-                db.execute("UPDATE scheduler.Site SET NextJoinUtc=?,NextLeaveUtc=?,LastReconciledUtc=? WHERE SiteId=:site",utc(next_join),utc(next_leave),utc(last_plan))
-            for s in sessions:
-                if not db.one('SELECT SessionId FROM scheduler.AccountSession WHERE SessionId=?',s['id']):
-                    db.execute("INSERT scheduler.AccountSession(SessionId,SiteId,BotAccountId,MachineId,WorkerEpoch,StartedUtc,PlannedEndUtc,ActualEndUtc,IsOpen,EndReason) VALUES(?,:site,?,:machine,?,?,?,?,?,?)",s['id'],s['account'],self.epoch,utc(s['start']),utc(s['end']),utc(s.get('closed')),not bool(s.get('closed')),s.get('reason'))
-                elif s.get('closed'):
-                    # Only ever close; the scheduler may already have closed it, and must never see it reopened.
-                    db.execute('UPDATE scheduler.AccountSession SET ActualEndUtc=?,IsOpen=0,EndReason=COALESCE(EndReason,?) WHERE SessionId=? AND IsOpen=1',utc(s.get('closed')),s.get('reason'),s['id'])
-            for e in entries:
-                opened=e['status'] not in ('closed','failed')
-                if not db.one('SELECT EntryId FROM scheduler.Entry WHERE EntryId=?',e['id']):
-                    db.execute("INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,IsOpen,CreatedUtc) VALUES(?,:site,?,:machine,?,?,?,?,?)",e['id'],e['account'],self.epoch,e['table'],e['status'],opened,utc(e['created']))
-                # PlayTableId: the tournament table a registered bot currently plays (None for ring entries).
-                db.execute('UPDATE scheduler.Entry SET Status=?,IsOpen=?,BuyInAmount=?,SeatedUtc=?,ClosedUtc=?,LastConfirmedUtc=?,SessionId=?,PlayTableId=? WHERE EntryId=?',e['status'],opened,e.get('buy_in'),utc(e.get('seated')),utc(e.get('closed')),utc(e.get('confirmed')),e.get('session'),e.get('play_table'),e['id'])
-                for cmd in e.get('commands',[]):
-                    is_open=cmd['status'] in ('pending','claimed','uncertain')
-                    if not db.one('SELECT CommandId FROM scheduler.Command WHERE CommandId=?',cmd['id']):
-                        if is_open:
-                            # A command the worker started itself (e.g. leaving a busted seat) is being carried out
-                            # now; one the scheduler planned for the same entry and kind but no worker has claimed
-                            # yet is superseded. Inserting next to it broke the one-open-command rule: the save
-                            # failed on every publish and stopped the site (machine 5, 2026-11-09 01:10).
-                            db.execute("""UPDATE scheduler.Command SET Status='cancelled',IsOpen=0,ResultCode='superseded',
-                                ResultText='The PC already carries out this task for the bot.',UpdatedUtc=SYSUTCDATETIME()
-                                WHERE EntryId=? AND Kind=? AND IsOpen=1 AND Status='pending'""",e['id'],cmd['kind'])
-                        db.execute("INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc) VALUES(?,:site,?,:machine,?,?,?,?,?,'{}',?,?)",cmd['id'],e['id'],self.epoch,cmd['kind'],cmd['status'],is_open,cmd['version'],utc(cmd['due']),utc(cmd['due']+timedelta(minutes=3)))
-                    db.execute('UPDATE scheduler.Command SET Status=?,IsOpen=?,ResultCode=?,ResultText=?,UpdatedUtc=SYSUTCDATETIME() WHERE CommandId=?',cmd['status'],is_open,cmd.get('result'),cmd.get('result_text'),cmd['id'])
-            active_accounts={e['account'] for e in entries if e['status'] not in ('closed','failed')}
-            for aid in active_accounts:
-                if not db.one('SELECT BotAccountId FROM scheduler.AccountLease WHERE BotAccountId=?',aid):
-                    db.execute("INSERT scheduler.AccountLease(BotAccountId,SiteId,MachineId,WorkerEpoch,LeaseToken,LeaseUntilUtc,LastConfirmedUtc) VALUES(?,:site,:machine,?,?,DATEADD(second,90,SYSUTCDATETIME()),SYSUTCDATETIME())",aid,self.epoch,str(uuid.uuid4()))
-                db.execute('UPDATE scheduler.AccountLease SET LeaseUntilUtc=DATEADD(second,90,SYSUTCDATETIME()),LastConfirmedUtc=SYSUTCDATETIME(),RequiresReconciliation=? WHERE BotAccountId=? AND WorkerEpoch=?',any(e['account']==aid and e['status']=='uncertain' for e in entries),aid,self.epoch)
-            # A cancelled first join has no session yet, but still owns a lease.
-            # Retain leases for uncertain/open entries; release only this worker's
-            # leases once the persisted journal confirms no entries remain.
-            db.execute("DELETE l FROM scheduler.AccountLease l WHERE l.SiteId=:site AND l.WorkerEpoch=? AND NOT EXISTS (SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1)",self.epoch)
-            from .rules import split_interval
-            for span in intervals:
-                if db.one('SELECT IntervalId FROM scheduler.AccountInterval WHERE IntervalId=?',span['id']): continue
-                # an empty interval at millisecond precision has nothing to account and would violate EndUtc>StartUtc
-                if span['end'].replace(microsecond=span['end'].microsecond//1000*1000)<=span['start'].replace(microsecond=span['start'].microsecond//1000*1000): continue
-                db.execute("INSERT scheduler.AccountInterval(IntervalId,SiteId,BotAccountId,MachineId,WorkerEpoch,SequenceNumber,StartUtc,EndUtc,EntryCount) VALUES(?,:site,?,:machine,?,?,?,?,?)",span['id'],span['account'],self.epoch,span['sequence'],utc(span['start']),utc(span['end']),span['entries'])
-                for day,seconds in split_interval(span['start'],span['end'],'Europe/Budapest').items():
-                    count=int(seconds)
-                    if not count: continue
-                    if db.one("SELECT LocalDate FROM scheduler.AccountDay WHERE SiteId=:site AND BotAccountId=? AND LocalDate=?",span['account'],day):
-                        db.execute("UPDATE scheduler.AccountDay SET SessionSeconds=SessionSeconds+?,EntrySeconds=EntrySeconds+?,UpdatedUtc=SYSUTCDATETIME() WHERE SiteId=:site AND BotAccountId=? AND LocalDate=?",count,count*span['entries'],span['account'],day)
-                    else:
-                        db.execute("INSERT scheduler.AccountDay(SiteId,BotAccountId,LocalDate,SessionSeconds,EntrySeconds) VALUES(:site,?,?,?,?)",span['account'],day,count,count*span['entries'])
-        if tables or seats:
-            self.publish_lobby(tables,seats)
+            db.execute(JOURNAL_SQL,self.epoch,bool(ready),bool(last_plan),utc(next_join),utc(next_leave),utc(last_plan),*payload)
 
     def publish_lobby(self,tables,seats):
         """Write lobby tables and seats in one round trip, in a transaction of their own.

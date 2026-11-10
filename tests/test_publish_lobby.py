@@ -37,7 +37,7 @@ def lobby():
     return tables,seats
 
 
-def test_publish_writes_the_lobby_in_one_batch_after_the_journal():
+def test_publish_writes_the_lobby_in_one_batch_before_the_journal():
     db=Recorder();tables,seats=lobby()
     repository(db).publish(tables,seats,[],[],[])
     assert db.transactions==2
