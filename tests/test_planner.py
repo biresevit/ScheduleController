@@ -176,10 +176,14 @@ def test_already_draining_entry_does_not_create_an_extra_departure():
     assert not result.actions
 
 
-def test_unknown_observed_account_ownership_requires_reconciliation():
-    result = run(tables=[Table("a", 1, D(".1"), 6, 1, NOW, observed_accounts=frozenset({1}))])
-    assert not result.actions
-    assert result.reasons == ["unreconciled_observed_entry"]
+def test_an_account_seated_without_an_entry_is_set_aside_without_blocking_the_site():
+    # Account 1 sits at table a, played by a PC that stopped reporting. The site keeps joining with account 2,
+    # never at a table the unseen account occupies a seat of; account 1 gets nothing where takeover is off.
+    result = run(accounts=[Account(1, 1, "low"), Account(2, 1, "low")],
+                 tables=[Table("a", 1, D(".1"), 6, 1, NOW, observed_accounts=frozenset({1})), Table("b", 1, D(".1"), 6, 0, NOW)])
+    assert "unreconciled_observed_entry" in result.reasons
+    assert result.actions and {a.account for a in result.actions} == {2}
+    assert not any(a.takeover for a in result.actions)
 
 
 def test_duplicate_trigger_cannot_bypass_per_tick_budget():
@@ -472,3 +476,36 @@ def test_scaled_pace_rotates_many_ended_sessions_per_pass():
     entries = [Entry(f"e{a.id}", a.id, a.owner_machine, f"t{a.id % 40}") for a in ended]
     result = plan(_scaled(), NOW, 3000, ended + accounts[300:], machines, tables, entries, random.Random(4))
     assert len([a for a in result.actions if a.kind == "leave"]) > 3
+
+
+def ghost_inputs(takeover_machine=True):
+    settings = replace(SETTINGS, takeover_seats=True)
+    accounts = [Account(1, 1, "low"), Account(2, 1, "low")]
+    machines = [Machine(1, 1, 6, NOW, takeover=takeover_machine)]
+    # table a is full, account 1 holds one of its seats unseen
+    tables = [Table("a", 1, D(".1"), 6, 6, NOW, observed_accounts=frozenset({1})), Table("b", 1, D(".1"), 6, 0, NOW)]
+    return settings, accounts, machines, tables
+
+
+def test_a_seat_without_an_entry_is_taken_over_first_even_at_a_full_table_and_target():
+    settings, accounts, machines, tables = ghost_inputs()
+    result = plan(settings, NOW, 0, accounts, machines, tables, [], random.Random(3))
+    assert [(a.kind, a.account, a.table, a.takeover) for a in result.actions] == [("join", 1, "a", True)]
+
+
+def test_a_takeover_needs_a_pc_whose_worker_can_resume_the_seat():
+    settings, accounts, machines, tables = ghost_inputs(takeover_machine=False)
+    result = plan(settings, NOW, 5, accounts, machines, tables, [], random.Random(3))
+    assert not any(a.takeover or a.table == "a" for a in result.actions)
+    assert any(a.account in (1, 2) and a.table == "b" for a in result.actions)
+
+
+def test_an_account_with_several_unseen_seats_is_taken_over_on_one_pc():
+    settings = replace(SETTINGS, takeover_seats=True, max_joins=5)
+    accounts = [Account(1, 1, "low")]
+    machines = [Machine(1, 1, 6, NOW, takeover=True), Machine(2, 1, 6, NOW, takeover=True)]
+    tables = [Table(t, 1, D(".1"), 6, 1, NOW, observed_accounts=frozenset({1})) for t in ("a", "b")]
+    result = plan(settings, NOW, 0, accounts, machines, tables, [], random.Random(3))
+    takeovers = [a for a in result.actions if a.takeover]
+    assert sorted(a.table for a in takeovers) == ["a", "b"]
+    assert len({a.machine for a in takeovers}) == 1  # one login per account: a second PC would replace the first

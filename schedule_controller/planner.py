@@ -53,6 +53,8 @@ class Machine:
     maintenance: bool = False
     # When this PC's latest login (join command) is due, on any site: the next one waits min_gap after it.
     last_join: datetime | None = None
+    # The PC's worker can resume a seat its account already holds (Session.add takeover), release 2026.11.12.1 on.
+    takeover: bool = False
 
 
 @dataclass(frozen=True)
@@ -103,6 +105,9 @@ class Settings:
     site_joins_per_minute: int = 60
     # Safety bound on the actions one pass may plan when the pace scales.
     max_actions_per_tick: int = 200
+    # A login replaces the account's earlier session on this poker site (BluffPoker), so a seat played by a PC that
+    # stopped reporting can be taken over by logging the account in on another PC. Off: such accounts are set aside.
+    takeover_seats: bool = False
 
 
 @dataclass(frozen=True)
@@ -114,6 +119,8 @@ class Action:
     not_before: datetime
     entry: str | None = None
     soft_limit_override: bool = False
+    # Join for a seat the account holds without an open entry: the worker resumes it instead of sitting down.
+    takeover: bool = False
 
 
 @dataclass
@@ -159,14 +166,21 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
     if len(pairs) != len(active):
         result.reasons.append("duplicate_entry_reservations")
         return result
+    # Seats our accounts hold without an open entry: played by a PC that stopped reporting (its entries were expired),
+    # or by hand. They used to stop all planning of the site until they were gone; one PC that played on unseen blocked
+    # every ring join of Simo's site for hours (PC 1023, 2026-11-11). Now only those accounts are affected: taken over
+    # where a login replaces the old session, otherwise set aside. The seats stay counted as occupied at their tables.
+    ghost: dict[int, set[str]] = {}
     for t in tab.values():
         if not 0 <= t.occupied <= t.seats or len(t.observed_accounts) > t.occupied:
             raise ValueError("Invalid table occupancy")
         for account_id in t.observed_accounts:
             if account_id in acc and (account_id, t.id) not in pairs:
-                # Absence from the task ledger is not permission to add a replacement.
-                result.reasons.append("unreconciled_observed_entry")
-                return result
+                ghost.setdefault(account_id, set()).add(t.id)
+    if ghost:
+        result.reasons.append("unreconciled_observed_entry")
+    # No ordinary join to a table where the account already sits.
+    pairs |= {(aid, tid) for aid, tids in ghost.items() for tid in tids}
     owners: dict[int, set[int]] = {a.id: ({a.owner_machine} if a.owner_machine is not None else set()) for a in acc.values()}
     for e in active:
         owners[e.account].add(e.machine)
@@ -273,6 +287,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         pinned = sorted(owners[a.id])
         reason = ("disabled or missing credentials" if not a.enabled or not a.credentials_ready else
                   "lease needs reconciliation" if a.requires_reconciliation else
+                  "seated at a table without an open entry" if a.id in ghost and not settings.takeover_seats else
                   f"pinned to several machines {pinned}" if len(pinned) > 1 else
                   "session not started" if a.session_start is not None and now < a.session_start else
                   "session ended" if a.session_end is not None and now >= a.session_end else
@@ -297,7 +312,21 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         if due_join>now+timedelta(seconds=settings.tick_seconds):
             break
         options = []
+        takeovers = []
         for a in acc.values():
+            if a.id in ghost:
+                if not settings.takeover_seats:
+                    continue
+                # The seat exists already: no target, free seat or cooldown check, only the account's limits.
+                if (a.enabled and a.credentials_ready and not a.requires_reconciliation and len(owners[a.id]) <= 1
+                        and account_count[a.id] < a.max_tables):
+                    for tid in sorted(ghost[a.id]):
+                        if tid not in supported:
+                            continue
+                        for m in ready.values():
+                            if (m.takeover and not m.maintenance and machine_count[m.id] < m.capacity
+                                    and not (owners[a.id] and m.id not in owners[a.id])):
+                                takeovers.append((a, supported[tid], m))
             if (not (a.enabled or simulation and a.synthetic) or a.synthetic and not simulation
                 or not a.credentials_ready and not (simulation and a.synthetic)
                 or a.requires_reconciliation or len(owners[a.id]) > 1 or account_count[a.id] >= a.max_tables
@@ -314,6 +343,10 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
                     if m.maintenance or machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:
                         continue
                     options.append((a, t, m))
+        # Taking over a seat that sits out unseen comes before any new join.
+        takeover = bool(takeovers)
+        if takeover:
+            options = takeovers
         if not options:
             break
         if scaled:
@@ -328,7 +361,7 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
             if candidate >= now + timedelta(seconds=horizon_seconds):
                 break
             options = [o for o in options if free(o) <= candidate]
-        manual_options = [o for o in options if o[0].manual]
+        manual_options = [o for o in options if o[0].manual] if not takeover else []
         if manual_options:
             options = manual_options
         # A new login, or (extra_table_percent of the time) another table for an account already playing, the one
@@ -393,13 +426,16 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
         if due_join >= now + timedelta(seconds=horizon_seconds):
             break
         result.actions.append(Action("join", a.id, m.id, t.id, due_join,
-                                     soft_limit_override=not bool(under_limit)))
+                                     soft_limit_override=not bool(under_limit), takeover=takeover))
         result.next_join = due_join
         pairs.add((a.id, t.id))
         current[a.tier] += 1
         account_count[a.id] += 1
         machine_count[m.id] += 1
-        table_count[t.id] += 1
+        if takeover:
+            ghost[a.id].discard(t.id)  # the seat is already counted at its table
+        else:
+            table_count[t.id] += 1
         concentration[m.id, t.id] += 1
         owners[a.id].add(m.id)
     result.remaining_deficits = {tier: max(0, desired[tier] - current[tier]) for tier in TIERS}

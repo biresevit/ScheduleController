@@ -27,6 +27,24 @@ def aware(value):
     return value.replace(tzinfo=timezone.utc) if value and value.tzinfo is None else value
 
 
+# First PC release whose worker resumes a seat its account already holds when a join says takeover.
+TAKEOVER_RELEASE = "2026.11.12.1"
+
+
+def release_at_least(label, minimum):
+    """Compares release labels YYYY.MM.DD.N; False for a missing or unreadable label."""
+    try:
+        return tuple(int(x) for x in str(label).split(".")) >= tuple(int(x) for x in minimum.split("."))
+    except (TypeError, ValueError):
+        return False
+
+
+def takes_over_seats(site):
+    """On BluffPoker a login replaces the account's earlier session, so the seat of a PC that stopped reporting can be
+    taken over from another PC. Other platforms are not known to do that: their accounts are only set aside."""
+    return str(site.get("Platform") or "").lower().startswith("bluffpoker")
+
+
 def cancel_paused_joins(db, site_id):
     """The scheduler's join commands no PC has picked up yet (manual tasks are kept), closed with their entries."""
     return db.one("EXEC scheduler.CancelPausedJoins @SiteId=?", site_id)["n"]
@@ -124,6 +142,19 @@ class CloudScheduler:
                 site_id).rowcount
             if released > 0:
                 log.info("Released %s stale lease(s) left by earlier worker runs", released)
+            takeover = takes_over_seats(site)
+            if takeover:
+                # The same for a PC the scheduler expired (no heartbeat for 180 s, its entries closed): its leases held
+                # the accounts until that PC came back, for days when it never did (machine 1022, 31 accounts from
+                # 2026-11-07). A login on another PC replaces the account's session there, so they are released.
+                offline = db.execute("""DELETE l FROM scheduler.AccountLease l
+                    JOIN scheduler.MachineAssignment a ON a.SiteId=l.SiteId AND a.MachineId=l.MachineId
+                    WHERE l.SiteId=? AND l.RequiresReconciliation=1 AND a.WorkerEpoch<>l.WorkerEpoch
+                      AND (a.LastHeartbeatUtc IS NULL OR a.LastHeartbeatUtc<DATEADD(second,-180,SYSUTCDATETIME()))
+                      AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1)""",
+                    site_id).rowcount
+                if offline > 0:
+                    log.info("Released %s lease(s) of offline PCs", offline)
             # Sessions outlive their tables: a bot that busts, fails a join or is no longer seated
             # keeps its session and gets new joins. The session ends once its planned end has
             # passed and the planner's leaves have closed its last table.
@@ -208,7 +239,11 @@ class CloudScheduler:
             last_joins = {r["MachineId"]: aware(r["LastJoin"]) for r in db.rows("""SELECT c.MachineId,MAX(c.NotBeforeUtc) LastJoin
                 FROM scheduler.Command c JOIN scheduler.MachineAssignment a ON a.MachineId=c.MachineId AND a.SiteId=?
                 WHERE c.Kind='join' AND c.NotBeforeUtc>=DATEADD(minute,-30,SYSUTCDATETIME()) GROUP BY c.MachineId""", site_id)}
-            machines = [replace(m, capacity=max(0, m.capacity - tournament_by_machine[m.id]), last_join=last_joins.get(m.id))
+            # PCs whose worker resumes a seat its account already holds (the takeover join), release 2026.11.12.1 on.
+            releases = {r["MachineId"]: r["Label"] for r in db.rows("""SELECT u.MachineId,r.Label FROM scheduler.MachineUpdateAgent u
+                JOIN scheduler.UpdateRelease r ON r.ReleaseId=u.CurrentReleaseId WHERE u.SiteId=?""", site_id)}
+            machines = [replace(m, capacity=max(0, m.capacity - tournament_by_machine[m.id]), last_join=last_joins.get(m.id),
+                                takeover=release_at_least(releases.get(m.id), TAKEOVER_RELEASE))
                         for m in tournament_machines]
             machine_by_id = {m["MachineId"]: m for m in machine_rows}
             lobby_rows = db.rows("SELECT * FROM scheduler.LobbyTable WHERE SiteId=?", site_id)
@@ -240,7 +275,8 @@ class CloudScheduler:
                 site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"], tick_seconds=30,
                 planning_horizon_seconds=planning_horizon, heartbeat_seconds=site["HeartbeatTimeoutSeconds"],
                 freshness_seconds=site["TableFreshnessSeconds"],
-                extra_table_percent=int(site.get("ExtraTableChancePercent") if site.get("ExtraTableChancePercent") is not None else 30))
+                extra_table_percent=int(site.get("ExtraTableChancePercent") if site.get("ExtraTableChancePercent") is not None else 30),
+                takeover_seats=takeover)
             # The scaled pace backs off to the fixed one for five minutes after the poker site rate-limits a login.
             rate_limited = db.one("""SELECT COUNT(*) AS n FROM scheduler.Command WHERE SiteId=? AND Kind='join'
                 AND CreatedUtc>=DATEADD(minute,-30,SYSUTCDATETIME()) AND UpdatedUtc>=DATEADD(minute,-5,SYSUTCDATETIME())
@@ -266,7 +302,11 @@ class CloudScheduler:
             for action in result.actions:
                 if action.kind == "join":
                     any_join_proposed = True
-                    if self._create_join(db, site, action, policy_by_id[action.account], machine_by_id[action.machine], rng):
+                    if action.takeover:
+                        log.info("Site %s: account %s holds a seat at %s that no PC reports; taking it over on machine %s",
+                                 site_id, action.account, action.table, action.machine)
+                    if self._create_join(db, site, action, policy_by_id[action.account], machine_by_id[action.machine], rng,
+                                         {"takeover": True} if action.takeover else None):
                         created += 1
                         last_successful_join_due = action.not_before
                 elif action.kind == "leave":

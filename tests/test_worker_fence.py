@@ -178,3 +178,45 @@ def test_owns_machine_compares_the_epoch_on_a_new_connection(monkeypatch, stored
     monkeypatch.setattr(pilot_repository, 'connection_string', lambda: 'DRIVER=x')
     assert Repository('abc', 1006, 1023).owns_machine() is owned
     assert seen == [(1006, 1023)]
+
+
+def seated_session(monkeypatch):
+    from schedule_controller.pilot import Session
+    import schedule_controller.pilot as module
+    class FakeBot:
+        async def process(self, state): pass
+    monkeypatch.setattr(module, 'Bot', lambda *args, **kwargs: FakeBot())
+    client = SimpleNamespace(tables={}, states={42: {'s': [{'f': 0}]}}, join=AsyncMock(), hero_seat=lambda value: 0,
+                             return_from_away=AsyncMock(), player_command=AsyncMock(), sit=AsyncMock())
+    session = Session.__new__(Session); session.repo = None; session.failures = {}
+    session.ready = asyncio.Event(); session.ready.set(); session.policy = {'Username': 'Fede'}
+    session.client = client; session.decision = object(); session.bots = {}; session.queues = {}; session.workers = {}
+    return session, client
+
+
+def test_a_takeover_join_resumes_the_seat_the_account_already_holds(monkeypatch):
+    async def scenario():
+        session, client = seated_session(monkeypatch)
+        assert await session.add(42, {'i': 42, 'n': 'Prague'}, random.Random(1), takeover=True) is None
+        client.sit.assert_not_awaited()
+        assert 42 in session.workers
+        session.workers[42].cancel(); await asyncio.gather(session.workers[42], return_exceptions=True)
+    import random
+    asyncio.run(scenario())
+
+
+def test_an_ordinary_join_still_refuses_an_unexpected_existing_seat(monkeypatch):
+    async def scenario():
+        session, client = seated_session(monkeypatch)
+        with pytest.raises(RuntimeError, match='Unexpected existing seat'):
+            await session.add(42, {'i': 42, 'n': 'Prague'}, random.Random(1))
+        assert not session.workers
+    import random
+    asyncio.run(scenario())
+
+
+def test_release_labels_and_takeover_platforms():
+    from schedule_controller.cloud_scheduler import release_at_least, takes_over_seats, TAKEOVER_RELEASE
+    assert release_at_least('2026.11.12.1', TAKEOVER_RELEASE) and release_at_least('2026.11.13.0', TAKEOVER_RELEASE)
+    assert not release_at_least('2026.11.11.13', TAKEOVER_RELEASE) and not release_at_least(None, TAKEOVER_RELEASE)
+    assert takes_over_seats({'Platform': 'BluffPokerPlatform'}) and not takes_over_seats({'Platform': 'EvenBet'})

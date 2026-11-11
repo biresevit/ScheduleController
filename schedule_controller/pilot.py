@@ -407,13 +407,18 @@ class Session:
             log.exception('Table worker failed: %s / %s',self.policy['Username'],tid)
             self.failures[tid]=type(exc).__name__
 
-    async def add(self,tid,info,rng):
+    async def add(self,tid,info,rng,takeover=False):
+        """Sit down and start the bot; returns the buy-in. takeover: the scheduler planned this join for a seat the
+        account already holds, played by no worker it can see (a PC that stopped reporting). The poker site ended that
+        PC's session at this login, so the seat is resumed instead of refused; the buy-in is then unknown (None)."""
         await self.ready.wait()
         if self.failures:
             raise RuntimeError('Account connection is unhealthy')
         self.client.tables[tid]=info
         await self.client.join(tid)
         if self.client.hero_seat(self.client.states[tid]) is not None:
+            if takeover and await self.resume_seat(tid):
+                return None
             raise RuntimeError('Unexpected existing seat requires reconciliation')
         amount=await self.buy_in_amount(tid,rng)
         post=rng.random()<float(self.policy['PostBbChance'])
@@ -548,6 +553,10 @@ class Session:
         """Attach workers to a seat proven to exist after a controller restart."""
         self.client.tables[tid]=info
         await self.client.join(tid)
+        return await self.resume_seat(tid)
+
+    async def resume_seat(self,tid):
+        """Start the bot at a joined table where the account is already seated; None when it is not."""
         state=self.client.states.get(tid,{})
         hero=self.client.hero_seat(state)
         if hero is None:
@@ -1092,7 +1101,8 @@ class Pilot:
                 if info is None:
                     raise RuntimeError(f'Table {tid} is no longer available in this account\'s lobby')
                 phase='joining the table and taking a seat'
-                amount=await c.add(tid,info,self.rng)
+                takeover=bool((cmd.get('payload') or {}).get('takeover'))
+                amount=await c.add(tid,info,self.rng,takeover=takeover) if takeover else await c.add(tid,info,self.rng)
                 self.accrue()
                 session=next((s for s in reversed(self.sessions) if s['account']==e['account'] and not s.get('closed')),None)
                 if not session:
@@ -1101,7 +1111,8 @@ class Pilot:
                     self.sessions.append(session)
                 e.update(status='seated',seated=now(),confirmed=now(),buy_in=amount,session=session['id'])
                 self.accrue()
-                log.info('SEATED %s table=%s name=%s buyin=%s',c.policy['Username'],tid,info.get('n',tid),amount)
+                log.info('SEATED %s table=%s name=%s buyin=%s%s',c.policy['Username'],tid,info.get('n',tid),amount,
+                         ' (took over the seat of a PC that stopped reporting)' if takeover else '')
             else:
                 phase='leaving the table'
                 c=self.clients.get(e['account'])
