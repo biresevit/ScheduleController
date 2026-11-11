@@ -63,7 +63,7 @@ def test_follower_seats_moves_and_finishes_the_account():
         await t.apply(SNG, {"status": "RUNNING", "myRegistrationStatus": "PLAYING", "myTableId": "table-1", "playersRemaining": 6, "info": info})
         await t.apply(SNG, {"status": "RUNNING", "myRegistrationStatus": "PLAYING", "myTableId": "table-1", "playersRemaining": 5, "info": info})
         await t.apply(SNG, {"status": "RUNNING", "myRegistrationStatus": "PLAYING", "myTableId": "table-2", "playersRemaining": 4, "info": info})
-        assert client.tables["table-2"]["tournament"] == {"format": "SNG", "players_left": 4, "players_total": 6, "places_paid": 2, "ante": None}
+        assert client.tables["table-2"]["tournament"] == {"format": "SNG", "players_left": 4, "players_total": 6, "places_paid": 2, "ante": None, "buy_in": None}
         await t.apply(SNG, {"status": "RUNNING", "myRegistrationStatus": "ELIMINATED", "myFinalPosition": 3, "info": info})
     asyncio.run(run())
     assert attached == ["table-1", "table-2"] and detached == ["table-1", "table-2"]
@@ -204,3 +204,17 @@ def test_other_registration_refusals_still_fail():
     else:
         raise AssertionError("a closed registration must not count as registered")
     assert not t.active
+
+
+def test_table_info_carries_the_lobby_buy_in_for_pdecision():
+    from schedule_controller.tournament_worker import remember_buy_ins
+    remember_buy_ins("BluffPokerTest", lobby_rows([row(buyInTotalChips=22)], NOW) + [{"id": "Tring", "table_type": "RING", "minimum": 5}])
+    client = SimpleNamespace(tables={})
+    session = SimpleNamespace(client=client, bots={}, platform="BluffPokerTest", policy={"Username": "someday87", "BotAccountId": 7})
+    t = BluffPokerTournaments(session, logging.getLogger("test"))
+    t.active[SNG] = {"format": "SNG", "table": "table-1"}
+    t.refresh_table_info(SNG)
+    assert client.tables["table-1"]["tournament"]["buy_in"] == 22
+    session.platform = "OtherPlatform"
+    t.refresh_table_info(SNG)
+    assert client.tables["table-1"]["tournament"]["buy_in"] is None

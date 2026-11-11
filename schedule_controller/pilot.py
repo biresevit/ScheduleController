@@ -794,6 +794,7 @@ class Pilot:
         if observer_tournaments is not None:
             rows=bluffpoker_tournament_rows if self.platform==BLUFFPOKER else tournament_lobby_rows
             self.tables.extend(rows(observer_tournaments,stamp))
+            remember_buy_ins(self.platform,self.tables)
         took=time.monotonic()-scan_started
         (log.warning if took>10 else log.debug)('Lobby scan of %s tables took %.1f s',len(self.tables),took)
         await self.reconcile_observed_entries()

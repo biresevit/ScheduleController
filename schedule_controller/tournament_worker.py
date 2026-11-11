@@ -24,6 +24,22 @@ def lobby_key(tournament_id) -> str:
     return f"T{tournament_id}"
 
 
+# Buy-in of every tournament the lobby scans saw, per (platform, lobby key), in table currency like the lobby rows.
+# PDecision compares it with the customer's minimum buy-in for card sharing and the solver strategy.
+BUY_INS: dict = {}
+
+
+def remember_buy_ins(platform, rows) -> None:
+    for row in rows or []:
+        if row.get("table_type") in ("SNG", "MTT") and row.get("minimum") is not None:
+            BUY_INS[(platform, str(row["id"]))] = row["minimum"]
+
+
+def buy_in(platform, tid) -> float | None:
+    value = BUY_INS.get((platform, lobby_key(tid)))
+    return float(value) if value is not None else None
+
+
 def tournament_id(lobby_table_id: str) -> int | str:
     """EvenBet tournament ids are numbers; other platforms' (BluffPoker UUIDs) stay text."""
     text = str(lobby_table_id).removeprefix("T")
@@ -320,7 +336,7 @@ class TournamentPlay:
             self.client.tables.setdefault(table, {"i": table, "g": 72})["tournament"] = {
                 "format": state.get("format"), "players_left": state.get("players_left"),
                 "players_total": state.get("players_total"), "places_paid": state.get("places_paid"),
-                "ante": state.get("ante")}
+                "ante": state.get("ante"), "buy_in": buy_in(getattr(self.session, "platform", None), tid)}
 
     async def follow(self, tid):
         """Standings for PDecision (players left / total, places paid) and rebuy/add-on chip amounts."""

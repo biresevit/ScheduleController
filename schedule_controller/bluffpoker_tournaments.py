@@ -20,7 +20,7 @@ from decimal import Decimal
 
 from poker_controller.sites import table_key
 
-from .tournament_worker import lobby_key
+from .tournament_worker import buy_in, lobby_key
 
 POLL_SECONDS = 5
 OUT = {"ELIMINATED", "WINNER", "CANCELLED"}
@@ -373,7 +373,7 @@ class BluffPokerTournaments:
             self.client.tables.setdefault(table, {"i": table})["tournament"] = {
                 "format": state.get("format"), "players_left": state.get("players_left"),
                 "players_total": state.get("players_total"), "places_paid": state.get("places_paid"),
-                "ante": None}
+                "ante": None, "buy_in": buy_in(getattr(self.session, "platform", None), tid)}
 
     def on_bust(self, table):
         """Busted at a tournament table: the hub marks the account ELIMINATED a moment later; the follower then
