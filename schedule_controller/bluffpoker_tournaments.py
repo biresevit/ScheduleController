@@ -30,6 +30,8 @@ OPEN = {"SCHEDULED", "REGISTERING"}
 # How long a finished tournament keeps being published as completed, so its lobby row stops showing it running.
 COMPLETED_HOURS = 24
 REGISTERED = {"REGISTERED", "CHECKED_IN", "PLAYING"}
+# Hub refusal (409) of a register call for a tournament the account is already registered for.
+ALREADY_REGISTERED = "ALREADY_REGISTERED"
 
 
 def parse_time(value) -> datetime | None:
@@ -112,7 +114,15 @@ class BluffPokerTournaments:
 
     async def register(self, tid, fmt: str, entry_idx: int = 0, *, registration_only=False) -> dict:
         # No idempotency on BluffPoker's register: a failure is reported, never retried blindly.
-        reply = await self.client.register_tournament(str(tid))
+        try:
+            reply = await self.client.register_tournament(str(tid))
+        except Exception as exc:
+            # The account already holds this registration (an earlier attempt went through, or another
+            # session registered it): that is the outcome we wanted, so carry on as registered.
+            if getattr(exc, "code", None) != ALREADY_REGISTERED:
+                raise
+            self.log.info("ALREADY REGISTERED %s %s=%s, continuing as registered", self.policy["Username"], fmt, tid)
+            reply = {"success": True, "already_registered": True}
         if not registration_only:self.state_for(tid, fmt)["format"] = fmt
         self.log.info("REGISTERED %s %s=%s", self.policy["Username"], fmt, tid)
         return reply

@@ -168,3 +168,39 @@ def test_seated_rebuy_and_addon_are_decided_once_per_offer(monkeypatch):
     asyncio.run(run())
     assert client.tournament_rebuy.await_count == 1 and client.tournament_addon.await_count == 1
     assert events == ["seated", "rebuy", "addon"]
+
+
+class AlreadyRegistered(Exception):
+    terminal, code, status = False, "ALREADY_REGISTERED", 409
+
+
+def test_already_registered_counts_as_a_successful_registration():
+    for fmt, only in (("MTT", True), ("MTT", False), ("SNG", False)):
+        client = SimpleNamespace(tables={}, register_tournament=AsyncMock(side_effect=AlreadyRegistered()),
+                                 tournament_state=AsyncMock(return_value={"status": "REGISTERING", "myRegistrationStatus": "REGISTERED"}))
+        session = SimpleNamespace(client=client, bots={}, policy={"Username": "someday87", "BotAccountId": 7})
+        t = BluffPokerTournaments(session, logging.getLogger("test"))
+
+        async def run():
+            reply = await t.register("dc4aacf1", fmt, registration_only=only)
+            followed = "dc4aacf1" in t.active
+            for state in list(t.active.values()):
+                state["poller"].cancel()
+            return reply, followed
+        reply, followed = asyncio.run(run())
+        assert reply["success"] and reply["already_registered"], fmt
+        assert followed is not only, (fmt, only)
+        assert client.register_tournament.await_count == 1
+
+
+def test_other_registration_refusals_still_fail():
+    client = SimpleNamespace(tables={}, register_tournament=AsyncMock(side_effect=Refused()))
+    session = SimpleNamespace(client=client, bots={}, policy={"Username": "someday87", "BotAccountId": 7})
+    t = BluffPokerTournaments(session, logging.getLogger("test"))
+    try:
+        asyncio.run(t.register("dc4aacf1", "SNG"))
+    except Refused:
+        pass
+    else:
+        raise AssertionError("a closed registration must not count as registered")
+    assert not t.active
