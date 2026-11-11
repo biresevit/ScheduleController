@@ -38,6 +38,25 @@ log=logging.getLogger(__name__)
 TABLE_IDS={128197714,128016534,128048285,128048284,128053412,
            113891676,88548202,128053413,128094710}
 
+# The scheduler expires a PC whose heartbeat is 180 s old (scheduler.ExpireOfflineMachines): it closes the PC's entries
+# and sessions and fences its epoch. A worker stuck on a database call played on regardless: its bots kept their seats
+# unseen, and every seat of the site without an open entry stopped all ring joins of the site (PC 1023, 2026-11-11).
+# A worker whose publishes have not reached the database for FENCE_SECONDS stops itself before that deadline.
+FENCE_SECONDS=120
+# The worker loop publishes (its heartbeat) at least this often, whatever the lobby refresh interval.
+HEARTBEAT_SECONDS=30
+WATCH_SECONDS=5
+# A fenced worker's last tries to leave its ring tables: the current hand first, then at once.
+FENCE_FINISH_SECONDS=60
+FENCE_LEAVE_SECONDS=15
+# How long a fenced worker waits for its cancelled jobs; one stuck behind the database call is abandoned.
+FENCE_JOBS_SECONDS=10
+
+
+class WorkerFenced(RuntimeError):
+    """The worker stopped because its heartbeat no longer reached the database; run_sites starts it again."""
+
+
 def now(): return datetime.now(timezone.utc)
 def ring_table(entry):
     """The table key of a ring entry (EvenBet: int, BluffPoker: UUID text); None for a tournament entry ('T' + id)."""
@@ -595,6 +614,8 @@ class Pilot:
         self.publish_lock=asyncio.Lock()
         self.client_lock=asyncio.Lock()
         self.execution_locks={}
+        self.last_heartbeat=time.monotonic()  # when a publish last reached the database
+        self.fenced=None  # seconds without a heartbeat when the watchdog stopped the worker
 
     async def configuration(self):
         self.config=await asyncio.to_thread(self.repo.configuration)
@@ -846,6 +867,8 @@ class Pilot:
         self.accounting={aid:(stamp,n) for aid,n in counts.items()}
 
     async def publish(self,ready=True):
+        if getattr(self,'fenced',None) is not None:
+            return  # a stopped worker's jobs must not write after the worker started next
         async with self.publish_lock:
             self.accrue()
             spans=copy.deepcopy(self.intervals)
@@ -866,7 +889,8 @@ class Pilot:
             await asyncio.to_thread(self.repo.publish,tables,seats,
                 entries,sessions,spans,ready=ready,
                 next_join=self.next_join,next_leave=self.next_leave,last_plan=self.last_plan)
-            took=time.monotonic()-started
+            self.last_heartbeat=time.monotonic()
+            took=self.last_heartbeat-started
             if fresh_lobby:self.published_tables=self.tables
             # The scheduler treats tables older than ~45 s and heartbeats older than 60 s as stale.
             (log.warning if took>10 else log.debug)('Published %s lobby tables, %s entries, %s sessions and %s intervals in %.1f s',
@@ -1267,7 +1291,7 @@ class Pilot:
         await self.configuration()
         await self.decision.require_hand_history(self.platform)
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
-        chat_task=manual_task=live_task=None
+        chat_task=manual_task=live_task=watch_task=None
         try:
             # Holding the PC's worker lock proves the worker behind a fresh heartbeat has exited: a crashed worker
             # used to block its replacement for 90 s, and BluffPoker gives up a disconnected seat after ~29 s.
@@ -1280,6 +1304,7 @@ class Pilot:
             self.args.ready=True  # read by run_sites: a run that got ready restarts quickly after a failure
             log.info('Cloud worker ready after reconciling %s prior entries; entry capacity is enforced by the Azure scheduler',len(recovery))
             await self.refresh();await self.publish()
+            watch_task=asyncio.create_task(self.watch_heartbeat(asyncio.current_task()))
             from .chat_worker import run_chat
             chat_task=asyncio.create_task(run_chat(self))
             from .manual_worker import run_manual
@@ -1292,6 +1317,8 @@ class Pilot:
                 if tick>=next_refresh:
                     await self.refresh();await self.publish()
                     next_refresh=tick+self.config['site']['LobbyRefreshSeconds']
+                elif tick-self.last_heartbeat>=HEARTBEAT_SECONDS:
+                    await self.publish()
                 if tick>=next_claim:
                     claimed=await asyncio.to_thread(self.repo.claim_due,10)
                     for row in claimed:
@@ -1305,7 +1332,15 @@ class Pilot:
                         log.exception('Could not publish machine resource telemetry')
                     next_telemetry=tick+300
                 await asyncio.sleep(.25)
+        except asyncio.CancelledError:
+            if getattr(self,'fenced',None) is None:raise
+            # The watchdog's cancel, not a shutdown: run_sites starts the worker again.
+            asyncio.current_task().uncancel()
+            raise WorkerFenced(f'No heartbeat reached the database for {self.fenced:.0f} s') from None
         finally:
+            if watch_task:
+                watch_task.cancel()
+                await asyncio.gather(watch_task,return_exceptions=True)
             if live_task:
                 live_task.cancel()
                 await asyncio.gather(live_task,return_exceptions=True)
@@ -1315,8 +1350,10 @@ class Pilot:
             if chat_task:
                 chat_task.cancel()
                 await asyncio.gather(chat_task,return_exceptions=True)
-            if self.started:
-                try: await asyncio.to_thread(self.repo.stop_cloud_worker)
+            if self.started and getattr(self,'fenced',None) is not None:
+                await self.stop_fenced()
+            elif self.started:
+                try: await asyncio.wait_for(asyncio.to_thread(self.repo.stop_cloud_worker),30)
                 except Exception: log.exception('Could not mark cloud worker offline')
                 await asyncio.gather(*self.jobs.values(),return_exceptions=True)
                 if getattr(self.args,'leave_on_exit',False):
@@ -1341,6 +1378,64 @@ class Pilot:
         # worker stops one site's Pilot when the site is taken off the PC.
         event=getattr(self.args,'stop_event',None)
         return bool(event and event.is_set()) or Path(getattr(self.args,'stop_file',None) or self.output/'stop').exists()
+
+    async def watch_heartbeat(self,main,fence=None,every=None):
+        """Cancels `main` (run_cloud_worker) once no publish has reached the database for `fence` seconds.
+
+        Bots play on their own tasks, so a worker loop stuck on a database call (a publish that never returns keeps
+        publish_lock, and every later publish and leave waits behind it) went on playing seats nobody sees."""
+        fence=fence or FENCE_SECONDS;every=every or WATCH_SECONDS
+        while True:
+            await asyncio.sleep(every)
+            silent=time.monotonic()-self.last_heartbeat
+            if silent>=fence:
+                self.fenced=silent
+                log.error('No heartbeat reached the database for %.0f s; the scheduler expires this PC at 180 s and '
+                          'stops counting its seats. Stopping this worker.',silent)
+                main.cancel()
+                return
+
+    async def stop_fenced(self):
+        """Shutdown of a worker stopped by watch_heartbeat.
+
+        Its jobs may wait on the stuck database call, so they are cancelled instead of awaited. If a new connection
+        finds this worker still owning its entries, the seats are kept: the clients disconnect, and the worker started
+        next reconciles them while BluffPoker still holds them (~29 s), before the scheduler's 180 s expiry. Otherwise
+        the scheduler closes, or has closed, the entries without this worker, and its ring tables are left."""
+        jobs=[job for job in self.jobs.values() if not job.done()]
+        for job in jobs:job.cancel()
+        if jobs:await asyncio.wait(jobs,timeout=FENCE_JOBS_SECONDS)
+        try:
+            owned=await asyncio.wait_for(asyncio.to_thread(self.repo.owns_machine),20)
+        except Exception as exc:
+            owned=False
+            log.warning('The database cannot be reached on a new connection either: %s',str(exc) or type(exc).__name__)
+        if owned:
+            log.warning('The database answers on a new connection and this worker still owns its entries; '
+                        'restarting with the seats kept for reconciliation')
+        else:
+            log.warning('Leaving every ring table: the scheduler no longer counts this worker\'s seats')
+            await self.leave_unreported()
+
+    async def leave_unreported(self):
+        """Leaves every ring table of the worker's accounts, the current hand first. Tournament seats are not left
+        (that would forfeit the tournament); they are disconnected with the clients."""
+        async def leave(c,tid):
+            name=c.policy['Username']
+            try:
+                await asyncio.wait_for(c.remove(tid,finish=True),FENCE_FINISH_SECONDS)
+            except Exception as exc:
+                log.warning('Could not finish the hand of %s / %s (%s); leaving at once',name,tid,str(exc) or type(exc).__name__)
+                try:
+                    await asyncio.wait_for(c.client.leave(tid),FENCE_LEAVE_SECONDS)
+                except Exception as exc:
+                    log.error('Could not leave %s / %s: %s',name,tid,str(exc) or type(exc).__name__)
+                    return
+            log.info('LEFT %s table=%s (heartbeat lost)',name,tid)
+        def ring_tables(c):
+            tournament=getattr(getattr(c,'tourneys',None),'by_table',())
+            return [tid for tid in list(c.workers) if tid not in tournament]
+        await asyncio.gather(*(leave(c,tid) for c in list(self.clients.values()) for tid in ring_tables(c)))
 
     async def reconcile_cloud_entries(self,rows):
         """Prove old-epoch seats against the poker site before making this worker ready.

@@ -242,11 +242,16 @@ def _input_size(value):
 _local=threading.local()
 CONNECTION_IDLE_SECONDS=240   # below Azure SQL's 30-minute idle cut, so a reused link is live
 CONNECTION_MAX_AGE_SECONDS=1800
+# pyodbc's connect timeout covers only the login; without a query timeout a statement blocked on the server waited
+# forever, and the worker loop with it. Below the worker's FENCE_SECONDS (pilot.py), so a stuck statement fails and
+# the worker restarts and reconciles its seats before its own watchdog has to stop it.
+QUERY_TIMEOUT_SECONDS=90
 
 
 def _open_connection():
     import pyodbc
     conn=pyodbc.connect(connection_string(),autocommit=False,timeout=15)
+    conn.timeout=QUERY_TIMEOUT_SECONDS
     try:
         cursor=conn.cursor()
         # Session settings are set once and never changed by worker SQL, so every transaction
@@ -295,6 +300,7 @@ def machine_sites(machine_id):
     """The poker sites the PC's worker runs: those the PC plays, and a site taken off it until its tables are left."""
     import pyodbc
     conn=pyodbc.connect(connection_string(),timeout=15)
+    conn.timeout=30
     try:
         rows=conn.cursor().execute("""SELECT a.SiteId FROM scheduler.MachineAssignment a
             JOIN dbo.CustomerMachine m ON m.MachineId=a.MachineId AND m.IsActive=1
@@ -326,6 +332,19 @@ class Repository(ChatRepository,ManualRepository):
             if row and (row['EndReason']=='join_failure_limit' or row['Failures']>=2):
                 return 'join_failure_limit'
             return None if row and row['IsOpen'] and row['NotEnded'] else 'session_ended'
+
+    def owns_machine(self):
+        """True while this worker's epoch still owns the machine, i.e. the scheduler has not expired it.
+
+        Asked on a new connection (not the thread's cached one) by a worker whose publishes stopped arriving."""
+        import pyodbc
+        conn=pyodbc.connect(connection_string(),timeout=15)
+        conn.timeout=15
+        try:
+            row=conn.cursor().execute("SELECT WorkerEpoch FROM scheduler.MachineAssignment WHERE SiteId=? AND MachineId=?",
+                                      self.site_id,self.machine_id).fetchone()
+        finally:conn.close()
+        return bool(row) and str(row[0]).lower()==str(self.epoch).lower()
 
     @retry_deadlocks
     def enforce_join_failure_limit(self):
