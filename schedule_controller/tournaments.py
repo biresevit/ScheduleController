@@ -111,10 +111,10 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
 
     ready = {m.id: m for m in machines if m.enabled and m.ready and not m.maintenance and m.capacity > 0
              and fresh(m.heartbeat, heartbeat_seconds)}
-    account_count = Counter(e.account for e in entries)
+    account_count = Counter(e.account for e in entries if not e.parked)
     # PC capacity: every open entry except MTT registrations whose tournament is still far away (capacity_entries).
     machine_count = Counter(e.machine for e in (entries if capacity_entries is None else capacity_entries))
-    owners = {a.id: {e.machine for e in entries if e.account == a.id} | ({a.owner_machine} if a.owner_machine is not None else set())
+    owners = {a.id: {e.machine for e in entries if e.account == a.id and not e.parked} | ({a.owner_machine} if a.owner_machine is not None else set())
               for a in accounts}
     registered = {(e.account, e.table) for e in entries}
     # Open entries of this format per account (registered or playing), against the account's limit.

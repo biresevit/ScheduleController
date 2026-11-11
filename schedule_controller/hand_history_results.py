@@ -9,7 +9,7 @@ import os
 import re
 
 from .database import connection_string
-from .hand_settlement import balance, correct_winnings
+from .hand_settlement import HEADER, balance, correct_winnings
 
 log = logging.getLogger(__name__)
 # 2: showdowns re-settled from the cards (correct_winnings); older results are reprocessed.
@@ -25,7 +25,7 @@ FOLD = re.compile(r"^(?P<player>.+?) folds\s*$", re.I)
 def player_results(text: str) -> list[dict]:
     """Return every seated player's invested, won and net amounts in one pass."""
     text = correct_winnings(text)
-    sections = re.split(r"\*{5} Hand History for Game \d+ \*{5}", text)
+    sections = HEADER.split(text)
     if len(sections) == 1:
         raise ValueError("Unsupported hand-history format")
     combined: dict[str, dict] = {}
@@ -134,7 +134,7 @@ class HandHistoryProcessor:
             placeholders = ",".join("?" for _ in site_ids)
             c = conn.cursor().execute(f"""SELECT p.SiteId,b.BotAccountId,b.Username
                 FROM scheduler.AccountPolicy p JOIN dbo.BotAccount b ON b.BotAccountId=p.BotAccountId
-                WHERE p.SiteId IN ({placeholders})""", *site_ids)
+                WHERE p.SiteId IN ({placeholders}) AND b.IsActive=1 AND p.IsSynthetic=0""", *site_ids)
             result: dict[int, dict[str, int]] = defaultdict(dict)
             for site_id, account_id, username in c.fetchall():
                 result[int(site_id)][str(username).casefold()] = int(account_id)

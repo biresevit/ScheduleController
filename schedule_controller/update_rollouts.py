@@ -4,6 +4,7 @@ from math import ceil
 from .rules import Window,target_at
 
 ACTIVE=('preparing','draining','forcing','reconciling','stopping','installing','verifying','resuming')
+UPDATE_IDLE_TIMEOUT = timedelta(hours=24)
 
 
 def recovery_target(original,target,other_entries):
@@ -149,9 +150,9 @@ def advance(db,cid,rollout,task,stamp,serial):
     elif status=='resuming':
         finish_recovery(db,task,rollout,stamp)
     # Failed or stalled updates never silently advance to the next PC.
-    if status in ACTIVE and task['UpdatedUtc'] and task['UpdatedUtc']<now-timedelta(hours=4):
+    if status in ACTIVE and task['UpdatedUtc'] and task['UpdatedUtc']<now-UPDATE_IDLE_TIMEOUT:
         db.execute("UPDATE scheduler.UpdateRollout SET Status='paused',UpdatedUtc=? WHERE RolloutId=?",now,rid)
-        db.execute("UPDATE scheduler.MachineUpdateTask SET Detail='Update is taking longer than four hours. Rollout paused for review.' WHERE TaskId=?",tid)
+        db.execute("UPDATE scheduler.MachineUpdateTask SET Detail='Update has made no progress for 24 hours. Rollout paused for review.' WHERE TaskId=?",tid)
 
 
 def tick_idle_installations(db,customer_id,stamp):
@@ -204,9 +205,9 @@ def tick_idle_installations(db,customer_id,stamp):
                     db.execute("UPDATE scheduler.MachineUpdateTask SET Status='stopping',UpdatedUtc=?,Detail='No open entries or sessions. Installing applications.' WHERE TaskId=?",now,tid)
             elif status=='resuming':
                 finish_recovery(db,task,rollout,stamp)
-            if independent and status in ACTIVE and task['UpdatedUtc'] and task['UpdatedUtc']<now-timedelta(hours=4):
+            if independent and status in ACTIVE and task['UpdatedUtc'] and task['UpdatedUtc']<now-UPDATE_IDLE_TIMEOUT:
                 db.execute("UPDATE scheduler.UpdateRollout SET Status='paused',UpdatedUtc=? WHERE RolloutId=?",now,rid)
-                db.execute("UPDATE scheduler.MachineUpdateTask SET Detail='Update is taking longer than four hours. Rollout paused for review.' WHERE TaskId=?",tid)
+                db.execute("UPDATE scheduler.MachineUpdateTask SET Detail='Update has made no progress for 24 hours. Rollout paused for review.' WHERE TaskId=?",tid)
 
 
 def finish_recovery(db,task,rollout,stamp):

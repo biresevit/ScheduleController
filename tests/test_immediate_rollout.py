@@ -2,8 +2,18 @@
 from datetime import datetime, timedelta, timezone
 
 from schedule_controller.update_rollouts import OLD_AGENT, finish_recovery, tick_rollouts
+import pytest
 
 NOW = datetime.now(timezone.utc)
+
+
+@pytest.mark.parametrize('hours,should_pause', [(5, False), (23, False), (25, True)])
+def test_updates_allow_24_hours_without_progress(hours, should_pause):
+    pending = task(1, 'stopping') | {'UpdatedUtc': (NOW - timedelta(hours=hours)).replace(tzinfo=None)}
+    db = Database([pending])
+    tick_rollouts(db, NOW)
+    pauses = [sql for sql, _ in db.statements if "SET Status='paused'" in sql]
+    assert bool(pauses) is should_pause
 
 
 def task(mid, status='queued', version='1.0.13', **fields):

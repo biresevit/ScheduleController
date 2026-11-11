@@ -35,6 +35,14 @@ def test_scheduled_sngs_take_registrations_and_finished_tournaments_publish_as_c
     assert rows[0]["occupied"] == 3
 
 
+def test_running_mtt_is_open_only_during_explicit_late_registration():
+    rows = lobby_rows([row(id="late", type="MTT", status="RUNNING", lateRegOpen=True),
+                       row(id="closed", type="MTT", status="RUNNING", lateRegOpen=False),
+                       row(id="unknown", type="MTT", status="RUNNING", lateRegOpen=None)], NOW)
+    assert [(r["id"], r["open"], r["tournament_state"]) for r in rows] == [
+        ("Tlate", True, "running"), ("Tclosed", False, "running"), ("Tunknown", False, "running")]
+
+
 def test_follower_seats_moves_and_finishes_the_account():
     events, attached, detached = [], [], []
     client = SimpleNamespace(tables={}, join=AsyncMock(), forget_table=AsyncMock(), register_tournament=AsyncMock(return_value={"ok": True}))

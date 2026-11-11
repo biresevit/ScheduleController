@@ -19,7 +19,7 @@ from decimal import Decimal
 from itertools import combinations
 import re
 
-HEADER = re.compile(r"^\*{5} Hand History for Game \d+ \*{5}\r?$", re.M)
+HEADER = re.compile(r"^\*{5} Hand History for Game [A-Za-z0-9_-]+ \*{5}\r?$", re.M)
 MONEY = r"(?P<amount>\d+(?:\.\d+)?)"
 SEAT = re.compile(r"^Seat\s+\d+:\s+(?P<player>.*?)\s+\(\s*\$[\d.]+\s+USD\s*\)", re.I)
 PUT = re.compile(r"^(?P<player>.+?) (?:posts (?:small blind|big blind|ante)|calls|bets|raises) \[\$" + MONEY + r" USD\]", re.I)
@@ -208,8 +208,15 @@ def balance(contributions: dict, prizes: dict, seated: set, folded: set, big_bli
     return contributions, prizes
 
 
+def normalize_history(text: str) -> str:
+    """Normalize currency decimals and doubled CRs from older localized clients."""
+    text = text.replace("\r\r\n", "\r\n")
+    return re.sub(r"\$(-?\d+),(\d+)", r"$\1.\2", text)
+
+
 def correct_winnings(text: str) -> str:
     """Return the hand history with each settleable showdown's "wins" lines recomputed."""
+    text = normalize_history(text)
     starts = [m.start() for m in HEADER.finditer(text)]
     if not starts:
         return text

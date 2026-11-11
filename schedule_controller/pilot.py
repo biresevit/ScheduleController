@@ -674,7 +674,7 @@ class Pilot:
 
     async def close_session_if_idle(self,aid):
         """Log out after the account's final planned or active entry closes."""
-        if any(e['account']==aid and e['status'] not in ('closed','failed') for e in self.entries.values()):
+        if any(e['account']==aid and e['status'] not in ('closed','failed') and not e.get('parked') for e in self.entries.values()):
             return False
         async with self.client_lock:
             session=self.clients.pop(aid,None)
@@ -683,6 +683,20 @@ class Pilot:
             await session.close()
         log.info('Logout confirmed after final table: %s',self.policies[aid]['Username'])
         return True
+
+    async def park_tournament_registration(self,e):
+        await asyncio.to_thread(self.repo.park_registered_entry,e['id'])
+        e.update(parked=True,session=None,status='joining',play_table=None)
+        client=self.clients.get(e['account'])
+        if client:client.tourneys.park_registration(tournament_id(e['table']))
+        log.info('PARKED future MTT registration %s / %s; no playing session',self.policies[e['account']]['Username'],e['table'])
+
+    def close_empty_registration_return(self,aid,session_id,cmd,reason):
+        if not (cmd.get('payload') or {}).get('new_session'):return
+        if any(e['account']==aid and not e.get('parked') and e['status'] not in ('closed','failed') for e in self.entries.values()):return
+        for session in self.sessions:
+            if str(session['id'])==str(session_id) and not session.get('closed'):
+                session.update(closed=max(now(),session['start']),reason=reason)
 
     async def refresh(self):
         scan_started=time.monotonic()
@@ -887,7 +901,10 @@ class Pilot:
                 tick=time.monotonic()
                 if tick>=next_requests:
                     requests=await asyncio.to_thread(self.repo.live_view_requests)
-                    next_requests=tick+1
+                    next_requests=tick+(1 if requests else 3)
+                    # Manual control exists only under a live view; the manual loop reads this
+                    # instead of polling the database while nobody is watching.
+                    self.live_requests_seen=time.monotonic() if requests else 0.0
                     live={str(r['RequestId']) for r in requests}
                     published={k:v for k,v in published.items() if k in live}
                 for request in requests:
@@ -1097,6 +1114,8 @@ class Pilot:
 
     async def block_ended_session(self,e,cmd):
         if not getattr(self,'cloud',False):return False
+        if (cmd.get('payload') or {}).get('registration_only') or (cmd.get('payload') or {}).get('resume_registration'):
+            return False
         reason=await asyncio.to_thread(self.repo.join_session_block,e.get('session'))
         if not reason:return False
         e.update(status='closed',closed=now())
@@ -1137,34 +1156,58 @@ class Pilot:
                 cmd.update(status='succeeded',result='tournament_kept');await self.publish();return
             return await self.unregister_tournament(e,cmd,username)
         cmd['status']='claimed';e['status']='joining';phase='persisting task intent'
+        return_session=e.get('session')
         try:
             await self.publish()
             if await self.block_ended_session(e,cmd):return
-            if not await asyncio.to_thread(self.repo.authorize_join,cmd['version']):
-                e.update(status='closed',closed=now());cmd.update(status='cancelled',result='configuration_changed');return
+            returning=(cmd.get('payload') or {}).get('resume_registration')
+            allowed=await asyncio.to_thread(self.repo.authorize_join,cmd['version'],True) if returning else await asyncio.to_thread(self.repo.authorize_join,cmd['version'])
+            if not allowed:
+                if returning:await self.park_tournament_registration(e)
+                else:e.update(status='closed',closed=now())
+                if returning:self.close_empty_registration_return(e['account'],return_session,cmd,'registration_return_cancelled')
+                cmd.update(status='cancelled',result='configuration_changed');return
             phase='checking PDecision readiness'
             await self.decision.require_hand_history(self.platform)
             phase='logging in'
             c=await self.session_for(e['account'])
             if c.failures:raise RuntimeError('Account connection is unhealthy')
             row=next((t for t in self.tables if str(t['id'])==str(e['table'])),{})
-            fmt=row.get('table_type') or 'SNG'
+            fmt=(cmd.get('payload') or {}).get('format') or row.get('table_type') or 'SNG'
             phase='registering for the tournament'
-            await c.tourneys.register(tournament_id(e['table']),fmt)
+            payload=cmd.get('payload') or {}
+            if payload.get('resume_registration'):
+                if not await c.tourneys.resume_registration(tournament_id(e['table']),fmt):
+                    e.update(status='closed',closed=now(),parked=False)
+                    cmd.update(status='succeeded',result='registration_gone')
+                    self.close_empty_registration_return(e['account'],return_session,cmd,'registration_gone')
+                    return
+            else:
+                from .mtt_sessions import waits_for_mtt
+                only=fmt=='MTT' and (payload.get('registration_only') or waits_for_mtt(row,now()))
+                if only:await c.tourneys.register(tournament_id(e['table']),fmt,registration_only=True)
+                else:await c.tourneys.register(tournament_id(e['table']),fmt)
             session=next((s for s in reversed(self.sessions) if s['account']==e['account'] and not s.get('closed')),None)
             e.update(confirmed=now(),session=e.get('session') or (session and session['id']))
             cmd['status']='succeeded'
+            from .mtt_sessions import waits_for_mtt
+            if fmt=='MTT' and (payload.get('registration_only') or waits_for_mtt(row,now())):
+                await self.park_tournament_registration(e)
             log.info('REGISTERED %s %s %s',username,fmt,e['table'])
         except Exception as exc:
             self.errors.append({'account':username,'table':e['table'],'kind':'register','error':type(exc).__name__,'at':now().isoformat()})
             log.exception('Tournament registration failed: %s / %s',username,e['table'])
-            e.update(status='failed',closed=now())
+            if (cmd.get('payload') or {}).get('resume_registration'):
+                await self.park_tournament_registration(e)
+                self.close_empty_registration_return(e['account'],return_session,cmd,'registration_return_failed')
+            else:e.update(status='failed',closed=now())
             cmd.update(status='failed',result=type(exc).__name__,result_text=failure_description(exc,'Registration',username,e['table'],phase))
             try:await self.close_session_if_idle(e['account'])
             except Exception:log.exception('Could not close idle account %s',username)
         finally:
             try:
                 await self.publish()
+                if e.get('parked') or e['status']=='closed':await self.close_session_if_idle(e['account'])
                 if cmd['status']=='failed':await self.after_join_failure(e)
             except Exception:log.exception('Could not persist tournament registration')
 
@@ -1208,6 +1251,8 @@ class Pilot:
                 'start':aware(row['StartedUtc']),'end':aware(row['PlannedEndUtc'])})
         try:payload=json.loads(row.get('PayloadJson') or '{}')
         except ValueError:payload={}
+        if payload.get('resume_registration'):
+            e.update(parked=False,session=str(row['SessionId']),status=row['EntryStatus'])
         cmd={'id':cid,'kind':row['Kind'],'status':'claimed','due':aware(row['NotBeforeUtc']),
              'version':row['ConfigVersion'],'payload':payload if isinstance(payload,dict) else {}}
         e['commands'].append(cmd)
@@ -1320,6 +1365,23 @@ class Pilot:
             raise failed[0]
 
     async def reconcile_account(self,aid,entries,lobby_for):
+        from .mtt_sessions import waits_for_mtt
+        live=[]
+        for row in entries:
+            table={'table_type':row.get('TableType'),'tournament_state':row.get('TournamentState'),
+                   'start':aware(row.get('StartUtc'))}
+            expired = aware(row.get('PlannedEndUtc'))
+            waiting = waits_for_mtt(table,now()) or (table['table_type']=='MTT' and table['tournament_state']=='registering'
+                                                    and expired is not None and expired<=now())
+            confirmed=row.get('LastConfirmedUtc') or row.get('RegistrationConfirmed')
+            if row.get('IsParked') or (confirmed and row['Status'] in ('joining','uncertain') and not row.get('PlayTableId') and waiting):
+                await asyncio.to_thread(self.repo.park_registered_entry,row['EntryId'])
+                self.entries[str(row['EntryId'])]={'id':str(row['EntryId']),'account':aid,'table':str(row['TableId']),
+                    'status':'joining','created':aware(row['CreatedUtc']),'confirmed':aware(row.get('LastConfirmedUtc')),
+                    'session':None,'parked':True,'commands':[]}
+            else:live.append(row)
+        if not live:return
+        entries=live
         session=await self.session_for(aid)
         lobby=await lobby_for(session)
         for row in entries:
@@ -1331,7 +1393,7 @@ class Pilot:
                 self.entries[eid]={'id':eid,'account':aid,'table':key,'status':status,'buy_in':row['BuyInAmount'],
                     'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),'commands':[],
                     'session':str(row['SessionId']) if row.get('SessionId') else None}
-                session.tourneys.active.setdefault(tournament_id(key),{'format':'SNG','entry_idx':0,'table':None,'addon_decided':False})
+                session.tourneys.active.setdefault(tournament_id(key),{'format':row.get('TableType') or 'SNG','entry_idx':0,'table':None,'addon_decided':False})
                 try:await session.tourneys.resume()
                 except Exception as exc:log.warning('Tournament resume failed for %s / %s: %s',row['Username'],key,exc)
                 # A registration EvenBet no longer holds (unregistered or cancelled) and that has no

@@ -110,10 +110,10 @@ class BluffPokerTournaments:
             state["poller"] = self.spawn(self.follow(str(tid)), "standings")
         return state
 
-    async def register(self, tid, fmt: str, entry_idx: int = 0) -> dict:
+    async def register(self, tid, fmt: str, entry_idx: int = 0, *, registration_only=False) -> dict:
         # No idempotency on BluffPoker's register: a failure is reported, never retried blindly.
         reply = await self.client.register_tournament(str(tid))
-        self.state_for(tid, fmt)["format"] = fmt
+        if not registration_only:self.state_for(tid, fmt)["format"] = fmt
         self.log.info("REGISTERED %s %s=%s", self.policy["Username"], fmt, tid)
         return reply
 
@@ -128,6 +128,17 @@ class BluffPokerTournaments:
 
     async def unregister(self, tid) -> None:
         raise ValueError("Unregistering is not available on BluffPoker yet")
+
+    async def resume_registration(self,tid,fmt):
+        tid=str(tid)
+        reply=await self.client.tournament_state(tid)
+        if reply.get('myRegistrationStatus') not in REGISTERED:return False
+        self.state_for(tid,fmt)['format']=fmt
+        await self.apply(tid,reply)
+        return True
+
+    def park_registration(self,tid):
+        self.forget(tid)
 
     def forget(self, tid):
         state = self.active.pop(str(tid), None) or {}

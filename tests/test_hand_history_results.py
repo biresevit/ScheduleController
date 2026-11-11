@@ -36,3 +36,34 @@ def test_combined_history_accumulates_each_player():
         HAND + HAND.replace("162968912", "162968913"))}
     assert rows["monica"]["net"] == Decimal(28)
     assert rows["demoOpponent"]["net"] == Decimal(-28)
+
+
+@pytest.mark.parametrize("hand_id", [
+    "76da2b9c-881c-4506-a063-16642d54da08",
+    "76da2b9c-881c-4506-a063-16642d54da08-27",
+    "76da2b9c-881c-4506-a063-16642d",
+])
+def test_bluffpoker_ids_preserve_settlement_and_mixed_history_totals(hand_id):
+    bluff = HAND.replace("162968912", hand_id).replace("\n", "\r\n")
+    assert player_results(bluff) == player_results(HAND)
+    rows = {r["player_name"]: r for r in player_results(HAND + bluff)}
+    assert rows["monica"]["net"] == Decimal(28)
+    assert rows["demoOpponent"]["net"] == Decimal(-28)
+
+
+def test_localized_bluffpoker_currency_and_doubled_carriage_returns():
+    hand = """***** Hand History for Game 6ab84bec-ddf7-4f60-a11a-9502d1e13ef0-753 *****
+$0,50/$1,00 USD fastforward NL Texas Hold'em
+Seat 1: player3 ( $100 USD )
+Seat 5: moody ( $96,87 USD )
+Seat 6: josh ( $208,57 USD )
+moody posts small blind [$0.50 USD]
+josh posts big blind [$1 USD]
+player3 folds
+moody folds
+josh wins $1,5 USD
+""".replace("\n", "\r\r\n")
+    rows = {r["player_name"]: r for r in player_results(hand)}
+    assert rows["moody"]["net"] == Decimal("-0.5")
+    assert rows["josh"]["net"] == Decimal("0.5")
+    assert rows["player3"]["net"] == 0

@@ -27,17 +27,19 @@ async def run_chat(pilot):
             for aid,session in list(pilot.clients.items()):
                 client=session.client
                 if client.chat_overflow:
-                    log.warning('Chat buffer overflow for account %s; requesting history',aid)
+                    if getattr(client,'supports_chat_history',True):
+                        log.warning('Chat buffer overflow for account %s; requesting history',aid)
+                    else:
+                        log.warning('Live chat buffer overflow for account %s; dropped messages cannot be recovered (no server history)',aid)
                     client.chat_overflow=False
                     watched={key for key in watched if key[0]!=id(client)}
                 while not client.chat_events.empty() and len(pending)<500:
                     message=client.chat_events.get_nowait()
-                    reader=readers.get(int(message['table_id']))
+                    reader=readers.get(table_key(message['table_id']))
                     if reader and reader[0]==aid:
                         pending.append(message)
-            await asyncio.to_thread(pilot.repo.chat_exchange,pending)
+            command=await asyncio.to_thread(pilot.repo.chat_exchange,pending,claim=True)
             pending.clear()
-            command=await asyncio.to_thread(pilot.repo.claim_chat)
             if command:
                 session=pilot.clients.get(command['BotAccountId'])
                 try:
@@ -55,4 +57,4 @@ async def run_chat(pilot):
             raise
         except Exception:
             log.exception('Chat synchronization failed')
-        await asyncio.sleep(2)
+        await asyncio.sleep(3)

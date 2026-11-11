@@ -116,13 +116,83 @@ def test_registration_success_and_refusal():
         ok = {"RegisterInTournament": {"t": "RegisterInTournamentsResponse", "success": True}}
         session, t, _ = play(ok)
         await t.register(123, "SNG")
-        topic, fields = session.client.connection.sent[0]
+        topic, fields = next(r for r in session.client.connection.sent if r[0] == 'RegisterInTournament')
         assert topic == "RegisterInTournament" and fields["tournamentId"] == 123 and fields["playerEntryIdx"] == 0
         assert t.active[123]["format"] == "SNG"
         await t.close()
         session, t, _ = play({"RegisterInTournament": {"success": False, "text": "Not enough money"}})
         with pytest.raises(ValueError, match="Not enough money"):
             await t.register(5, "MTT")
+    run(go())
+
+
+@pytest.mark.parametrize('seated', [False, True])
+def test_existing_registration_is_adopted_without_registering_again(seated):
+    async def go():
+        session, t, events = play({'GetPlayerTournaments': {'tournaments': [123]}})
+        if seated:
+            session.client.player_tables = [{'i': 501, 't': 123, 'n': 'Existing SNG'}]
+        try:
+            reply = await t.register(123, 'SNG')
+            assert reply['success'] and reply['already_registered']
+            assert not any(topic == 'RegisterInTournament' for topic, _ in session.client.connection.sent)
+            assert ('SubscribeTournament', {'tournamentId': 123}) in session.client.connection.sent
+            assert 123 in t.active and t.active[123]['poller']
+            assert session.attached == ([501] if seated else [])
+            assert any(e[2] == 'seated' for e in events) is seated
+        finally:
+            await t.close()
+    run(go())
+
+
+@pytest.mark.parametrize('confirmed', [False, True])
+def test_duplicate_registration_race_requires_account_confirmation(confirmed):
+    from poker_controller.transport import ProtocolError
+    async def go():
+        checks = []
+        def registered(_):
+            checks.append(1)
+            return {'tournaments': [123] if len(checks) > 1 and confirmed else []}
+        def duplicate(_):
+            raise ProtocolError({'t': 'Result', 'resultCode': 1, 'resultCodeExt': 11,
+                                 'text': 'You are already registered for this tournament.'})
+        session, t, _ = play({'GetPlayerTournaments': registered, 'RegisterInTournament': duplicate})
+        try:
+            if confirmed:
+                assert (await t.register(123, 'SNG'))['already_registered']
+                assert 123 in t.active
+            else:
+                with pytest.raises(ProtocolError):
+                    await t.register(123, 'SNG')
+                assert 123 not in t.active
+            assert sum(topic == 'RegisterInTournament' for topic, _ in session.client.connection.sent) == 1
+        finally:
+            await t.close()
+    run(go())
+
+
+def test_reentry_is_not_skipped_when_account_still_lists_tournament():
+    async def go():
+        session, t, _ = play({'GetPlayerTournaments': {'tournaments': [123]},
+                              'RegisterInTournament': {'success': True}})
+        try:
+            await t.register(123, 'MTT', entry_idx=1)
+            calls = [fields for topic, fields in session.client.connection.sent if topic == 'RegisterInTournament']
+            assert len(calls) == 1 and calls[0]['playerEntryIdx'] == 1
+        finally:
+            await t.close()
+    run(go())
+
+
+def test_registration_only_does_not_start_play_or_a_tournament_follower():
+    async def go():
+        session,t,_=play({'RegisterInTournament':{'success':True}})
+        await t.register(123,'MTT',registration_only=True)
+        assert t.active=={} and not t.tasks and not session.attached
+        t.handle({'t':'TournamentSeatedDown','tournamentId':123,'info':{'i':501,'t':123}})
+        await asyncio.sleep(0)
+        assert not session.attached
+        await t.close()
     run(go())
 
 

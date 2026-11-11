@@ -18,6 +18,22 @@ def run(accounts=None, machines=None, tables=None, entries=None, target=5, **kwa
                 tables or [Table("a", 1, D(".1"), 6, 0, NOW)], entries or [], random.Random(3), **kwargs)
 
 
+def test_scaled_slow_pace_queues_a_future_join_instead_of_discarding_every_gap():
+    settings = replace(SETTINGS, min_gap=45, max_gap=285, tick_seconds=30,
+                       planning_horizon_seconds=900, fill_minutes=45, session_minutes=640)
+    inputs = ([Account(1, 1, 'low')], [Machine(1, 1, 6, NOW)],
+              [Table('a', 1, D('.1'), 6, 0, NOW)], [])
+    result = plan(settings, NOW, 27, *inputs, random.Random(3))
+    assert len(result.actions) == 1
+    assert NOW + timedelta(seconds=30) < result.actions[0].not_before < NOW + timedelta(seconds=900)
+    assert result.next_join == result.actions[0].not_before
+    # Keep the queued gap instead of drawing another until it is near due.
+    repeated = plan(settings, NOW + timedelta(seconds=5), 27, *inputs, random.Random(9),
+                    next_join=result.next_join)
+    assert repeated.actions == []
+    assert repeated.next_join == result.next_join
+
+
 def test_never_seats_account_twice_at_one_table():
     result = run()
     assert len(result.actions) == 1
@@ -411,7 +427,9 @@ def test_scaled_pace_joins_faster_for_a_large_target_and_never_slower_than_fixed
     joins = [a for a in big.actions if a.kind == "join"]
     # 1000 short: (400 + 1333) joins an hour -> ~2 s apart, so a 30 s pass plans far more than the old three.
     assert len(joins) > 6
-    assert all(a.not_before <= NOW + timedelta(seconds=30) for a in joins)
+    # One final join may carry a pause into a later tick; never queue a distant burst.
+    assert sum(a.not_before > NOW + timedelta(seconds=30) for a in joins) <= 1
+    assert all(a.not_before < NOW + timedelta(seconds=210) for a in joins)
     # One PC never logs in twice within min_gap.
     by_pc = {}
     for a in joins:
@@ -421,8 +439,11 @@ def test_scaled_pace_joins_faster_for_a_large_target_and_never_slower_than_fixed
         assert all(b - a >= timedelta(seconds=20) for a, b in zip(stamps, stamps[1:]))
     # A small target keeps today's pace: no gap above the fixed maximum.
     small = plan(_scaled(), NOW, 5, accounts[:5], machines[:1], tables[:5], [], random.Random(1))
-    assert [a.kind for a in small.actions] == ["join"]
+    assert small.actions and all(a.kind == 'join' for a in small.actions)
+    assert sum(a.not_before > NOW + timedelta(seconds=30) for a in small.actions) <= 1
     assert small.actions[0].not_before - NOW <= timedelta(seconds=60)
+    assert all(b.not_before - a.not_before <= timedelta(seconds=60)
+               for a, b in zip(small.actions, small.actions[1:]))
 
 
 def test_scaled_pace_respects_the_site_ceiling_and_pc_gap():

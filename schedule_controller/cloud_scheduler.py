@@ -46,7 +46,7 @@ class Rows:
 # no table, CPU or connection, and MTTs are often registered hours ahead (machine 5, 2026-11-08: 28 waiting
 # registrations held 28 of its 100 entries, so ring tables stopped at ~51). When several start together the PC can
 # briefly be above its maximum; the planner then joins no ring table until leaves bring it back under.
-MTT_REGISTRATION_WAITING = """(e.Status='joining' AND EXISTS(SELECT 1 FROM scheduler.LobbyTable w
+MTT_REGISTRATION_WAITING = """(e.IsParked=1 OR e.Status='joining' AND EXISTS(SELECT 1 FROM scheduler.LobbyTable w
     WHERE w.SiteId=e.SiteId AND w.TableId=e.TableId AND w.TableType='MTT' AND w.TournamentState='registering'
       AND w.StartUtc>DATEADD(minute,30,SYSUTCDATETIME())))"""
 
@@ -131,10 +131,16 @@ class CloudScheduler:
                     ActualEndUtc=CASE WHEN s.StartedUtc>SYSUTCDATETIME() THEN s.StartedUtc ELSE SYSUTCDATETIME() END
                 FROM scheduler.AccountSession s
                 WHERE s.SiteId=? AND s.IsOpen=1 AND s.PlannedEndUtc<=SYSUTCDATETIME()
-                  AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=s.BotAccountId AND e.IsOpen=1)""",
+                  AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=s.BotAccountId AND e.IsOpen=1 AND e.IsParked=0)""",
                 site_id).rowcount
             if ended > 0:
                 log.info("Closed %s session(s) that reached their planned end with no open tables", ended)
+            from .mtt_sessions import wake_registrations
+            if site['SchedulingEnabled']:
+                login_rng=random.Random(f'mtt-login:{site_id}:{stamp}')
+                for _ in range(max(1,site['MaxJoinsPerTick'])):
+                    if not wake_registrations(db,site,stamp,login_rng,self._session):break
+                    site['NextMttLoginUtc']=db.one('SELECT NextMttLoginUtc FROM scheduler.Site WHERE SiteId=?',site_id)['NextMttLoginUtc']
             policies = db.rows("""SELECT p.*,b.IsActive,CONVERT(bit,CASE WHEN b.LoginEmail IS NOT NULL AND b.LoginPassword IS NOT NULL THEN 1 ELSE 0 END) HasLogin,COALESCE(d.SessionSeconds,0) PlayedSeconds,
                 l.MachineId OwnerMachine,l.RequiresReconciliation,s.SessionId,s.PlannedEndUtc,
                 s.IsManual SessionManual,s.StartedUtc SessionStart,s.MachineId SessionMachine,
@@ -148,11 +154,11 @@ class CloudScheduler:
                 WHERE p.SiteId=? AND p.DeletedUtc IS NULL""", local_day, site_id)
             # Tournament entries (SNG/MTT) are planned separately and never left; for ring planning
             # they only use up each account's table limit and each PC's capacity.
-            tournament_entries = db.rows(f"""SELECT e.BotAccountId,e.MachineId,
+            tournament_entries = db.rows(f"""SELECT e.BotAccountId,e.MachineId,e.IsParked,
                     CASE WHEN {MTT_REGISTRATION_WAITING} THEN 1 ELSE 0 END AS Waiting FROM scheduler.Entry e
                 JOIN scheduler.LobbyTable t ON t.SiteId=e.SiteId AND t.TableId=e.TableId
                 WHERE e.SiteId=? AND e.IsOpen=1 AND t.TableType IN ('SNG','MTT')""", site_id)
-            tournament_by_account = Counter(r["BotAccountId"] for r in tournament_entries)
+            tournament_by_account = Counter(r["BotAccountId"] for r in tournament_entries if not r['IsParked'])
             tournament_by_machine = Counter(r["MachineId"] for r in tournament_entries if not r["Waiting"])
             draining_accounts=set()
             for machine in maintenance:
@@ -173,11 +179,15 @@ class CloudScheduler:
                 # An open session's entries must be on its machine (Entry->AccountSession FK), and a
                 # session can now be open with no tables, so pin the account to the session's machine.
                 owner = p["SessionMachine"] if p["SessionId"] else p["OwnerMachine"]
+                eligible = previous+timedelta(minutes=p['SessionCooldownMinutes']) if previous else None
+                begins = aware(p['SessionStart'])
+                if p['SessionId'] and begins and begins>stamp and not manual:
+                    eligible=max(eligible,begins) if eligible else begins
                 account = Account(aid, site_id, p["StakeTier"], p["PlayingFrequency"], int(p["PlayedSeconds"]),
                     p["MaxPlaytimeMinutes"], p["MaxTables"], owner,
                     enabled=bool(p["IsEnabled"] and p["IsActive"]), credentials_ready=bool(p["CredentialRef"] or p.get("HasLogin")),
                     synthetic=bool(p["IsSynthetic"]), requires_reconciliation=bool(p["RequiresReconciliation"]),
-                    eligible_after=previous+timedelta(minutes=p["SessionCooldownMinutes"]) if previous else None,
+                    eligible_after=eligible,
                     session_end=aware(p["PlannedEndUtc"]),drain_for_update=aid in draining_accounts,
                     manual=manual,session_start=aware(p["SessionStart"]) if manual else None,
                     max_sng_entries=p["MaxSngEntries"],max_mtt_entries=p["MaxMttEntries"],
@@ -298,7 +308,7 @@ class CloudScheduler:
             # Re-read open entries so a registration planned just before counts toward this one.
             rows = db.rows(f"""SELECT e.*,CASE WHEN {MTT_REGISTRATION_WAITING} THEN 1 ELSE 0 END AS Waiting
                 FROM scheduler.Entry e WHERE e.SiteId=? AND e.IsOpen=1""", site_id)
-            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"]) for e in rows]
+            entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"],parked=bool(e['IsParked'])) for e in rows]
             holding = [entry for entry, row in zip(entries, rows) if not row["Waiting"]]
             plan = plan_registrations(fmt, stamp, target, accounts, machines, tournaments, entries, ranges,
                 aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
@@ -307,7 +317,11 @@ class CloudScheduler:
             for action in plan.actions:
                 join = SimpleNamespace(account=action.account, machine=action.machine, table=action.tournament,
                                        not_before=action.not_before, soft_limit_override=False)
-                extra = {"format": fmt, "tournament_id": tournament_id(action.tournament)}
+                row=next(t for t in lobby_rows if t['TableId']==action.tournament)
+                from .mtt_sessions import waits_for_mtt
+                registration_only=waits_for_mtt({'table_type':fmt,'tournament_state':row.get('TournamentState'),
+                                               'start':aware(row.get('StartUtc'))},stamp)
+                extra = {"format": fmt, "tournament_id": tournament_id(action.tournament),'registration_only':registration_only}
                 if self._create_join(db, site, join, policy_by_id[action.account], machine_by_id[action.machine], rng, extra):
                     created += 1
             if created:
@@ -342,7 +356,7 @@ class CloudScheduler:
             db.execute("""INSERT scheduler.AccountLease(BotAccountId,SiteId,MachineId,WorkerEpoch,LeaseToken,
                 LeaseUntilUtc,LastConfirmedUtc) VALUES(?,?,?,?,?,DATEADD(second,90,SYSUTCDATETIME()),SYSUTCDATETIME())""",
                 action.account, site["SiteId"], action.machine, epoch, str(uuid.uuid4()))
-        session_id = self._session(db, site["SiteId"], action.account, action.machine, epoch, policy, action.not_before, rng)
+        session_id = None if (extra or {}).get('registration_only') else self._session(db, site["SiteId"], action.account, action.machine, epoch, policy, action.not_before, rng)
         entry_id, command_id = str(uuid.uuid4()), str(uuid.uuid4())
         db.execute("""INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,
             IsOpen,CreatedUtc,SessionId) VALUES(?,?,?,?,?,?,'reserved',1,SYSUTCDATETIME(),?)""",

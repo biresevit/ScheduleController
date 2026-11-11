@@ -76,6 +76,7 @@ class Entry:
     machine: int
     table: str
     status: str = "seated"
+    parked: bool = False
 
 
 @dataclass(frozen=True)
@@ -321,7 +322,10 @@ def plan(settings: Settings, now: datetime, target: int, accounts: list[Account]
             free = lambda o: pc_free.get(o[2].id, candidate)
             if not any(free(o) <= candidate for o in options):
                 candidate = min(free(o) for o in options)
-            if candidate > now + timedelta(seconds=settings.tick_seconds) or candidate >= now + timedelta(seconds=horizon_seconds):
+            # The drawn gap may exceed one timer tick. Queue that one future
+            # join within the planning horizon; the loop's due_join guard stops
+            # further draws until it is near due, preserving long pauses.
+            if candidate >= now + timedelta(seconds=horizon_seconds):
                 break
             options = [o for o in options if free(o) <= candidate]
         manual_options = [o for o in options if o[0].manual]

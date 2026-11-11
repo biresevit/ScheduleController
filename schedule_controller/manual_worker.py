@@ -103,8 +103,19 @@ async def run_manual(pilot):
             except Exception:log.exception('Manual turn synchronization failed for %s/%s',aid,tid)
         pending[key]=asyncio.create_task(process())
     while True:
+        delay=3.0
         try:
-            rows=await asyncio.to_thread(pilot.repo.manual_watches)
+            # Manual control lives under a live view (run_live_views polls those). With no view
+            # open on this PC there is nothing to watch, so skip the query; this loop at 4 Hz on
+            # every PC was the database's largest single source of calls (2026-11-11).
+            if watched or getattr(pilot,'live_requests_seen',0.0):
+                rows=await asyncio.to_thread(pilot.repo.manual_watches)
+            else:
+                rows=[]
+            # Fast only while someone controls the table (or right after it ends, to resume
+            # automatic play); an open view with control switched off is checked each second.
+            if watched and not rows or any(r['Enabled'] or r['Pending'] for r in rows):delay=.25
+            elif rows:delay=1.0
             active=set()
             for r in rows:
                 aid=r['BotAccountId'];tid=table_key(r['TableId']);active.add((aid,tid))
@@ -124,4 +135,4 @@ async def run_manual(pilot):
             await asyncio.gather(*pending.values(),return_exceptions=True)
             raise
         except Exception:log.exception('Manual table synchronization failed')
-        await asyncio.sleep(.25)
+        await asyncio.sleep(delay)

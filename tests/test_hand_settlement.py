@@ -267,3 +267,10 @@ def test_win_credited_to_a_placeholder_name_goes_to_the_only_player_left():
     assert rows["Hartginia"]["won"] == Decimal("145.63") and rows["Hartginia"]["net"] == Decimal("71.18")
     assert "player3" not in rows
     assert sum(r["net"] for r in rows.values()) == 0
+
+
+def test_bluffpoker_id_still_corrects_placeholder_winner():
+    import re
+    bluff = re.sub(r"Hand History for Game \d+", "Hand History for Game 76da2b9c-881c-4506-a063-16642d", PLACEHOLDER_WINNER)
+    assert wins(correct_winnings(bluff)) == wins(correct_winnings(PLACEHOLDER_WINNER))
+    assert nets(bluff) == nets(PLACEHOLDER_WINNER)

@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from datetime import datetime,timedelta,timezone
 import json
 import socket
+import threading
+import time
 import uuid
 import re
 
@@ -75,18 +77,20 @@ INSERT scheduler.AccountSession(SessionId,SiteId,BotAccountId,MachineId,WorkerEp
 
 DECLARE @e TABLE(EntryId uniqueidentifier PRIMARY KEY,BotAccountId int,TableId nvarchar(80),Status varchar(12),IsOpen bit,
     BuyInAmount decimal(19,4),CreatedUtc datetime2(3),SeatedUtc datetime2(3),ClosedUtc datetime2(3),LastConfirmedUtc datetime2(3),
-    SessionId uniqueidentifier,PlayTableId nvarchar(80));
+    SessionId uniqueidentifier,PlayTableId nvarchar(80),IsParked bit);
 INSERT @e SELECT * FROM OPENJSON(@entries) WITH(EntryId uniqueidentifier '$.id',BotAccountId int '$.account',TableId nvarchar(80) '$.table',
     Status varchar(12) '$.status',IsOpen bit '$.open',BuyInAmount decimal(19,4) '$.buy_in',CreatedUtc datetime2(3) '$.created',
     SeatedUtc datetime2(3) '$.seated',ClosedUtc datetime2(3) '$.closed',LastConfirmedUtc datetime2(3) '$.confirmed',
-    SessionId uniqueidentifier '$.session',PlayTableId nvarchar(80) '$.play_table');
+    SessionId uniqueidentifier '$.session',PlayTableId nvarchar(80) '$.play_table',IsParked bit '$.parked');
 INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,IsOpen,CreatedUtc)
     SELECT e.EntryId,@site,e.BotAccountId,@machine,@epoch,e.TableId,e.Status,e.IsOpen,e.CreatedUtc
     FROM @e e WHERE NOT EXISTS(SELECT 1 FROM scheduler.Entry x WHERE x.EntryId=e.EntryId);
 -- PlayTableId: the tournament table a registered bot currently plays (NULL for ring entries).
 UPDATE x SET Status=e.Status,IsOpen=e.IsOpen,BuyInAmount=e.BuyInAmount,SeatedUtc=e.SeatedUtc,ClosedUtc=e.ClosedUtc,
-    LastConfirmedUtc=e.LastConfirmedUtc,SessionId=e.SessionId,PlayTableId=e.PlayTableId
-    FROM scheduler.Entry x JOIN @e e ON e.EntryId=x.EntryId;
+    LastConfirmedUtc=e.LastConfirmedUtc,SessionId=e.SessionId,PlayTableId=e.PlayTableId,IsParked=COALESCE(e.IsParked,0)
+    FROM scheduler.Entry x JOIN @e e ON e.EntryId=x.EntryId
+    WHERE x.MachineId=@machine AND x.WorkerEpoch=@epoch AND (x.IsOpen=1 OR e.IsOpen=0)
+      AND NOT (x.IsParked=0 AND COALESCE(e.IsParked,0)=1 AND x.SessionId IS NOT NULL AND e.SessionId IS NULL);
 
 DECLARE @c TABLE(CommandId uniqueidentifier PRIMARY KEY,EntryId uniqueidentifier,Kind varchar(5),Status varchar(10),IsOpen bit,
     ConfigVersion bigint,NotBeforeUtc datetime2(3),ExpiresUtc datetime2(3),ResultCode nvarchar(80),ResultText nvarchar(1000),IsNew bit);
@@ -120,7 +124,7 @@ UPDATE x SET LeaseUntilUtc=DATEADD(second,90,SYSUTCDATETIME()),LastConfirmedUtc=
 -- A cancelled first join has no session yet, but still owns a lease. Retain leases for uncertain/open entries;
 -- release only this worker's leases once the persisted journal confirms no entries remain.
 DELETE l FROM scheduler.AccountLease l WHERE l.SiteId=@site AND l.WorkerEpoch=@epoch
-    AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1);
+    AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1 AND e.IsParked=0);
 
 DECLARE @i TABLE(IntervalId uniqueidentifier PRIMARY KEY,BotAccountId int,SequenceNumber bigint,StartUtc datetime2(3),EndUtc datetime2(3),EntryCount int);
 INSERT @i SELECT * FROM OPENJSON(@intervals) WITH(IntervalId uniqueidentifier '$.id',BotAccountId int '$.account',
@@ -162,12 +166,12 @@ def journal_payload(entries,sessions,intervals):
         entry_rows[str(e['id'])]=dict(id=str(e['id']),account=e['account'],table=str(e['table']),status=e['status'],open=opened,
             buy_in=e.get('buy_in'),created=stamp_ms(e['created']),seated=stamp_ms(e.get('seated')),closed=stamp_ms(e.get('closed')),
             confirmed=stamp_ms(e.get('confirmed')),session=None if e.get('session') is None else str(e['session']),
-            play_table=None if e.get('play_table') is None else str(e['play_table']))
+            play_table=None if e.get('play_table') is None else str(e['play_table']),parked=bool(e.get('parked')))
         for cmd in e.get('commands',[]):
             command_rows[str(cmd['id'])]=dict(id=str(cmd['id']),entry=str(e['id']),kind=cmd['kind'],status=cmd['status'],
                 open=cmd['status'] in ('pending','claimed','uncertain'),version=cmd['version'],due=stamp_ms(cmd['due']),
                 expires=stamp_ms(cmd['due']+timedelta(minutes=3)),result=cmd.get('result'),result_text=cmd.get('result_text'))
-    active={e['account'] for e in entries if e['status'] not in ('closed','failed')}
+    active={e['account'] for e in entries if e['status'] not in ('closed','failed') and not e.get('parked')}
     leases=[dict(account=a,uncertain=any(e['account']==a and e['status']=='uncertain' for e in entries)) for a in sorted(active)]
     interval_rows={};days=[]
     for span in intervals:
@@ -180,7 +184,7 @@ def journal_payload(entries,sessions,intervals):
             if count:
                 days.append(dict(interval=str(span['id']),account=span['account'],day=str(day),seconds=count,
                                  entry_seconds=count*span['entries']))
-    dump=lambda rows:json.dumps(list(rows),default=str)
+    dump=lambda rows:Text(json.dumps(list(rows),default=str))
     return (dump(session_rows.values()),dump(entry_rows.values()),dump(command_rows.values()),dump(leases),
             dump(interval_rows.values()),dump(days))
 
@@ -198,16 +202,88 @@ class DB:
             return '?'
         rendered=re.sub(r':site\b|:machine\b|\?',replace,sql)
         return rendered,values
-    def rows(self,sql,*args):
+    def run(self,sql,args):
         sql,params=self.bind(sql,args)
-        self.c.execute(sql,*params)
+        if params:
+            # pyodbc declares a string as nvarchar(<its length>), so each new payload length made a new
+            # statement: SQL Server compiled the ~40-statement journal batch again and cached another 5 MB
+            # plan (147 copies, 650 MB, 2026-11-11), which evicted every other plan and kept CPU at 100%.
+            # Fixed declarations give each statement one or two plans. The setting sticks to the
+            # cursor, so it is set on every call.
+            self.c.setinputsizes([_input_size(p) for p in params])
+        return self.c.execute(sql,*params)
+    def rows(self,sql,*args):
+        self.run(sql,args)
         names=[x[0] for x in self.c.description]
         return [dict(zip(names,row)) for row in self.c.fetchall()]
     def one(self,sql,*args):
         return next(iter(self.rows(sql,*args)),None)
     def execute(self,sql,*args):
-        sql,params=self.bind(sql,args)
-        return self.c.execute(sql,*params)
+        return self.run(sql,args)
+
+
+class Text(str):
+    """A string parameter always sent as nvarchar(max) (JSON payloads), whatever its length."""
+
+
+SQL_WVARCHAR=-9  # pyodbc.SQL_WVARCHAR; size 0 declares nvarchar(max)
+
+
+def _input_size(value):
+    if isinstance(value,str):
+        return (SQL_WVARCHAR,0 if isinstance(value,Text) or len(value)>4000 else 4000,0)
+    return None
+
+
+# One long-lived connection per worker thread. The worker polls several times a second;
+# opening a pooled connection per poll cost a connection reset and a SET XACT_ABORT batch each
+# time, and the pool's 60 s idle timeout re-logged in (TLS) ~10 times a minute per PC. On the
+# S0 database that overhead, not the queries, kept CPU at 100% (2026-11-11).
+_local=threading.local()
+CONNECTION_IDLE_SECONDS=240   # below Azure SQL's 30-minute idle cut, so a reused link is live
+CONNECTION_MAX_AGE_SECONDS=1800
+
+
+def _open_connection():
+    import pyodbc
+    conn=pyodbc.connect(connection_string(),autocommit=False,timeout=15)
+    try:
+        cursor=conn.cursor()
+        # Session settings are set once and never changed by worker SQL, so every transaction
+        # starts with the same state (the lobby/journal batches also set NOCOUNT ON).
+        cursor.execute('SET XACT_ABORT ON;SET NOCOUNT ON')
+        cursor.close()
+        conn.commit()
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
+def _thread_connection():
+    stamp=time.monotonic()
+    cached=getattr(_local,'conn',None)
+    if cached:
+        conn,opened,used=cached
+        if stamp-used<=CONNECTION_IDLE_SECONDS and stamp-opened<=CONNECTION_MAX_AGE_SECONDS:
+            _local.conn=(conn,opened,stamp)
+            return conn
+        _local.conn=None
+        try: conn.close()
+        except Exception: pass
+    conn=_open_connection()
+    _local.conn=(conn,stamp,stamp)
+    return conn
+
+
+def _discard_thread_connection(conn):
+    cached=getattr(_local,'conn',None)
+    if cached and cached[0] is conn:
+        _local.conn=None
+    try: conn.rollback()
+    except Exception: pass
+    try: conn.close()
+    except Exception: pass
 
 
 from .chat_repository import ChatRepository
@@ -258,17 +334,21 @@ class Repository(ChatRepository,ManualRepository):
             limit_failed_sessions(db,self.site_id)
     @contextmanager
     def transaction(self):
-        import pyodbc
-        conn=pyodbc.connect(connection_string(),autocommit=False,timeout=15)
+        conn=_thread_connection()
+        cursor=None
         try:
-            db=DB(conn.cursor(),self.site_id,self.machine_id)
-            db.execute('SET XACT_ABORT ON')
-            yield db
+            cursor=conn.cursor()
+            yield DB(cursor,self.site_id,self.machine_id)
             conn.commit()
         except BaseException:
-            conn.rollback()
+            # A failed transaction may leave the session unusable (lost link, XACT_ABORT doom);
+            # never hand it to the next caller.
+            _discard_thread_connection(conn)
             raise
-        finally: conn.close()
+        finally:
+            if cursor is not None:
+                try: cursor.close()
+                except Exception: pass
 
     @retry_deadlocks
     def claim_observer(self):
@@ -340,10 +420,14 @@ class Repository(ChatRepository,ManualRepository):
             if not previous_worker_gone and machine['LastHeartbeatUtc'] and machine['IsReady'] and machine['LastHeartbeatUtc']>cutoff:
                 raise RuntimeError('Machine has a live worker')
             entries=db.rows("""SELECT e.EntryId,e.BotAccountId,b.Username,e.TableId,e.Status,e.BuyInAmount,
-                    e.CreatedUtc,e.SeatedUtc,e.LastConfirmedUtc,e.SessionId,s.StartedUtc,s.PlannedEndUtc
+                    e.CreatedUtc,e.SeatedUtc,e.LastConfirmedUtc,e.SessionId,s.StartedUtc,s.PlannedEndUtc,
+                    e.IsParked,e.PlayTableId,l.TableType,l.StartUtc,l.TournamentState,
+                    CONVERT(bit,CASE WHEN EXISTS(SELECT 1 FROM scheduler.Command c WHERE c.EntryId=e.EntryId
+                        AND c.Kind='join' AND c.Status='succeeded') THEN 1 ELSE 0 END) AS RegistrationConfirmed
                 FROM scheduler.Entry e WITH(UPDLOCK,HOLDLOCK)
                 JOIN dbo.BotAccount b ON b.BotAccountId=e.BotAccountId
                 LEFT JOIN scheduler.AccountSession s ON s.SessionId=e.SessionId
+                LEFT JOIN scheduler.LobbyTable l ON l.SiteId=e.SiteId AND l.TableId=e.TableId
                 WHERE e.SiteId=:site AND e.MachineId=:machine AND e.IsOpen=1 ORDER BY e.BotAccountId,e.TableId""")
             # Commands claimed by the dead epoch can never safely be replayed.
             # The Azure planner will create fresh leave/join commands after the
@@ -404,12 +488,22 @@ class Repository(ChatRepository,ManualRepository):
                 WHERE SiteId=:site AND MachineId=:machine AND WorkerEpoch=?""",self.epoch)
 
     @retry_deadlocks
+    def park_registered_entry(self, entry_id):
+        with self.transaction() as db:
+            row=db.one('SELECT BotAccountId FROM scheduler.Entry WITH(UPDLOCK,HOLDLOCK) WHERE EntryId=? AND SiteId=:site AND MachineId=:machine AND IsOpen=1',entry_id)
+            if not row:raise RuntimeError('Registration ownership changed')
+            db.execute("UPDATE scheduler.Entry SET IsParked=1,SessionId=NULL,WorkerEpoch=?,Status='joining' WHERE EntryId=?",self.epoch,entry_id)
+            db.execute("""DELETE l FROM scheduler.AccountLease l WHERE l.SiteId=:site AND l.MachineId=:machine
+                AND l.BotAccountId=? AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e
+                    WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1 AND e.IsParked=0)""",row['BotAccountId'])
+
+    @retry_deadlocks
     def claim_due(self, limit=10):
         """Atomically claim due Azure-planned commands for this worker epoch."""
         token=str(uuid.uuid4())
         with self.transaction() as db:
             rows=db.rows("""SELECT TOP (?) c.CommandId,c.EntryId,c.Kind,c.ConfigVersion,c.NotBeforeUtc,c.PayloadJson,
-                    e.BotAccountId,e.TableId,e.Status AS EntryStatus,e.CreatedUtc,e.SessionId,
+                    e.BotAccountId,e.TableId,e.Status AS EntryStatus,e.CreatedUtc,e.SessionId,e.IsParked,
                     s.StartedUtc,s.PlannedEndUtc
                 FROM scheduler.Command c WITH(UPDLOCK,READPAST,ROWLOCK)
                 JOIN scheduler.Entry e ON e.SiteId=c.SiteId AND e.EntryId=c.EntryId
@@ -520,11 +614,11 @@ class Repository(ChatRepository,ManualRepository):
             return [e['EntryId'] for e in entries]
 
     @retry_deadlocks
-    def authorize_join(self,version):
+    def authorize_join(self,version,existing_registration=False):
         with self.transaction() as db:
             row=db.one("SELECT s.SchedulingEnabled,s.ConfigVersion,m.WorkerEpoch,m.IsEnabled,m.IsReady,m.MaintenanceTaskId FROM scheduler.Site s JOIN scheduler.MachineAssignment m ON m.SiteId=s.SiteId WHERE s.SiteId=:site AND m.MachineId=:machine")
             allowed=db.one("SELECT SiteId FROM backoffice.MachineAllowedSite WHERE MachineId=:machine AND SiteId=:site")
-            return bool(allowed and not row['MaintenanceTaskId'] and row['SchedulingEnabled'] and row['IsEnabled'] and row['IsReady'] and row['ConfigVersion']==version and str(row['WorkerEpoch']).lower()==str(self.epoch).lower())
+            return bool(allowed and not row['MaintenanceTaskId'] and row['SchedulingEnabled'] and row['IsEnabled'] and row['IsReady'] and (existing_registration or row['ConfigVersion']==version) and str(row['WorkerEpoch']).lower()==str(self.epoch).lower())
 
     @retry_deadlocks
     def publish(self,tables,seats,entries,sessions,intervals,*,ready=True,next_join=None,next_leave=None,last_plan=None):
@@ -563,20 +657,25 @@ class Repository(ChatRepository,ManualRepository):
         with self.transaction() as db:
             owned=db.one("SELECT WorkerEpoch FROM scheduler.MachineAssignment WHERE SiteId=:site AND MachineId=:machine")
             if not owned or str(owned['WorkerEpoch']).lower()!=str(self.epoch).lower(): raise RuntimeError('Worker epoch lost')
-            db.execute(LOBBY_SQL,self.epoch,json.dumps(rows,default=str),json.dumps(sorted(str(t) for t in seats)),json.dumps(players,default=str))
+            db.execute(LOBBY_SQL,self.epoch,Text(json.dumps(rows,default=str)),Text(json.dumps(sorted(str(t) for t in seats))),Text(json.dumps(players,default=str)))
 
     @retry_deadlocks
     def live_view_requests(self):
         """Return only unexpired requests assigned to this worker's machine."""
+        import time
+        stamp=time.monotonic()
+        cleanup=stamp>=getattr(self,'_live_cleanup_at',0)
         with self.transaction() as db:
-            db.execute("UPDATE scheduler.LiveViewRequest SET Status='expired' WHERE MachineId=:machine AND Status IN ('requested','active') AND ExpiresUtc<=SYSUTCDATETIME()")
-            return db.rows("""SELECT r.RequestId,r.TableId,r.BotAccountId,JSON_VALUE(s.PayloadJson,'$.table_id') AS BoundTableId
+            if cleanup:db.execute("UPDATE scheduler.LiveViewRequest SET Status='expired' WHERE MachineId=:machine AND Status IN ('requested','active') AND ExpiresUtc<=SYSUTCDATETIME()")
+            rows=db.rows("""SELECT r.RequestId,r.TableId,r.BotAccountId,JSON_VALUE(s.PayloadJson,'$.table_id') AS BoundTableId
                 FROM scheduler.LiveViewRequest r
                 LEFT JOIN scheduler.LiveTableSnapshot s ON s.RequestId=r.RequestId
                 JOIN scheduler.Entry e ON e.SiteId=r.SiteId AND e.TableId=r.TableId
                     AND e.BotAccountId=r.BotAccountId AND e.MachineId=r.MachineId AND e.IsOpen=1
                 WHERE r.SiteId=:site AND r.MachineId=:machine AND r.Status IN ('requested','active')
                     AND r.ExpiresUtc>SYSUTCDATETIME()""")
+        if cleanup:self._live_cleanup_at=stamp+30
+        return rows
 
     @retry_deadlocks
     def publish_live_view(self,request_id,hand_id,payload):
@@ -600,8 +699,8 @@ class Repository(ChatRepository,ManualRepository):
                 return False
             if snapshot:
                 db.execute("""UPDATE scheduler.LiveTableSnapshot SET SequenceNumber=SequenceNumber+1,
-                    CapturedUtc=SYSUTCDATETIME(),HandId=?,PayloadJson=? WHERE RequestId=?""",str(hand_id or ''),json.dumps(payload),request_id)
+                    CapturedUtc=SYSUTCDATETIME(),HandId=?,PayloadJson=? WHERE RequestId=?""",str(hand_id or ''),Text(json.dumps(payload)),request_id)
             else:
-                db.execute("INSERT scheduler.LiveTableSnapshot(RequestId,SequenceNumber,CapturedUtc,HandId,PayloadJson) VALUES(?,1,SYSUTCDATETIME(),?,?)",request_id,str(hand_id or ''),json.dumps(payload))
+                db.execute("INSERT scheduler.LiveTableSnapshot(RequestId,SequenceNumber,CapturedUtc,HandId,PayloadJson) VALUES(?,1,SYSUTCDATETIME(),?,?)",request_id,str(hand_id or ''),Text(json.dumps(payload)))
             db.execute("UPDATE scheduler.LiveViewRequest SET Status='active',LastSnapshotUtc=SYSUTCDATETIME(),ErrorText=NULL WHERE RequestId=?",request_id)
             return True

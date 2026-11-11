@@ -67,6 +67,7 @@ class TournamentPlay:
         self.tasks: set = set()
         self.on_event = None
         self.resume_lock = asyncio.Lock()
+        self.parked = set()
 
     @property
     def client(self):
@@ -109,16 +110,41 @@ class TournamentPlay:
 
     # ---- registration ----------------------------------------------------------------------------
 
-    async def register(self, tid: int, fmt: str, entry_idx: int = 0) -> dict:
-        reply = await self.client.connection.request(
-            "RegisterInTournament", acceptedExchangeRate=0, acceptedPrecision=0, grantTicketId=0, password="",
-            paymentClubId=0, playerEntryIdx=entry_idx, srcCurrencyId=0, tournamentId=int(tid), useCurrencyConversion=False)
+    async def register(self, tid: int, fmt: str, entry_idx: int = 0, *, registration_only=False) -> dict:
+        from poker_controller.transport import ProtocolError
+        tid = int(tid)
+        if registration_only:self.parked.add(tid)
+        else:self.parked.discard(tid)
+        # Restarted sessions can lose their local entry while EvenBet retains the
+        # registration. Adopt it without another buy-in. Re-entries remain explicit.
+        adopted = entry_idx == 0 and tid in await self.registered_tournaments()
+        if adopted:
+            reply = {"success": True, "already_registered": True}
+        else:
+            try:
+                reply = await self.client.connection.request(
+                    "RegisterInTournament", acceptedExchangeRate=0, acceptedPrecision=0, grantTicketId=0, password="",
+                    paymentClubId=0, playerEntryIdx=entry_idx, srcCurrencyId=0, tournamentId=tid, useCurrencyConversion=False)
+            except ProtocolError as exc:
+                # Confirm a racing registration from account state, rather than
+                # treating every refusal (or an ambiguous send) as success.
+                if (entry_idx != 0 or exc.response.get("resultCode") != 1
+                        or exc.response.get("resultCodeExt") != 11
+                        or tid not in await self.registered_tournaments()):
+                    raise
+                adopted = True
+                reply = {"success": True, "already_registered": True}
         if not reply.get("success"):
             raise ValueError(f"Tournament registration refused: {reply.get('text') or reply.get('resultCode') or reply}")
+        if registration_only:return reply
         state = self.active.setdefault(int(tid), {"format": fmt, "entry_idx": entry_idx, "table": None, "addon_decided": False})
-        state.update(format=fmt, entry_idx=entry_idx, finished=False)
-        if not state.get("poller"):
+        state.update(format=fmt, entry_idx=state.get("entry_idx", entry_idx) if adopted else entry_idx, finished=False)
+        if not state.get("poller") or state["poller"].done():
             state["poller"] = self.spawn(self.follow(int(tid)), "standings")
+        if adopted:
+            await self.client.connection.request("SubscribeTournament", tournamentId=tid)
+            await self.resume()
+            self.log.info("RESUMED existing registration %s %s=%s", self.policy["Username"], fmt, tid)
         self.log.info("REGISTERED %s %s=%s entry=%s", self.policy["Username"], fmt, tid, entry_idx)
         return reply
 
@@ -126,6 +152,23 @@ class TournamentPlay:
         """Tournament ids EvenBet holds a registration of this account for."""
         reply = await self.client.connection.request("GetPlayerTournaments")
         return {int(t) for t in reply.get("tournaments") or []}
+
+    async def resume_registration(self, tid, fmt):
+        tid=int(tid)
+        self.parked.discard(tid)
+        if tid not in await self.registered_tournaments():return False
+        state=self.active.setdefault(tid,{'format':fmt,'entry_idx':0,'table':None,'addon_decided':False})
+        state.update(format=fmt,finished=False)
+        if not state.get('poller') or state['poller'].done():state['poller']=self.spawn(self.follow(tid),'standings')
+        await self.client.connection.request('SubscribeTournament',tournamentId=tid)
+        await self.resume()
+        return True
+
+    def park_registration(self,tid):
+        tid=int(tid)
+        self.parked.add(tid)
+        state=self.active.pop(tid,None) or {}
+        if state.get('poller'):state['poller'].cancel()
 
     async def unregister(self, tid: int) -> None:
         """Cancel a registration before the tournament starts (as the web client's Unregister button).
@@ -153,6 +196,8 @@ class TournamentPlay:
     # ---- messages --------------------------------------------------------------------------------
 
     def handle(self, message: dict):
+        tid=message.get('tournamentId') or (message.get('info') or {}).get('t') or (message.get('info') or {}).get('i')
+        if tid is not None and int(tid) in self.parked:return
         topic = message.get("t")
         if topic == "TournamentInvite":
             info = message.get("info") or {}
