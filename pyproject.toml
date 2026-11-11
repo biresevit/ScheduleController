@@ -11,7 +11,7 @@ dependencies = ["tzdata>=2025.2", "azure-storage-blob>=12.24,<13"]
 
 [project.optional-dependencies]
 db = ["pyodbc>=5,<6"]
-test = ["pytest>=8"]
+test = ["pytest>=8", "pyflakes>=3"]
 
 [project.scripts]
 schedule-db = "schedule_controller.database:main"

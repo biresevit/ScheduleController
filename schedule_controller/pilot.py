@@ -29,7 +29,7 @@ from .planner import Account,Entry,Machine,Settings,Table,plan
 from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
 from .join_failures import LIMIT_REASON,LIMIT_DESCRIPTION,failure_description
-from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,tournament_id
+from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,remember_buy_ins,tournament_id
 from .bluffpoker_tournaments import BluffPokerTournaments,lobby_rows as bluffpoker_tournament_rows
 
 log=logging.getLogger(__name__)
