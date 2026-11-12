@@ -303,8 +303,10 @@ def test_tournament_leave_unregisters_only_when_the_operator_asked():
         p.publish=AsyncMock();p.accrue=lambda:None;p.errors=[]
         p.policies={7:{'Username':'jeremy'}}
         tourneys=SimpleNamespace(unregister=AsyncMock())
-        p.clients={7:SimpleNamespace(tourneys=tourneys)}
+        p.clients={7:SimpleNamespace(tourneys=tourneys,close=AsyncMock())}
+        p.client_lock=asyncio.Lock()
         e={'id':'e1','account':7,'table':'T128872490','status':status,'commands':[]}
+        p.entries={'e1':e}
         return p,e,tourneys
     p,e,tourneys=pilot('joining')
     cmd={'id':'c1','kind':'leave','payload':{}}
@@ -314,6 +316,8 @@ def test_tournament_leave_unregisters_only_when_the_operator_asked():
     asyncio.run(p.execute_tournament(e,cmd,'leave'))
     tourneys.unregister.assert_awaited_once_with(128872490)
     assert cmd['status']=='succeeded' and cmd['result']=='unregistered' and e['status']=='closed'
+    # Nothing else open: the account logs out, as after its last ring table.
+    assert 7 not in p.clients
     p,e,tourneys=pilot('seated')
     cmd={'id':'c3','kind':'leave','payload':{'unregister':True}}
     asyncio.run(p.execute_tournament(e,cmd,'leave'))

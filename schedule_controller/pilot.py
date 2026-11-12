@@ -1265,6 +1265,9 @@ class Pilot:
             self.accrue();e.update(status='closed',closed=now(),confirmed=now());self.accrue()
             cmd.update(status='succeeded',result='unregistered')
             log.info('UNREGISTERED %s %s',username,e['table'])
+            # Like a ring leave: with no table or registration left the account logs out.
+            try:await self.close_session_if_idle(e['account'])
+            except Exception:log.exception('Could not close idle account %s',username)
         except Exception as exc:
             self.errors.append({'account':username,'table':e['table'],'kind':'unregister','error':type(exc).__name__,'at':now().isoformat()})
             log.exception('Tournament unregistration failed: %s / %s',username,e['table'])

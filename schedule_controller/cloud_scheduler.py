@@ -155,6 +155,10 @@ class CloudScheduler:
                     site_id).rowcount
                 if offline > 0:
                     log.info("Released %s lease(s) of offline PCs", offline)
+            from .mtt_sessions import unregister_ended_sngs
+            unregistering = unregister_ended_sngs(db, site)
+            if unregistering:
+                log.info("Site %s: unregistering %s SNG registration(s) of sessions past their planned end", site_id, unregistering)
             # Sessions outlive their tables: a bot that busts, fails a join or is no longer seated
             # keeps its session and gets new joins. The session ends once its planned end has
             # passed and the planner's leaves have closed its last table.

@@ -107,3 +107,39 @@ def test_machine_plays_several_sites_of_its_customer(database):
     c.execute("DELETE dbo.MachineCasino WHERE MachineId=? AND Casino=N'BluffPoker'", machine)
     with pytest.raises(pyodbc.Error):  # last: the error aborts the transaction; the machine no longer plays BluffPoker
         c.execute("INSERT scheduler.MachineAssignment(SiteId,MachineId) VALUES(?,?)", other, machine)
+
+
+def test_retired_machine_stops_everywhere_keeps_history_and_comes_back_when_paired(database):
+    import pyodbc
+    c, seed = database
+    machine, site = seed["machine_id"], seed["site_id"]
+    customer, mac = c.execute("SELECT CustomerId,MacAddress FROM dbo.CustomerMachine WHERE MachineId=?", machine).fetchone()
+    c.execute("DELETE scheduler.AccountLease WHERE MachineId=?", machine)
+    c.execute("UPDATE scheduler.Entry SET IsOpen=0,Status='closed' WHERE MachineId=? AND IsOpen=1", machine)
+    c.execute("UPDATE scheduler.MachineUpdateTask SET CompletedUtc=SYSUTCDATETIME() WHERE MachineId=? AND StartedUtc IS NOT NULL AND CompletedUtc IS NULL", machine)
+    sessions = c.execute("SELECT COUNT(*) FROM scheduler.AccountSession WHERE MachineId=?", machine).fetchone()[0]
+    c.execute("EXEC backoffice.RetireMachine @CustomerId=?,@MachineId=?", customer, machine)
+    assert not c.execute("SELECT IsActive FROM dbo.CustomerMachine WHERE MachineId=?", machine).fetchone()[0]
+    assert c.execute("SELECT COUNT(*) FROM scheduler.MachineAssignment WHERE MachineId=? AND (IsEnabled=1 OR IsReady=1)", machine).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM backoffice.MachineAllowedSite WHERE MachineId=?", machine).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM scheduler.MachineUpdateAgent WHERE MachineId=? AND Enabled=1", machine).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM scheduler.AccountSession WHERE MachineId=? AND IsOpen=1", machine).fetchone()[0] == 0
+    assert c.execute("SELECT COUNT(*) FROM scheduler.AccountSession WHERE MachineId=?", machine).fetchone()[0] == sessions  # history kept
+    c.execute("EXEC backoffice.RegisterPairedMachine @CustomerId=?,@SiteId=?,@Mac=?,@Host=N'MSI',@Capacity=12", customer, site, mac)
+    assert c.execute("SELECT IsActive FROM dbo.CustomerMachine WHERE MachineId=?", machine).fetchone()[0]
+    assert tuple(c.execute("SELECT IsEnabled,MaxEntries FROM scheduler.MachineAssignment WHERE MachineId=? AND SiteId=?", machine, site).fetchone()) == (True, 12)
+    assert c.execute("SELECT COUNT(*) FROM backoffice.MachineAllowedSite WHERE MachineId=? AND SiteId=?", machine, site).fetchone()[0] == 1
+    c.execute("UPDATE dbo.CustomerMachine SET IsActive=0 WHERE MachineId=?", machine)
+    with pytest.raises(pyodbc.Error, match="not found"):  # last: the error aborts the transaction
+        c.execute("EXEC backoffice.RetireMachine @CustomerId=?,@MachineId=?", customer, machine)
+
+
+def test_machine_with_open_entries_cannot_be_retired(database):
+    import pyodbc
+    c, seed = database
+    machine = seed["machine_id"]
+    customer = c.execute("SELECT CustomerId FROM dbo.CustomerMachine WHERE MachineId=?", machine).fetchone()[0]
+    if not c.execute("SELECT COUNT(*) FROM scheduler.Entry WHERE MachineId=? AND IsOpen=1", machine).fetchone()[0]:
+        pytest.skip("the test machine has no open entry right now")
+    with pytest.raises(pyodbc.Error, match="open tables"):
+        c.execute("EXEC backoffice.RetireMachine @CustomerId=?,@MachineId=?", customer, machine)

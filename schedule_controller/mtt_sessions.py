@@ -12,6 +12,35 @@ def waits_for_mtt(table, stamp):
             and start is not None and start > stamp + LOGIN_LEAD)
 
 
+def unregister_ended_sngs(db, site):
+    """An SNG registration must not keep a session open past its planned end. Until the SNG starts the bot only
+    waits, so at the session's end the registration is cancelled (the operator's Unregister task) and the session
+    can end. A 6-max that bots alone filled to 5/6 kept four accounts in sessions three days past their end and out
+    of ring play (site 1, 2026-11-09..12). A started SNG is played to the end; MTTs park instead (wake_registrations).
+    Returns the number of unregister tasks created."""
+    sid = site['SiteId']
+    rows = db.rows("""SELECT e.EntryId,e.MachineId,e.TableId,a.WorkerEpoch FROM scheduler.Entry e
+        JOIN scheduler.LobbyTable l ON l.SiteId=e.SiteId AND l.TableId=e.TableId
+        JOIN scheduler.AccountSession s ON s.BotAccountId=e.BotAccountId AND s.IsOpen=1
+        JOIN scheduler.MachineAssignment a ON a.SiteId=e.SiteId AND a.MachineId=e.MachineId
+        WHERE e.SiteId=? AND e.IsOpen=1 AND e.IsParked=0 AND e.Status='joining' AND e.PlayTableId IS NULL
+          AND l.TableType='SNG' AND l.TournamentState='registering' AND s.PlannedEndUtc<=SYSUTCDATETIME()
+          AND a.WorkerEpoch IS NOT NULL
+          AND NOT EXISTS(SELECT 1 FROM scheduler.Command c WHERE c.EntryId=e.EntryId AND c.IsOpen=1)
+          AND NOT EXISTS(SELECT 1 FROM scheduler.Command c WHERE c.EntryId=e.EntryId AND c.Kind='leave'
+              AND c.Status='failed' AND c.UpdatedUtc>=DATEADD(minute,-5,SYSUTCDATETIME()))""", sid)
+    for row in rows:
+        cid = str(uuid.uuid4())
+        payload = json.dumps({'unregister': True, 'format': 'SNG', 'reason': 'session_end',
+                              'tournament_id': int(str(row['TableId']).lstrip('T'))})
+        db.execute("""INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,
+            ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc) VALUES(?,?,?,?,?,'leave','pending',1,?,?,
+            SYSUTCDATETIME(),DATEADD(minute,10,SYSUTCDATETIME()))""",
+            cid, sid, row['EntryId'], row['MachineId'], row['WorkerEpoch'], site['ConfigVersion'], payload)
+        db.execute('INSERT scheduler.Outbox(CommandId,AvailableUtc) VALUES(?,SYSUTCDATETIME())', cid)
+    return len(rows)
+
+
 def wake_registrations(db, site, stamp, rng, session_factory):
     """Under the site lock: schedule at most one paced return, without another registration."""
     sid = site['SiteId']
