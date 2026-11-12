@@ -218,3 +218,28 @@ def test_table_info_carries_the_lobby_buy_in_for_pdecision():
     session.platform = "OtherPlatform"
     t.refresh_table_info(SNG)
     assert client.tables["table-1"]["tournament"]["buy_in"] is None
+
+
+def test_mtt_plan_decides_reentry_and_addon_over_the_account_chances(monkeypatch):
+    # Chances 1.0, but the plan says this bot neither re-enters nor takes the add-on.
+    t, client, events, _ = buyback_setup(monkeypatch, register_tournament=AsyncMock(), tournament_addon=AsyncMock())
+    t.active[MTT].update(plan_rebuy=False, plan_addon=False)
+    asyncio.run(t.apply(MTT, {"status": "RUNNING", "myRegistrationStatus": "PLAYING", "myTableId": "t1", "myAddOn": OFFER}))
+    asyncio.run(t.apply(MTT, eliminated()))
+    assert client.register_tournament.await_count == 0 and client.tournament_addon.await_count == 0
+    # Chances 0, but the plan says re-enter: it does (within the account's re-entry limit).
+    t, client, events, _ = buyback_setup(monkeypatch, policy={"RebuyTournamentChance": 0.0},
+                                         register_tournament=AsyncMock(return_value={"ok": True, "stackChips": 10000}))
+    t.active[MTT].update(plan_rebuy=True)
+    asyncio.run(t.apply(MTT, eliminated()))
+    assert client.register_tournament.await_count == 1 and events == ["reentry"]
+
+
+def test_lobby_rows_carry_rebuy_reentry_addon_and_late_registration():
+    from schedule_controller.bluffpoker_tournaments import tournament_info
+    mtt = row(type="MTT", status="SCHEDULED", scheduledStartAt="2026-11-05T20:00:00.000Z", reEntryUnlimited=True,
+              reEntryMax=None, rebuyMax=0, rebuyUnlimited=False, addOnStack=0, lateRegUntilLevel=14,
+              lateRegClosesAt="2026-11-05T21:40:00.000Z")
+    assert lobby_rows([mtt], NOW)[0]["info"] == {"rebuy": False, "reentry": True, "addon": False, "late_reg": True,
+                                                 "late_reg_until": "2026-11-05T21:40:00.000Z", "late_reg_level": 14}
+    assert tournament_info(row()) == {"late_reg": False}

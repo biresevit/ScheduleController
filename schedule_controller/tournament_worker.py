@@ -116,6 +116,14 @@ class TournamentPlay:
         value = self.policy.get(f"Max{'Mtt' if fmt == 'MTT' else 'Sng'}{kind}")
         return 3 if value is None and kind == "Rebuys" else 1 if value is None else int(value)
 
+    def wants(self, state, key, column, default):
+        """The MTT plan's choice for this registration (state 'plan_rebuy' / 'plan_addon', from the scheduler), else
+        a draw with the account's chance. A planned rebuy still respects the account's rebuy / re-entry limits."""
+        planned = state.get(key)
+        if planned is not None:
+            return bool(planned)
+        return self.session.rng.random() < self.chance(column, default)
+
     def chance(self, column, default):
         value = self.policy.get(column)
         return default if value is None else float(value)
@@ -312,7 +320,7 @@ class TournamentPlay:
         # with the tournament rebuy chance. entry_idx counts the re-entries already taken.
         if (status.get("isReEntryPeriodActive") and status.get("reEntryAllowedPersonal")
                 and int(state.get("entry_idx") or 0) < self.limit("Reentries", state.get("format"))
-                and self.session.rng.random() < self.chance("RebuyTournamentChance", .5)):
+                and self.wants(state, "plan_rebuy", "RebuyTournamentChance", .5)):
             await self.pause(3, 10)
             try:
                 await self.register(tid, state["format"], int(state.get("entry_idx") or 0) + 1)
@@ -373,7 +381,7 @@ class TournamentPlay:
             return
         entry_idx = int(state.get("entry_idx") or 0)
         allowed = state.get("rebuys", 0) < self.limit("Rebuys", state.get("format"))
-        if allowed and self.session.rng.random() < self.chance("RebuyTournamentChance", .5):
+        if allowed and self.wants(state, "plan_rebuy", "RebuyTournamentChance", .5):
             reply = await self.client.connection.request("RebuyRequest", tournamentId=tid, type=REBUY,
                                                          playerEntryIdx=entry_idx, chipsAmount=int(state.get("rebuy_chips") or 0))
             ok = reply.get("success") or "planned" in str(reply.get("text", ""))
@@ -391,7 +399,7 @@ class TournamentPlay:
         if state.get("addon_decided") or not (status.get("isAddonPeriodActive") and status.get("addonAllowedPersonal")):
             return
         state["addon_decided"] = True
-        if self.session.rng.random() < self.chance("AddonChance", .5):
+        if self.wants(state, "plan_addon", "AddonChance", .5):
             self.spawn(self.addon(tid), "add-on")
         else:
             self.log.info("TOURNAMENT NO ADD-ON %s tournament=%s", self.policy["Username"], tid)

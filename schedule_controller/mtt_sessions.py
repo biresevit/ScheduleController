@@ -94,8 +94,10 @@ def wake_registrations(db, site, stamp, rng, session_factory):
         db.execute("""UPDATE scheduler.Entry SET MachineId=?,WorkerEpoch=?,SessionId=?,IsParked=0,
             Status='reserved' WHERE EntryId=? AND IsParked=1""", mid, epoch, session, row['EntryId'])
         cid = str(uuid.uuid4())
+        plan = {k: bool(row[c]) for k, c in (('rebuy', 'TournamentRebuy'), ('addon', 'TournamentAddon'))
+                if row.get(c) is not None}
         payload = json.dumps({'account_id': aid, 'table_id': row['TableId'], 'format': 'MTT',
-                              'resume_registration': True,'new_session':row['OpenSessionId'] is None})
+                              'resume_registration': True,'new_session':row['OpenSessionId'] is None, **plan})
         db.execute("""INSERT scheduler.Command(CommandId,SiteId,EntryId,MachineId,WorkerEpoch,Kind,Status,IsOpen,
             ConfigVersion,PayloadJson,NotBeforeUtc,ExpiresUtc) VALUES(?,?,?,?,?,'join','pending',1,?,?,?,?)""",
             cid, sid, row['EntryId'], mid, epoch, site['ConfigVersion'], payload, due, due + timedelta(minutes=30))

@@ -36,6 +36,8 @@ class Tournament:
     start: datetime | None = None
     game: str = "NLH"
     name: str = ""
+    open: bool = True          # lobby IsOpen: a running MTT accepts late registrations while it is open
+    info: dict = field(default_factory=dict, compare=False)  # LobbyTable.TournamentInfo (mtt_plans.parse_info)
 
 
 # AllowedGames value of an account that plays only SNGs and MTTs (no ring table matches it).
@@ -58,6 +60,8 @@ class Registration:
     machine: int
     tournament: str
     not_before: datetime
+    rebuy: bool | None = None  # MTT plans: whether this bot rebuys / re-enters and takes the add-on
+    addon: bool | None = None
 
 
 @dataclass
@@ -109,53 +113,13 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
         result.reasons.append("no_open_tournament")
         return result
 
-    ready = {m.id: m for m in machines if m.enabled and m.ready and not m.maintenance and m.capacity > 0
-             and fresh(m.heartbeat, heartbeat_seconds)}
-    account_count = Counter(e.account for e in entries if not e.parked)
-    # PC capacity: every open entry except MTT registrations whose tournament is still far away (capacity_entries).
-    machine_count = Counter(e.machine for e in (entries if capacity_entries is None else capacity_entries))
-    owners = {a.id: {e.machine for e in entries if e.account == a.id and not e.parked} | ({a.owner_machine} if a.owner_machine is not None else set())
-              for a in accounts}
-    registered = {(e.account, e.table) for e in entries}
-    # Open entries of this format per account (registered or playing), against the account's limit.
-    format_count = Counter(e.account for e in entries if formats.get(e.table, fmt if str(e.table).startswith("T") else None) == fmt)
-    limit = (lambda a: a.max_sng_entries) if fmt == "SNG" else (lambda a: a.max_mtt_entries)
-
-    options = []
-    for a in accounts:
-        if (not a.enabled or a.synthetic or not a.credentials_ready or a.requires_reconciliation or a.manual
-                or a.drain_for_update or len(owners[a.id]) > 1 or account_count[a.id] >= a.max_tables
-                or format_count[a.id] >= limit(a)
-                or a.eligible_after is not None and now < a.eligible_after.astimezone(timezone.utc)
-                or a.session_end is not None and now >= a.session_end.astimezone(timezone.utc)):
-            continue
-        fitting = [t for t in open_tournaments if fits(t.buy_in, ranges.get(a.tier)) and (a.id, t.id) not in registered
-                   and (t.game in a.games or TOURNAMENTS_ONLY in a.games)]
-        if not fitting:
-            continue
-        for m in ready.values():
-            if machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:
-                continue
-            options.append((a, m, fitting))
+    options = _options(fmt, now, accounts, machines, entries, heartbeat_seconds, capacity_entries,
+                       lambda a: [t for t in open_tournaments if fits(t.buy_in, ranges.get(a.tier))
+                                  and (t.game in a.games or TOURNAMENTS_ONLY in a.games)], formats)
     if not options:
         result.reasons.append("no_eligible_account")
         return result
-
-    # Like ring joins: fill running sessions first, then accounts under their daily preference,
-    # weighted by playing frequency and favouring the least played.
-    resuming = [o for o in options if o[0].session_end is not None]
-    if resuming:
-        options = resuming
-    under_limit = [o for o in options if o[0].played_seconds < o[0].max_minutes * 60]
-    if under_limit:
-        options = under_limit
-    available = {o[0].id: o[0] for o in options}
-    chosen = rng.choices(list(available), weights=[FREQUENCY_WEIGHTS.get(a.frequency, 1) / (1 + a.played_seconds / 3600)
-                                                   for a in available.values()], k=1)[0]
-    choices = [o for o in options if o[0].id == chosen]
-    load = lambda m: machine_count[m.id] / m.capacity
-    machine = min((o[1] for o in choices), key=lambda m: (load(m), m.id))
-    fitting = choices[0][2]
+    chosen, machine, fitting = _choose(options, rng)
     if fmt == "SNG":
         # Fewest free seats starts soonest: a 6-max at 5/6 before a 36-player SNG at 34/36.
         best = min(t.max_players - t.registered for t in fitting)
@@ -169,4 +133,126 @@ def plan_registrations(fmt: str, now: datetime, target: int, accounts: list[Acco
     due = max(now, next_time.astimezone(timezone.utc)) if next_time else now
     result.actions.append(Registration(chosen, machine.id, tournament.id, due))
     result.next_time = due + timedelta(seconds=rng.uniform(min_gap, max(min_gap, max_gap)))
+    return result
+
+
+def _fresh(now: datetime, stamp: datetime, seconds: int) -> bool:
+    return (now - stamp.astimezone(timezone.utc)).total_seconds() <= seconds
+
+
+def _options(fmt, now, accounts, machines, entries, heartbeat_seconds, capacity_entries, fitting_for, formats,
+             registered=None):
+    """(account, machine, fitting tournaments) for every account that may register now, on every PC it may use.
+
+    Accounts follow the ring rules (enabled, credentials, cooldown, session, table limit, one PC) and the account's
+    limit of open entries of this format; PCs must be ready, fresh and below capacity."""
+    ready = {m.id: m for m in machines if m.enabled and m.ready and not m.maintenance and m.capacity > 0
+             and _fresh(now, m.heartbeat, heartbeat_seconds)}
+    account_count = Counter(e.account for e in entries if not e.parked)
+    # PC capacity: every open entry except MTT registrations whose tournament is still far away (capacity_entries).
+    machine_count = Counter(e.machine for e in (entries if capacity_entries is None else capacity_entries))
+    owners = {a.id: {e.machine for e in entries if e.account == a.id and not e.parked} | ({a.owner_machine} if a.owner_machine is not None else set())
+              for a in accounts}
+    registered = registered if registered is not None else {(e.account, e.table) for e in entries}
+    # Open entries of this format per account (registered or playing), against the account's limit.
+    format_count = Counter(e.account for e in entries if formats.get(e.table, fmt if str(e.table).startswith("T") else None) == fmt)
+    limit = (lambda a: a.max_sng_entries) if fmt == "SNG" else (lambda a: a.max_mtt_entries)
+    options = []
+    for a in accounts:
+        if (not a.enabled or a.synthetic or not a.credentials_ready or a.requires_reconciliation or a.manual
+                or a.drain_for_update or len(owners[a.id]) > 1 or account_count[a.id] >= a.max_tables
+                or format_count[a.id] >= limit(a)
+                or a.eligible_after is not None and now < a.eligible_after.astimezone(timezone.utc)
+                or a.session_end is not None and now >= a.session_end.astimezone(timezone.utc)):
+            continue
+        fitting = [t for t in fitting_for(a) if (a.id, t.id) not in registered]
+        if not fitting:
+            continue
+        for m in ready.values():
+            if machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:
+                continue
+            options.append((a, m, fitting, machine_count[m.id] / m.capacity))
+    return options
+
+
+def _choose(options, rng):
+    """Like ring joins: fill running sessions first, then accounts under their daily preference, weighted by
+    playing frequency and favouring the least played; the least loaded of the account's PCs."""
+    resuming = [o for o in options if o[0].session_end is not None]
+    if resuming:
+        options = resuming
+    under_limit = [o for o in options if o[0].played_seconds < o[0].max_minutes * 60]
+    if under_limit:
+        options = under_limit
+    available = {o[0].id: o[0] for o in options}
+    chosen = rng.choices(list(available), weights=[FREQUENCY_WEIGHTS.get(a.frequency, 1) / (1 + a.played_seconds / 3600)
+                                                   for a in available.values()], k=1)[0]
+    choices = [o for o in options if o[0].id == chosen]
+    best = min(choices, key=lambda o: (o[3], o[1].id))
+    return chosen, best[1], best[2]
+
+
+@dataclass
+class MttProgress:
+    """One MTT instance's registrations so far (every entry that registered, also the ones that busted)."""
+    registered: int = 0
+    rebuy: int = 0
+    addon: int = 0
+    accounts: set = field(default_factory=set)
+
+
+def plan_mtt_registrations(now: datetime, plans: dict, tournaments: list[Tournament], progress: dict,
+                           accounts: list[Account], machines: list[Machine], entries: list[Entry], ranges: dict,
+                           next_time: datetime | None, min_gap: int, max_gap: int, heartbeat_seconds: int,
+                           freshness_seconds: int, rng: random.Random, excluded=(),
+                           capacity_entries: list[Entry] | None = None) -> TournamentPlan:
+    """Plan at most one MTT registration from the per-MTT plans (mtt_plans).
+
+    plans: series name -> MttPlan. progress: lobby TableId -> MttProgress.
+    The MTT furthest behind its plan goes first (then the earliest start). Registrations are paced by the site's
+    join gap while on plan; an MTT two or more behind registers at once (one per scheduler tick).
+    Accounts whose tier buy-in range fits the MTT are preferred; the others may still play it, as the operator
+    chose this MTT and its number of bots."""
+    from .mtt_plans import desired, open_for, series_name, take
+    result = TournamentPlan(next_time=next_time)
+    behind = []
+    for t in tournaments:
+        if t.format != "MTT" or t.game != "NLH" or t.start is None or is_excluded(t.name, excluded):
+            continue
+        plan = plans.get(series_name(t.name))
+        if plan is None or plan.total <= 0 or not _fresh(now, t.observed, freshness_seconds):
+            continue
+        if not open_for(plan, t.start, now, t.state, t.open, t.info):
+            continue
+        done = progress.get(t.id) or MttProgress()
+        need = desired(plan, t.start, now, t.info) - done.registered
+        if need > 0:
+            behind.append((need, t, plan, done))
+    if not behind:
+        result.reasons.append("on_plan")
+        return result
+    behind.sort(key=lambda x: (-x[0], x[1].start, x[1].id))
+    if behind[0][0] < 2 and next_time is not None and now < next_time.astimezone(timezone.utc):
+        result.reasons.append("paced")
+        return result
+    formats = {t.id: t.format for t in tournaments}
+    registered = {(e.account, e.table) for e in entries} | {(a, tid) for tid, p in progress.items() for a in p.accounts}
+    for need, t, plan, done in behind:
+        def fitting(a, t=t, tiered=True):
+            return [t] if (t.game in a.games or TOURNAMENTS_ONLY in a.games) and (not tiered or fits(t.buy_in, ranges.get(a.tier))) else []
+        options = _options("MTT", now, accounts, machines, entries, heartbeat_seconds, capacity_entries, fitting, formats, registered)
+        if not options:
+            options = _options("MTT", now, accounts, machines, entries, heartbeat_seconds, capacity_entries,
+                               lambda a, t=t: fitting(a, t, False), formats, registered)
+        if not options:
+            result.reasons.append(f"no_eligible_account:{t.id}")
+            continue
+        chosen, machine, _ = _choose(options, rng)
+        remaining = plan.total - done.registered
+        rebuy = take(plan.rebuy - done.rebuy, remaining, rng.random())
+        addon = take(plan.addon - done.addon, remaining, rng.random())
+        due = now
+        result.actions.append(Registration(chosen, machine.id, t.id, due, rebuy=rebuy, addon=addon))
+        result.next_time = due + timedelta(seconds=rng.uniform(min_gap, max(min_gap, max_gap)))
+        return result
     return result

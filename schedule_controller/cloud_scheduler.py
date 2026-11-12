@@ -17,7 +17,7 @@ from .tournament_worker import tournament_id
 from .database import connection_string
 from .planner import Account, Entry, Machine, Settings, Table, plan
 from .rules import Band, Window, target_at
-from .tournaments import Tournament, excluded_names, plan_registrations
+from .tournaments import MttProgress, Tournament, excluded_names, plan_mtt_registrations, plan_registrations
 from .join_failures import limit_failed_sessions
 
 log = logging.getLogger(__name__)
@@ -67,6 +67,23 @@ class Rows:
 MTT_REGISTRATION_WAITING = """(e.IsParked=1 OR e.Status='joining' AND EXISTS(SELECT 1 FROM scheduler.LobbyTable w
     WHERE w.SiteId=e.SiteId AND w.TableId=e.TableId AND w.TableType='MTT' AND w.TournamentState='registering'
       AND w.StartUtc>DATEADD(minute,30,SYSUTCDATETIME())))"""
+
+def mtt_progress(db, site_id) -> dict:
+    """Registrations per MTT instance still to be planned: every entry that registered (open, or seated and since busted), with the
+    plan's rebuy / add-on choices and the accounts (one registration per account and instance)."""
+    progress = {}
+    for r in db.rows("""SELECT e.TableId,e.BotAccountId,e.TournamentRebuy,e.TournamentAddon FROM scheduler.Entry e
+            JOIN scheduler.LobbyTable l ON l.SiteId=e.SiteId AND l.TableId=e.TableId
+            WHERE e.SiteId=? AND l.TableType='MTT' AND l.TournamentState<>'completed'
+              AND l.StartUtc>=DATEADD(day,-2,SYSUTCDATETIME()) AND e.Status<>'failed'
+              AND (e.IsOpen=1 OR e.SeatedUtc IS NOT NULL)""", site_id):
+        p = progress.setdefault(r["TableId"], MttProgress())
+        p.registered += 1
+        p.rebuy += bool(r.get("TournamentRebuy"))
+        p.addon += bool(r.get("TournamentAddon"))
+        p.accounts.add(r["BotAccountId"])
+    return progress
+
 
 class CloudScheduler:
     """Plans every enabled site under a per-site SQL application lock."""
@@ -340,23 +357,32 @@ class CloudScheduler:
         site_id = site["SiteId"]
         ranges = {r["Tier"]: (r["TournamentMinBuyIn"], r["TournamentMaxBuyIn"]) if r.get("TournamentMinBuyIn") is not None else None
                   for r in db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=?", site_id)}
+        from .mtt_plans import parse_info, plan_from_row
         tournaments = [Tournament(t["TableId"], t["TableType"], Decimal(t["MinBuyIn"]), int(t["OccupiedSeats"]), int(t["MaxSeats"]),
                                   t.get("TournamentState") or "registering", aware(t["ObservedUtc"]), aware(t.get("StartUtc")), t["GameType"],
-                                  t.get("TableName") or "")
+                                  t.get("TableName") or "", bool(t.get("IsOpen", True)), parse_info(t.get("TournamentInfo")))
                        for t in lobby_rows if t.get("TableType") in ("SNG", "MTT")]
+        # MTTs follow their per-tournament plans (Schedule page, MTT tab), not a weekly schedule.
+        plans = {r["SeriesName"]: plan_from_row(r) for r in db.rows("SELECT * FROM scheduler.MttPlan WHERE SiteId=?", site_id)}
         excluded = excluded_names(site.get("ExcludedTournamentNames"))
         freshness = max(site["TableFreshnessSeconds"], 3 * (site.get("LobbyRefreshSeconds") or 60))
         results = {}
         for fmt, column in (("SNG", "NextSngUtc"), ("MTT", "NextMttUtc")):
-            target = target_at(windows_by_format.get(fmt, []), stamp, site["TimeZone"])
+            target = target_at(windows_by_format.get(fmt, []), stamp, site["TimeZone"]) if fmt == "SNG" else None
             # Re-read open entries so a registration planned just before counts toward this one.
             rows = db.rows(f"""SELECT e.*,CASE WHEN {MTT_REGISTRATION_WAITING} THEN 1 ELSE 0 END AS Waiting
                 FROM scheduler.Entry e WHERE e.SiteId=? AND e.IsOpen=1""", site_id)
             entries = [Entry(str(e["EntryId"]), e["BotAccountId"], e["MachineId"], e["TableId"], e["Status"],parked=bool(e['IsParked'])) for e in rows]
             holding = [entry for entry, row in zip(entries, rows) if not row["Waiting"]]
-            plan = plan_registrations(fmt, stamp, target, accounts, machines, tournaments, entries, ranges,
-                aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
-                site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding)
+            if fmt == "SNG":
+                plan = plan_registrations(fmt, stamp, target, accounts, machines, tournaments, entries, ranges,
+                    aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
+                    site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding)
+            else:
+                plan = plan_mtt_registrations(stamp, plans, tournaments, mtt_progress(db, site_id), accounts, machines,
+                    entries, ranges, aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
+                    site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding)
+                target = len(plans)
             created = 0
             for action in plan.actions:
                 join = SimpleNamespace(account=action.account, machine=action.machine, table=action.tournament,
@@ -366,6 +392,8 @@ class CloudScheduler:
                 registration_only=waits_for_mtt({'table_type':fmt,'tournament_state':row.get('TournamentState'),
                                                'start':aware(row.get('StartUtc'))},stamp)
                 extra = {"format": fmt, "tournament_id": tournament_id(action.tournament),'registration_only':registration_only}
+                if action.rebuy is not None:
+                    extra.update(rebuy=action.rebuy, addon=action.addon)
                 if self._create_join(db, site, join, policy_by_id[action.account], machine_by_id[action.machine], rng, extra):
                     created += 1
             if created:
@@ -403,8 +431,9 @@ class CloudScheduler:
         session_id = None if (extra or {}).get('registration_only') else self._session(db, site["SiteId"], action.account, action.machine, epoch, policy, action.not_before, rng)
         entry_id, command_id = str(uuid.uuid4()), str(uuid.uuid4())
         db.execute("""INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,
-            IsOpen,CreatedUtc,SessionId) VALUES(?,?,?,?,?,?,'reserved',1,SYSUTCDATETIME(),?)""",
-            entry_id, site["SiteId"], action.account, action.machine, epoch, action.table, session_id)
+            IsOpen,CreatedUtc,SessionId,TournamentRebuy,TournamentAddon) VALUES(?,?,?,?,?,?,'reserved',1,SYSUTCDATETIME(),?,?,?)""",
+            entry_id, site["SiteId"], action.account, action.machine, epoch, action.table, session_id,
+            (extra or {}).get("rebuy"), (extra or {}).get("addon"))
         payload = json.dumps({"account_id": action.account, "table_id": action.table,
                               "soft_limit_override": action.soft_limit_override, **(extra or {})})
         due = action.not_before.replace(tzinfo=None)

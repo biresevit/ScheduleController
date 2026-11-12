@@ -44,7 +44,7 @@ def main():
             "dbo.BotAccount":"SELECT","dbo.CustomerHandHistory":"SELECT",
             "reporting.HandProcessing":"SELECT,INSERT,UPDATE",
             "reporting.HandPlayerResult":"SELECT,INSERT,UPDATE,DELETE",
-            "scheduler.Site":"SELECT,UPDATE","scheduler.StakeBand":"SELECT","scheduler.ScheduleWindow":"SELECT",
+            "scheduler.Site":"SELECT,UPDATE","scheduler.StakeBand":"SELECT","scheduler.ScheduleWindow":"SELECT","scheduler.MttPlan":"SELECT",
             "scheduler.AccountPolicy":"SELECT","scheduler.AccountDay":"SELECT","scheduler.MachineAssignment":"SELECT",
             "scheduler.LobbyTable":"SELECT","scheduler.TableSeat":"SELECT","scheduler.AccountLease":"SELECT,INSERT,UPDATE,DELETE",
             "scheduler.AccountSession":"SELECT,INSERT,UPDATE","scheduler.Entry":"SELECT,INSERT,UPDATE",

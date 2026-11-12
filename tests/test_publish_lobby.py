@@ -46,7 +46,7 @@ def test_publish_writes_the_lobby_in_one_batch_before_the_journal():
     epoch,rows,seat_tables,players=batches[0]
     assert epoch==EPOCH and json.loads(seat_tables)==['128016534']
     assert json.loads(rows)==[dict(id='128016534',name='T',game='NLH',type='RING',bb='0.02',min=1,max=4,seats=6,occupied=2,open=True,
-                                   observed='2026-10-31T17:00:00',snapshot=None,start=None,state=None)]
+                                   observed='2026-10-31T17:00:00',snapshot=None,start=None,state=None,info=None)]
     assert json.loads(players)[0]=={'table':'128016534','seat':2,'native':'55','name':'andrew','account':14536,'stack':'2.10','bet':0,
                                         'in_game':True,'away':False,'hand':'99','observed':'2026-10-31T17:00:00'}
 

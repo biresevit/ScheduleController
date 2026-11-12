@@ -63,6 +63,12 @@ def ring_table(entry):
     table=str(entry['table'])
     return None if table.startswith('T') else table_key(table)
 def guid(): return str(uuid.uuid4())
+def apply_tournament_plan(tourneys,table,source):
+    """The MTT plan's rebuy / add-on choice for this registration (join payload 'rebuy'/'addon', or the entry's
+    TournamentRebuy/TournamentAddon after a restart) onto the tournament state; absent: the account's chances."""
+    plan={key:bool(source[name]) for key,name in (('plan_rebuy','rebuy'),('plan_addon','addon')) if (source or {}).get(name) is not None}
+    state=getattr(tourneys,'active',{}).get(tournament_id(table)) if plan else None
+    if state is not None:state.update(plan)
 def aware(value):
     if value is None: return None
     return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
@@ -1223,6 +1229,7 @@ class Pilot:
                 only=fmt=='MTT' and (payload.get('registration_only') or waits_for_mtt(row,now()))
                 if only:await c.tourneys.register(tournament_id(e['table']),fmt,registration_only=True)
                 else:await c.tourneys.register(tournament_id(e['table']),fmt)
+            apply_tournament_plan(c.tourneys,e['table'],payload)
             session=next((s for s in reversed(self.sessions) if s['account']==e['account'] and not s.get('closed')),None)
             e.update(confirmed=now(),session=e.get('session') or (session and session['id']))
             cmd['status']='succeeded'
@@ -1504,6 +1511,7 @@ class Pilot:
                     'created':aware(row['CreatedUtc']),'seated':aware(row['SeatedUtc']),'commands':[],
                     'session':str(row['SessionId']) if row.get('SessionId') else None}
                 session.tourneys.active.setdefault(tournament_id(key),{'format':row.get('TableType') or 'SNG','entry_idx':0,'table':None,'addon_decided':False})
+                apply_tournament_plan(session.tourneys,key,{'rebuy':row.get('TournamentRebuy'),'addon':row.get('TournamentAddon')})
                 try:await session.tourneys.resume()
                 except Exception as exc:log.warning('Tournament resume failed for %s / %s: %s',row['Username'],key,exc)
                 # A registration EvenBet no longer holds (unregistered or cancelled) and that has no

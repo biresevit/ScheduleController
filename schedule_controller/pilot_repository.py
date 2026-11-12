@@ -28,20 +28,20 @@ LOBBY_SQL="""SET NOCOUNT ON;
 DECLARE @site int=:site,@machine int=:machine,@epoch uniqueidentifier=?,@tables nvarchar(max)=?,@seatTables nvarchar(max)=?,@seats nvarchar(max)=?;
 DECLARE @t TABLE(TableId nvarchar(80) PRIMARY KEY,TableName nvarchar(200),GameType varchar(8),TableType varchar(4),BigBlind decimal(19,4),
     MinBuyIn decimal(19,4),MaxBuyIn decimal(19,4),MaxSeats smallint,OccupiedSeats smallint,IsOpen bit,ObservedUtc datetime2(3),FullSnapshotUtc datetime2(3),
-    StartUtc datetime2(3),TournamentState varchar(12));
+    StartUtc datetime2(3),TournamentState varchar(12),TournamentInfo nvarchar(2000));
 INSERT @t SELECT * FROM OPENJSON(@tables) WITH(TableId nvarchar(80) '$.id',TableName nvarchar(200) '$.name',GameType varchar(8) '$.game',
     TableType varchar(4) '$.type',BigBlind decimal(19,4) '$.bb',MinBuyIn decimal(19,4) '$.min',MaxBuyIn decimal(19,4) '$.max',MaxSeats smallint '$.seats',
     OccupiedSeats smallint '$.occupied',IsOpen bit '$.open',ObservedUtc datetime2(3) '$.observed',FullSnapshotUtc datetime2(3) '$.snapshot',
-    StartUtc datetime2(3) '$.start',TournamentState varchar(12) '$.state');
+    StartUtc datetime2(3) '$.start',TournamentState varchar(12) '$.state',TournamentInfo nvarchar(2000) '$.info');
 UPDATE l SET TableName=t.TableName,GameType=t.GameType,TableType=t.TableType,BigBlind=t.BigBlind,MinBuyIn=t.MinBuyIn,MaxBuyIn=t.MaxBuyIn,
     MaxSeats=t.MaxSeats,OccupiedSeats=t.OccupiedSeats,IsOpen=t.IsOpen,ObservedUtc=t.ObservedUtc,FullSnapshotUtc=t.FullSnapshotUtc,
-    StartUtc=t.StartUtc,TournamentState=t.TournamentState,CurrencyCode=(SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=@site),
+    StartUtc=t.StartUtc,TournamentState=t.TournamentState,TournamentInfo=COALESCE(t.TournamentInfo,l.TournamentInfo),CurrencyCode=(SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=@site),
     ObserverEpoch=@epoch,ObserverMachineId=@machine,SnapshotSequence=l.SnapshotSequence+1
     FROM scheduler.LobbyTable l JOIN @t t ON l.SiteId=@site AND l.TableId=t.TableId;
 INSERT scheduler.LobbyTable(SiteId,TableId,TableName,GameType,TableType,BigBlind,MinBuyIn,MaxBuyIn,MaxSeats,OccupiedSeats,IsOpen,
-    ObservedUtc,FullSnapshotUtc,ObserverEpoch,CurrencyCode,ObserverMachineId,SnapshotSequence,StartUtc,TournamentState)
+    ObservedUtc,FullSnapshotUtc,ObserverEpoch,CurrencyCode,ObserverMachineId,SnapshotSequence,StartUtc,TournamentState,TournamentInfo)
     SELECT @site,t.TableId,t.TableName,t.GameType,t.TableType,t.BigBlind,t.MinBuyIn,t.MaxBuyIn,t.MaxSeats,t.OccupiedSeats,t.IsOpen,
-        t.ObservedUtc,t.FullSnapshotUtc,@epoch,(SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=@site),@machine,1,t.StartUtc,t.TournamentState
+        t.ObservedUtc,t.FullSnapshotUtc,@epoch,(SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=@site),@machine,1,t.StartUtc,t.TournamentState,t.TournamentInfo
     FROM @t t WHERE NOT EXISTS(SELECT 1 FROM scheduler.LobbyTable l WHERE l.SiteId=@site AND l.TableId=t.TableId);
 DELETE s FROM scheduler.TableSeat s WHERE s.SiteId=@site AND s.TableId IN (SELECT CONVERT(nvarchar(80),value) FROM OPENJSON(@seatTables));
 INSERT scheduler.TableSeat(SiteId,TableId,SeatIndex,NativePlayerId,Username,BotAccountId,Stack,CurrentBet,InGame,SittingOut,HandId,ObservedUtc)
@@ -440,7 +440,7 @@ class Repository(ChatRepository,ManualRepository):
                 raise RuntimeError('Machine has a live worker')
             entries=db.rows("""SELECT e.EntryId,e.BotAccountId,b.Username,e.TableId,e.Status,e.BuyInAmount,
                     e.CreatedUtc,e.SeatedUtc,e.LastConfirmedUtc,e.SessionId,s.StartedUtc,s.PlannedEndUtc,
-                    e.IsParked,e.PlayTableId,l.TableType,l.StartUtc,l.TournamentState,
+                    e.IsParked,e.PlayTableId,l.TableType,l.StartUtc,l.TournamentState,e.TournamentRebuy,e.TournamentAddon,
                     CONVERT(bit,CASE WHEN EXISTS(SELECT 1 FROM scheduler.Command c WHERE c.EntryId=e.EntryId
                         AND c.Kind='join' AND c.Status='succeeded') THEN 1 ELSE 0 END) AS RegistrationConfirmed
                 FROM scheduler.Entry e WITH(UPDLOCK,HOLDLOCK)
@@ -667,7 +667,8 @@ class Repository(ChatRepository,ManualRepository):
         latest={str(t['id']):t for t in tables}
         rows=[dict(id=tid,name=t['name'],game=t['game'],type=t.get('table_type','RING'),bb=t['bb'],min=t['minimum'],max=t['maximum'],
                    seats=t['seats'],occupied=t['occupied'],open=bool(t['open']),observed=iso(t['observed']),snapshot=iso(t.get('snapshot')),
-                   start=iso(t.get('start')),state=t.get('tournament_state'))
+                   start=iso(t.get('start')),state=t.get('tournament_state'),
+                   info=json.dumps(t['info'],sort_keys=True,default=str)[:2000] if t.get('info') else None)
               for tid,t in sorted(latest.items())]
         players=[dict(table=str(tid),seat=p['seat'],native=None if p['native_id'] is None else str(p['native_id']),name=p['name'],account=p['account'],
                       stack=p['stack'],bet=p['bet'],in_game=bool(p['in_game']),away=bool(p['away']),hand=None if p['hand'] is None else str(p['hand']),

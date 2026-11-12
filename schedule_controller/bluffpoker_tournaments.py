@@ -61,8 +61,34 @@ def lobby_rows(tournaments: list[dict], observed: datetime) -> list[dict]:
                      "bb": max(buy_in, Decimal("0.01")), "minimum": buy_in, "maximum": buy_in,
                      "seats": seats, "occupied": min(registered, seats), "open": open_,
                      "observed": observed, "snapshot": observed, "start": parse_time(t.get("scheduledStartAt")),
-                     "tournament_state": state})
+                     "tournament_state": state, "info": tournament_info(t)})
     return rows
+
+
+def tournament_info(t: dict) -> dict:
+    """What the lobby list says about rebuys, re-entries, the add-on and late registration (API doc 5.2); a key is
+    left out when the hub did not send its fields."""
+    def has(*keys):
+        return any(k in t for k in keys)
+    info = {}
+    if has("rebuyMax", "rebuyUnlimited"):
+        info["rebuy"] = bool(t.get("rebuyUnlimited")) or int(t.get("rebuyMax") or 0) > 0
+    if has("reEntryMax", "reEntryUnlimited"):
+        info["reentry"] = bool(t.get("reEntryUnlimited")) or int(t.get("reEntryMax") or 0) > 0
+    if has("addOnStack"):
+        info["addon"] = int(t.get("addOnStack") or 0) > 0
+    if has("lateRegUntilLevel", "lateRegMinutes", "lateRegOpen"):
+        info["late_reg"] = bool(t.get("lateRegUntilLevel") or t.get("lateRegMinutes") or t.get("lateRegOpen"))
+    until = t.get("lateRegClosesAt") or t.get("lateRegEndsAt")
+    if until:
+        info["late_reg_until"] = str(until)
+    if t.get("lateRegUntilLevel"):
+        info["late_reg_level"] = int(t["lateRegUntilLevel"])
+    if has("guaranteedPrizePool", "guaranteed"):
+        value = t.get("guaranteedPrizePool", t.get("guaranteed"))
+        if value:
+            info["guaranteed"] = str(value)
+    return info
 
 
 class BluffPokerTournaments:
@@ -204,6 +230,14 @@ class BluffPokerTournaments:
         value = self.policy.get(f"Max{'Mtt' if fmt == 'MTT' else 'Sng'}{kind}")
         return 3 if value is None and kind == "Rebuys" else 1 if value is None else int(value)
 
+    def wants(self, state, key, column, default):
+        """The MTT plan's choice for this registration (state 'plan_rebuy' / 'plan_addon', from the scheduler), else
+        a draw with the account's chance. A planned rebuy still respects the account's rebuy / re-entry limits."""
+        planned = state.get(key)
+        if planned is not None:
+            return bool(planned)
+        return self.session.rng.random() < self.chance(column, default)
+
     def chance(self, column, default):
         value = self.policy.get(column)
         return default if value is None else float(value)
@@ -247,7 +281,7 @@ class BluffPokerTournaments:
             kind, offer = "reentry", reentry
         else:
             return False
-        if self.session.rng.random() >= self.chance("RebuyTournamentChance", .5):
+        if not self.wants(state, "plan_rebuy", "RebuyTournamentChance", .5):
             self.log.info("TOURNAMENT NO %s %s tournament=%s", kind.upper(), self.policy["Username"], tid)
             return False
         if not await self.affordable(offer):
@@ -318,7 +352,7 @@ class BluffPokerTournaments:
         elif not state.get("rebuy_offer_decided"):
             state["rebuy_offer_decided"] = True
             if (state.get("rebuys", 0) < self.limit("Rebuys", fmt)
-                    and self.session.rng.random() < self.chance("RebuyTournamentChance", .5)
+                    and self.wants(state, "plan_rebuy", "RebuyTournamentChance", .5)
                     and await self.affordable(offer)):
                 await self.pause(2, 6)
                 if await self.rebuy(tid):
@@ -329,7 +363,7 @@ class BluffPokerTournaments:
         addon = reply.get("myAddOn")
         if addon and not state.get("addon_decided"):
             state["addon_decided"] = True
-            if self.session.rng.random() < self.chance("AddonChance", .5) and await self.affordable(addon):
+            if self.wants(state, "plan_addon", "AddonChance", .5) and await self.affordable(addon):
                 await self.pause(2, 15)
                 if await self.purchase(tid, "addon"):
                     self.emit(tid, "addon", price=addon.get("priceChips"), fee=addon.get("feeChips"), chips=addon.get("chips"))
