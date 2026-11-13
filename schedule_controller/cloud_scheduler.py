@@ -50,6 +50,31 @@ def cancel_paused_joins(db, site_id):
     return db.one("EXEC scheduler.CancelPausedJoins @SiteId=?", site_id)["n"]
 
 
+# A PC claims a join for 5 minutes (ClaimUntilUtc); a join it still has not finished 10 minutes after that will not
+# finish (13 Nov 2026: a worker crashed on accounts created after it started and left 131 joins claimed for hours,
+# their entries counted as registered by the MTT plans and as capacity).
+STUCK_CLAIM_MINUTES = 10
+
+
+def expire_stuck_joins(db, site_id) -> dict:
+    """Fail join commands a PC claimed and never finished; close their entries if the site never confirmed them.
+    An entry already confirmed (registered or seated) keeps going: only its command is failed."""
+    return db.one("""SET NOCOUNT ON;
+        DECLARE @stuck TABLE(CommandId uniqueidentifier PRIMARY KEY,EntryId uniqueidentifier);
+        INSERT @stuck SELECT c.CommandId,c.EntryId FROM scheduler.Command c WITH(UPDLOCK,HOLDLOCK)
+            WHERE c.SiteId=? AND c.Kind='join' AND c.IsOpen=1 AND c.Status='claimed'
+              AND c.ClaimUntilUtc<DATEADD(minute,-?,SYSUTCDATETIME());
+        UPDATE c SET Status='failed',IsOpen=0,ResultCode='claim_expired',
+            ResultText='The PC took this task but never reported a result.',ClaimToken=NULL,ClaimUntilUtc=NULL,
+            UpdatedUtc=SYSUTCDATETIME()
+            FROM scheduler.Command c JOIN @stuck s ON s.CommandId=c.CommandId;
+        UPDATE e SET Status='failed',IsOpen=0,ClosedUtc=SYSUTCDATETIME()
+            FROM scheduler.Entry e JOIN @stuck s ON s.EntryId=e.EntryId
+            WHERE e.IsOpen=1 AND e.Status IN ('reserved','joining') AND e.SeatedUtc IS NULL AND e.LastConfirmedUtc IS NULL;
+        DECLARE @closed int=@@ROWCOUNT;
+        SELECT (SELECT COUNT(*) FROM @stuck) AS commands,@closed AS entries;""", site_id, STUCK_CLAIM_MINUTES)
+
+
 class Rows:
     def __init__(self, cursor): self.cursor = cursor
     def rows(self, sql, *args):
@@ -141,6 +166,10 @@ class CloudScheduler:
             target = target_at(windows_by_format.get("RING", []), stamp, site["TimeZone"]) if site["SchedulingEnabled"] else 0
             local_day = stamp.astimezone(ZoneInfo(site["TimeZone"])).date()
             limit_failed_sessions(db, site_id)
+            stuck = expire_stuck_joins(db, site_id)
+            if stuck and stuck["commands"]:
+                log.warning("Site %s: %s join(s) claimed by a PC but never finished were failed (%s entries closed)",
+                            site_id, stuck["commands"], stuck["entries"])
             # Joins paused from the Schedule page: no new ring joins or SNG/MTT registrations, and the scheduler's
             # joins the PC has not picked up yet are cancelled. Manual tasks, leaves and session ends go on.
             paused = bool(site.get("JoinsPaused"))

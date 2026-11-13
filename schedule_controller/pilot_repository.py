@@ -98,8 +98,9 @@ INSERT @c SELECT c.*,CASE WHEN EXISTS(SELECT 1 FROM scheduler.Command x WHERE x.
     FROM OPENJSON(@commands) WITH(CommandId uniqueidentifier '$.id',EntryId uniqueidentifier '$.entry',Kind varchar(5) '$.kind',
     Status varchar(10) '$.status',IsOpen bit '$.open',ConfigVersion bigint '$.version',NotBeforeUtc datetime2(3) '$.due',
     ExpiresUtc datetime2(3) '$.expires',ResultCode nvarchar(80) '$.result',ResultText nvarchar(1000) '$.result_text') c;
+-- A command the scheduler closed (e.g. claim_expired) is never reopened by a worker that still holds it.
 UPDATE x SET Status=c.Status,IsOpen=c.IsOpen,ResultCode=c.ResultCode,ResultText=c.ResultText,UpdatedUtc=SYSUTCDATETIME()
-    FROM scheduler.Command x JOIN @c c ON c.CommandId=x.CommandId WHERE c.IsNew=0;
+    FROM scheduler.Command x JOIN @c c ON c.CommandId=x.CommandId WHERE c.IsNew=0 AND (x.IsOpen=1 OR c.IsOpen=0);
 -- A command the worker started itself (e.g. leaving a busted seat) is being carried out now; one the scheduler planned
 -- for the same entry and kind but no worker has claimed yet is superseded. Inserting next to it broke the
 -- one-open-command rule: the save failed on every publish and stopped the site (machine 5, 2026-11-09 01:10).
