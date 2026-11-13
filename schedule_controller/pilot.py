@@ -58,6 +58,11 @@ class WorkerFenced(RuntimeError):
 
 
 def now(): return datetime.now(timezone.utc)
+def is_satellite_row(row):
+    from .satellites import is_satellite
+    return row.get('table_type') in ('MTT','SNG') and is_satellite(row.get('name'))
+
+
 def ring_table(entry):
     """The table key of a ring entry (EvenBet: int, BluffPoker: UUID text); None for a tournament entry ('T' + id)."""
     table=str(entry['table'])
@@ -700,7 +705,7 @@ class Pilot:
             e.update(status='seated',seated=e.get('seated') or now(),confirmed=now(),play_table=str(details.get('table')))
             log.info('SEATED %s tournament=%s table=%s',self.policies[aid]['Username'],key,details.get('table'))
         elif event=='finished':
-            self.accrue();e.update(status='closed',closed=now(),confirmed=now());self.accrue()
+            self.accrue();e.update(status='closed',closed=now(),confirmed=now(),place=details.get('place'));self.accrue()
             log.info('FINISHED %s tournament=%s place=%s',self.policies[aid]['Username'],key,details.get('place'))
         elif event in ('reentry','rebuy','addon'):
             # The entry stays open: a re-entry or rebuy keeps the bot in the same tournament.
@@ -709,9 +714,54 @@ class Pilot:
         async def persist():
             try:
                 await self.publish()
-                if event=='finished':await self.close_session_if_idle(aid)
+                if event=='finished':
+                    try:await self.adopt_satellite_seat(aid,e)
+                    except Exception:log.exception('Satellite seat check failed for %s / %s',self.policies[aid]['Username'],key)
+                    await self.close_session_if_idle(aid)
             except Exception:log.exception('Could not persist tournament %s for %s',key,self.policies[aid]['Username'])
         asyncio.create_task(persist())
+
+    async def adopt_satellite_seat(self,aid,satellite,checks=(0,5,15,30)):
+        """After a satellite: BluffPoker registers a ticket winner into the target MTT itself (paid with the ticket).
+        Find that registration and record it as an entry, so the bot plays the target (never a second register)."""
+        from .satellites import satellite_target
+        from .mtt_sessions import waits_for_mtt
+        row=next((t for t in self.tables if str(t['id'])==str(satellite['table'])),None)
+        if not row or not is_satellite_row(row):return None
+        target=satellite_target(row.get('name'),self.tables,now())
+        username=self.policies[aid]['Username']
+        if not target:
+            log.warning('SATELLITE %s ended for %s but its target MTT is not in the lobby',row.get('name'),username);return None
+        key=str(target['id'])
+        if any(x['account']==aid and str(x['table'])==key and x['status'] not in ('closed','failed') for x in self.entries.values()):
+            return None
+        session=self.clients.get(aid)
+        if not session or not hasattr(session.client,'tournament_state'):return None  # BluffPoker only
+        tid=tournament_id(key);status=None
+        for delay in checks:  # the site registers the winner right after the satellite ends
+            if delay:await asyncio.sleep(delay)
+            reply=await session.client.tournament_state(str(tid))
+            status=reply.get('myRegistrationStatus')
+            if status in ('REGISTERED','CHECKED_IN','PLAYING'):break
+        else:
+            log.info('SATELLITE %s: %s finished %s and holds no registration for %s (%s)',row.get('name'),username,
+                     satellite.get('place'),target.get('name'),status)
+            return None
+        e={'id':guid(),'account':aid,'table':key,'status':'joining','created':now(),'confirmed':now(),'commands':[],
+           'session':satellite.get('session'),'won_from':satellite['id']}
+        self.entries[e['id']]=e
+        await self.publish()
+        if waits_for_mtt(target,now()):
+            await self.park_tournament_registration(e)  # the scheduler wakes it up shortly before the start
+        else:
+            if not e['session']:
+                open_session=next((x for x in self.sessions if x['account']==aid and not x.get('closed')),None)
+                e['session']=open_session and str(open_session['id'])
+            session.tourneys.state_for(str(tid),'MTT')  # follows it: seated, table moves, the end
+        log.info('SATELLITE SEAT %s won a seat in %s from %s (place %s, %s)',username,target.get('name'),row.get('name'),
+                 satellite.get('place'),status)
+        await self.publish()
+        return e
 
     async def close_session_if_idle(self,aid):
         """Log out after the account's final planned or active entry closes."""

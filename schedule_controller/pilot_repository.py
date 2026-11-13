@@ -77,17 +77,19 @@ INSERT scheduler.AccountSession(SessionId,SiteId,BotAccountId,MachineId,WorkerEp
 
 DECLARE @e TABLE(EntryId uniqueidentifier PRIMARY KEY,BotAccountId int,TableId nvarchar(80),Status varchar(12),IsOpen bit,
     BuyInAmount decimal(19,4),CreatedUtc datetime2(3),SeatedUtc datetime2(3),ClosedUtc datetime2(3),LastConfirmedUtc datetime2(3),
-    SessionId uniqueidentifier,PlayTableId nvarchar(80),IsParked bit);
+    SessionId uniqueidentifier,PlayTableId nvarchar(80),IsParked bit,FinishPlace int,WonFromEntryId uniqueidentifier);
 INSERT @e SELECT * FROM OPENJSON(@entries) WITH(EntryId uniqueidentifier '$.id',BotAccountId int '$.account',TableId nvarchar(80) '$.table',
     Status varchar(12) '$.status',IsOpen bit '$.open',BuyInAmount decimal(19,4) '$.buy_in',CreatedUtc datetime2(3) '$.created',
     SeatedUtc datetime2(3) '$.seated',ClosedUtc datetime2(3) '$.closed',LastConfirmedUtc datetime2(3) '$.confirmed',
-    SessionId uniqueidentifier '$.session',PlayTableId nvarchar(80) '$.play_table',IsParked bit '$.parked');
-INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,IsOpen,CreatedUtc)
-    SELECT e.EntryId,@site,e.BotAccountId,@machine,@epoch,e.TableId,e.Status,e.IsOpen,e.CreatedUtc
+    SessionId uniqueidentifier '$.session',PlayTableId nvarchar(80) '$.play_table',IsParked bit '$.parked',
+    FinishPlace int '$.place',WonFromEntryId uniqueidentifier '$.won_from');
+INSERT scheduler.Entry(EntryId,SiteId,BotAccountId,MachineId,WorkerEpoch,TableId,Status,IsOpen,CreatedUtc,WonFromEntryId)
+    SELECT e.EntryId,@site,e.BotAccountId,@machine,@epoch,e.TableId,e.Status,e.IsOpen,e.CreatedUtc,e.WonFromEntryId
     FROM @e e WHERE NOT EXISTS(SELECT 1 FROM scheduler.Entry x WHERE x.EntryId=e.EntryId);
 -- PlayTableId: the tournament table a registered bot currently plays (NULL for ring entries).
 UPDATE x SET Status=e.Status,IsOpen=e.IsOpen,BuyInAmount=e.BuyInAmount,SeatedUtc=e.SeatedUtc,ClosedUtc=e.ClosedUtc,
-    LastConfirmedUtc=e.LastConfirmedUtc,SessionId=e.SessionId,PlayTableId=e.PlayTableId,IsParked=COALESCE(e.IsParked,0)
+    LastConfirmedUtc=e.LastConfirmedUtc,SessionId=e.SessionId,PlayTableId=e.PlayTableId,IsParked=COALESCE(e.IsParked,0),
+    FinishPlace=COALESCE(e.FinishPlace,x.FinishPlace)
     FROM scheduler.Entry x JOIN @e e ON e.EntryId=x.EntryId
     WHERE x.MachineId=@machine AND x.WorkerEpoch=@epoch AND (x.IsOpen=1 OR e.IsOpen=0)
       AND NOT (x.IsParked=0 AND COALESCE(e.IsParked,0)=1 AND x.SessionId IS NOT NULL AND e.SessionId IS NULL);
@@ -167,7 +169,8 @@ def journal_payload(entries,sessions,intervals):
         entry_rows[str(e['id'])]=dict(id=str(e['id']),account=e['account'],table=str(e['table']),status=e['status'],open=opened,
             buy_in=e.get('buy_in'),created=stamp_ms(e['created']),seated=stamp_ms(e.get('seated')),closed=stamp_ms(e.get('closed')),
             confirmed=stamp_ms(e.get('confirmed')),session=None if e.get('session') is None else str(e['session']),
-            play_table=None if e.get('play_table') is None else str(e['play_table']),parked=bool(e.get('parked')))
+            play_table=None if e.get('play_table') is None else str(e['play_table']),parked=bool(e.get('parked')),
+            place=e.get('place'),won_from=None if e.get('won_from') is None else str(e['won_from']))
         for cmd in e.get('commands',[]):
             command_rows[str(cmd['id'])]=dict(id=str(cmd['id']),entry=str(e['id']),kind=cmd['kind'],status=cmd['status'],
                 open=cmd['status'] in ('pending','claimed','uncertain'),version=cmd['version'],due=stamp_ms(cmd['due']),
