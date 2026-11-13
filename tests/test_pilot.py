@@ -429,3 +429,26 @@ def test_crashed_worker_lock_is_released_with_its_process(tmp_path):
     lock=WorkerLock(9,9,tmp_path)
     assert lock.acquire()
     lock.release()
+
+
+def test_bluffpoker_offer_with_a_text_table_id_is_answered_inside_its_window(monkeypatch):
+    table='3b355673-ab0e-44f8-92cc-88021c2b03b8'
+    events=[{'t':'RunItTwiceOffer','tableId':table,'handSeq':42,'timeoutMs':5000}]
+    async def next_event():
+        if events: return events.pop()
+        raise asyncio.CancelledError
+    session=Session.__new__(Session);session.repo=None
+    session.policy={'Username':'guido','RunItTwiceChance':Decimal(1)}
+    session.queues={table:object()};session.rit_responses=set();session.rit_tasks=set()
+    session.rng=random.Random(3)
+    session.client=SimpleNamespace(connection=SimpleNamespace(next_event=next_event),states={},player_command=AsyncMock())
+    delays=[]
+    async def sleep(seconds): delays.append(seconds)
+    monkeypatch.setattr(asyncio,'sleep',sleep)
+    async def exercise():
+        try: await session.receive()
+        except asyncio.CancelledError: pass
+        await asyncio.gather(*session.rit_tasks)
+    asyncio.run(exercise())
+    session.client.player_command.assert_awaited_once_with(table,17)
+    assert session.rit_responses=={(table,42)} and 0.5<=delays[0]<=2.0

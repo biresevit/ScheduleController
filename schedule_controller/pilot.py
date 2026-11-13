@@ -284,13 +284,18 @@ class Session:
                 elif event.get('t')=='NotifyFromServer' and event.get('resultCode'):
                     log.warning('Server notification for %s: code %s',self.policy['Username'],event.get('resultCode'))
                 elif event.get('t')=='RunItTwiceOffer':
-                    tid=int(event.get('tableId') or 0)
-                    hand=self.client.states.get(tid,{}).get('gi')
+                    # EvenBet table ids are numbers, BluffPoker ones text (its offer also names the hand).
+                    raw=str(event.get('tableId') or '').strip()
+                    tid=int(raw) if raw.isdigit() else raw
+                    hand=event.get('handSeq',self.client.states.get(tid,{}).get('gi'))
                     key=(tid,hand)
                     if tid in self.queues and key not in self.rit_responses:
                         self.rit_responses.add(key)
                         accept=self.rng.random()<float(self.policy['RunItTwiceChance'])
-                        task=asyncio.create_task(self.respond_run_it_twice(tid,accept,self.rng.uniform(0,7)))
+                        window=event.get('timeoutMs')
+                        # Human-like pause, but well inside the vote's window (BluffPoker sends it; 15 s default).
+                        longest=min(7.0,max(0.5,float(window)/1000*0.4)) if isinstance(window,(int,float)) and window>0 else 7.0
+                        task=asyncio.create_task(self.respond_run_it_twice(tid,accept,self.rng.uniform(0.5,longest)))
                         task.rit_table=tid
                         self.rit_tasks.add(task)
                         task.add_done_callback(self.rit_tasks.discard)
