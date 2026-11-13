@@ -477,3 +477,24 @@ def test_command_for_an_unknown_account_or_a_crash_never_stays_claimed():
     e={'id':'e2','account':7,'table':'T1','status':'joining','commands':[]};cmd={'id':'c2','status':'claimed'}
     asyncio.run(session.execute_serialized(e,cmd,'join'))
     assert cmd['status']=='failed' and e['status']=='failed' and session.publish.await_count==2
+
+
+def test_decision_metrics_are_flushed_in_one_batch_and_kept_when_the_write_fails():
+    from poker_controller.metrics import DecisionMetrics
+    stamp=datetime(2026,11,13,21,37,tzinfo=timezone.utc)
+    m=DecisionMetrics(clock=lambda:stamp)
+    for ms in (120,480,2600):m.decision(1,3,ms)
+    m.decision(4,1,700);m.missed('sit_out','Dean',42)
+    p=Pilot.__new__(Pilot);p.decision=SimpleNamespace(metrics=m);p.policies={7:{'Username':'dean'}}
+    written=[]
+    p.repo=SimpleNamespace(publish_decision_metrics=lambda rows,events:written.append((rows,events)))
+    asyncio.run(p.flush_metrics())
+    rows,events=written[0]
+    pre=next(r for r in rows if r['street']==1)
+    assert pre['hour']==stamp.replace(minute=0) and pre['opponents']==3 and pre['decisions']==3
+    assert pre['total_ms']==3200 and pre['max_ms']==2600 and pre['bands']==[1,1,0,0,1,0]
+    assert events[0]['account']==7 and events[0]['kind']=='sit_out'
+    def fail(rows,events):raise RuntimeError('db down')
+    m.decision(2,2,300);p.repo=SimpleNamespace(publish_decision_metrics=fail)
+    asyncio.run(p.flush_metrics())
+    rows,_=m.drain();assert rows[0]['decisions']==1  # kept for the next batch

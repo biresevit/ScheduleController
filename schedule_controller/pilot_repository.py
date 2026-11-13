@@ -551,6 +551,27 @@ class Repository(ChatRepository,ManualRepository):
                 WHERE SiteId=:site AND MachineId=:machine AND WorkerEpoch=?""",self.epoch)
 
     @retry_deadlocks
+    def publish_decision_metrics(self,rows,events):
+        """One batch: decision durations per hour, street and opponents, and the missed actions."""
+        stamp=lambda v:v.astimezone(timezone.utc).replace(tzinfo=None).isoformat(timespec='milliseconds')
+        data=json.dumps([dict(hour=stamp(r['hour']),street=r['street'],opponents=r['opponents'],decisions=r['decisions'],
+                              total=r['total_ms'],max=r['max_ms'],b=r['bands']) for r in rows])
+        missed=json.dumps([dict(kind=e['kind'],account=e.get('account'),username=(e.get('username') or '')[:100] or None,
+                                table=(e.get('table') or '')[:80] or None,at=stamp(e['at'])) for e in events])
+        with self.transaction() as db:
+            db.execute("""SET NOCOUNT ON;
+                INSERT scheduler.DecisionMetric(SiteId,MachineId,HourUtc,Street,Opponents,Decisions,TotalMs,MaxMs,
+                    Under250,Under500,Under1000,Under2000,Under5000,Over5000)
+                SELECT :site,:machine,r.hour,r.street,r.opponents,r.decisions,r.total,r.max,
+                    JSON_VALUE(r.b,'$[0]'),JSON_VALUE(r.b,'$[1]'),JSON_VALUE(r.b,'$[2]'),JSON_VALUE(r.b,'$[3]'),
+                    JSON_VALUE(r.b,'$[4]'),JSON_VALUE(r.b,'$[5]')
+                FROM OPENJSON(?) WITH(hour datetime2(0) '$.hour',street tinyint '$.street',opponents tinyint '$.opponents',
+                    decisions int '$.decisions',total bigint '$.total',max int '$.max',b nvarchar(max) '$.b' AS JSON) r;
+                INSERT scheduler.ActionTimeout(SiteId,MachineId,BotAccountId,Username,TableId,Kind,OccurredUtc)
+                SELECT :site,:machine,m.account,m.username,m.table_id,m.kind,m.at
+                FROM OPENJSON(?) WITH(kind varchar(16) '$.kind',account int '$.account',username nvarchar(100) '$.username',
+                    table_id nvarchar(80) '$.table',at datetime2(3) '$.at') m;""",data,missed)
+
     def publish_machine_telemetry(self,metrics):
         with self.transaction() as db:
             owned=db.one("SELECT WorkerEpoch FROM scheduler.MachineAssignment WHERE SiteId=:site AND MachineId=:machine")

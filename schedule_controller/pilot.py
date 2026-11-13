@@ -68,6 +68,9 @@ def ring_table(entry):
     table=str(entry['table'])
     return None if table.startswith('T') else table_key(table)
 def guid(): return str(uuid.uuid4())
+
+# Decision speed and missed actions reach the database in batches (one round trip per site and PC).
+METRICS_SECONDS=300
 def apply_tournament_plan(tourneys,table,source):
     """The MTT plan's rebuy / add-on choice for this registration (join payload 'rebuy'/'addon', or the entry's
     TournamentRebuy/TournamentAddon after a restart) onto the tournament state; absent: the account's chances."""
@@ -635,6 +638,8 @@ class Pilot:
         self.info={};self.tables=[];self.seats={};self.pending=[];self.jobs={};self.errors=[]
         self.next_join=self.next_leave=self.last_plan=None;self.saved=None;self.started=False
         self.decision=PDecision(os.getenv('PDECISION_URL','http://127.0.0.1:5005'),api_key=os.getenv('PDECISION_API_KEY','')) # one PDecision serves every poker site of the PC
+        from poker_controller.metrics import DecisionMetrics
+        self.decision.metrics=DecisionMetrics()  # this site's decision speed and missed actions, see flush_metrics
         self.output=Path(args.output);self.output.mkdir(parents=True,exist_ok=True)
         self.publish_lock=asyncio.Lock()
         self.client_lock=asyncio.Lock()
@@ -720,6 +725,20 @@ class Pilot:
                     await self.close_session_if_idle(aid)
             except Exception:log.exception('Could not persist tournament %s for %s',key,self.policies[aid]['Username'])
         asyncio.create_task(persist())
+
+    async def flush_metrics(self):
+        """Write the decision speed and missed actions collected since the last flush, in one batch."""
+        metrics=getattr(getattr(self,'decision',None),'metrics',None)
+        if metrics is None:return
+        rows,events=metrics.drain()
+        if not rows and not events:return
+        ids={str(p['Username']).casefold():aid for aid,p in getattr(self,'policies',{}).items()}
+        for event in events:event['account']=ids.get(str(event.get('username') or '').casefold())
+        try:
+            await asyncio.to_thread(self.repo.publish_decision_metrics,rows,events)
+        except Exception:
+            metrics.restore(rows,events)  # merged into the next batch
+            log.exception('Could not write decision metrics')
 
     async def adopt_satellite_seat(self,aid,satellite,checks=(0,5,15,30)):
         """After a satellite: BluffPoker registers a ticket winner into the target MTT itself (paid with the ticket).
@@ -1408,7 +1427,7 @@ class Pilot:
             manual_task=asyncio.create_task(run_manual(self))
             live_task=asyncio.create_task(self.run_live_views())
             next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
-            next_claim=next_telemetry=0.0
+            next_claim=next_telemetry=0.0;next_metrics=time.monotonic()+METRICS_SECONDS
             while (not self.args.seconds or now()<self.end) and not self.stopping():
                 tick=time.monotonic()
                 if tick>=next_refresh:
@@ -1428,6 +1447,9 @@ class Pilot:
                     except Exception:
                         log.exception('Could not publish machine resource telemetry')
                     next_telemetry=tick+300
+                if tick>=next_metrics:
+                    await self.flush_metrics()
+                    next_metrics=tick+METRICS_SECONDS
                 await asyncio.sleep(.25)
         except asyncio.CancelledError:
             if getattr(self,'fenced',None) is None:raise
@@ -1450,6 +1472,8 @@ class Pilot:
             if self.started and getattr(self,'fenced',None) is not None:
                 await self.stop_fenced()
             elif self.started:
+                try: await asyncio.wait_for(self.flush_metrics(),15)
+                except Exception: log.exception('Could not write the last decision metrics')
                 try: await asyncio.wait_for(asyncio.to_thread(self.repo.stop_cloud_worker),30)
                 except Exception: log.exception('Could not mark cloud worker offline')
                 await asyncio.gather(*self.jobs.values(),return_exceptions=True)
