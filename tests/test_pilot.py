@@ -452,3 +452,28 @@ def test_bluffpoker_offer_with_a_text_table_id_is_answered_inside_its_window(mon
     asyncio.run(exercise())
     session.client.player_command.assert_awaited_once_with(table,17)
     assert session.rit_responses=={(table,42)} and 0.5<=delays[0]<=2.0
+
+
+def test_command_for_an_account_added_after_start_reloads_the_configuration():
+    session=Pilot.__new__(Pilot);session.execution_locks={};session.policies={}
+    loaded={'n':0}
+    async def configuration():
+        loaded['n']+=1;session.policies={7:{'Username':'new_bot'}}
+    session.configuration=configuration
+    session.execute=AsyncMock();session.publish=AsyncMock()
+    e={'id':'e1','account':7,'table':'T1','status':'reserved','commands':[]};cmd={'id':'c1','status':'claimed'}
+    asyncio.run(session.execute_serialized(e,cmd,'join'))
+    assert loaded['n']==1;session.execute.assert_awaited_once_with(e,cmd,'join')
+
+
+def test_command_for_an_unknown_account_or_a_crash_never_stays_claimed():
+    session=Pilot.__new__(Pilot);session.execution_locks={};session.policies={}
+    async def configuration():pass
+    session.configuration=configuration;session.publish=AsyncMock()
+    e={'id':'e1','account':7,'table':'T1','status':'reserved','commands':[]};cmd={'id':'c1','status':'claimed'}
+    asyncio.run(session.execute_serialized(e,cmd,'join'))
+    assert cmd['status']=='failed' and cmd['result']=='unknown_account' and e['status']=='failed'
+    session.policies={7:{'Username':'x'}};session.execute=AsyncMock(side_effect=KeyError(7))
+    e={'id':'e2','account':7,'table':'T1','status':'joining','commands':[]};cmd={'id':'c2','status':'claimed'}
+    asyncio.run(session.execute_serialized(e,cmd,'join'))
+    assert cmd['status']=='failed' and e['status']=='failed' and session.publish.await_count==2

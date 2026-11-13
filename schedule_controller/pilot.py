@@ -1263,7 +1263,28 @@ class Pilot:
         """Serialize poker-server mutations per login while allowing accounts in parallel."""
         lock=self.execution_locks.setdefault(e['account'],asyncio.Lock())
         async with lock:
-            await self.execute(e,cmd,kind)
+            try:
+                if e['account'] not in self.policies:
+                    # An account added after this worker loaded its configuration (e.g. a CSV import).
+                    await self.configuration()
+                if e['account'] not in self.policies:
+                    log.warning('Command %s for account %s not executed: the account is not configured for this site',
+                                cmd['id'],e['account'])
+                    if e['status'] in ('reserved','joining'):e.update(status='failed',closed=now())
+                    cmd.update(status='failed',result='unknown_account',
+                               result_text='The account is not enabled for this site any more')
+                    await self.publish();return
+                await self.execute(e,cmd,kind)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # Never leave a claimed command behind: it would stay open and its entry would count forever.
+                log.exception('%s command %s failed outside its task handling',kind,cmd['id'])
+                if cmd.get('status') in ('pending','claimed'):
+                    if kind=='join' and e['status'] in ('reserved','joining'):e.update(status='failed',closed=now())
+                    cmd.update(status='failed',result=type(exc).__name__,result_text=str(exc)[:1000])
+                    try:await self.publish()
+                    except Exception:log.exception('Could not persist the failed command %s',cmd['id'])
 
     async def unregister_tournament(self,e,cmd,username):
         """Operator Unregister task: cancel an SNG/MTT registration before the tournament seats the bot."""
