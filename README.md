@@ -1,5 +1,7 @@
 # ScheduleController | Distributed scheduling
 
+> **Permitted use:** These bots may only be used for research, poker practice in the [simulator](https://github.com/biresevit/simulator-portfolio), poker practice through a real poker-site client, or authorized load testing to assess a poker site's stability under high traffic. Running bots at real-money tables without disclosing their use to all human players is prohibited.
+
 A Python service that translates weekly operating targets into coordinated work across multiple machines. Planning runs in Azure; local workers execute commands and report observed state.
 
 ## Engineering highlights
@@ -44,7 +46,6 @@ The first environment is **Nenad / Evenbet**, with eight verified demo accounts.
 
 - Weekly local-time schedule evaluation, including DST and midnight accounting.
 - Currency-specific stake bands, exact integer target allocation, and strict category matching.
-- Stable initial account defaults: frequency, daily playtime preference, stake category, post-BB/RIT probabilities and buy-in weights.
 - A pure preview planner with gradual joins/departures, machine capacity and table concentration, account-to-machine ownership, pending reservation accounting, soft daily preference fallback, and stale observation handling.
 - Azure SQL migration and customer/site/account seed with transactional dry run, migration checksums, idempotency and ownership checks.
 - SQL structures for future telemetry, leases, commands, outbox and daily time accounting. The presence of these tables does not imply their writers/consumers exist yet.
@@ -108,8 +109,6 @@ The seed only reassigns the specifically selected active Evenbet/EvenBet machine
 
 Nenad's site starts with scheduling disabled, no weekly targets, one disabled machine assignment capped at six entries, and disabled account policies awaiting worker provisioning. Monica stays an active existing dbo.BotAccount. The five `__schedule_demo_01` through `__schedule_demo_05` accounts are inactive in dbo.BotAccount and marked synthetic in scheduler.AccountPolicy. A SQL constraint prevents enabling synthetic policies or attaching credentials. They are usable only in explicit offline simulations.
 
-The six policies initially have two low, two medium and two high stake accounts; two each of low/medium/high frequency and 120/240/360-minute daily preferences. Monica is in high stakes to match the demo's previously tested 1/2 BB tables. All initial band percentages are equal to rounding precision (33.34/33.33/33.33). No Simo/BluffPoker account or policy is changed.
-
 Migrations are immutable after application. Add `002_*.sql` for future schema changes. `scheduler.SetSchedule` atomically replaces a site's windows and rejects overlaps; use a configuration API with customer authorization before exposing it to workers/customers. Direct SQL access is for provisioning only.
 
 ## Tests and simulation
@@ -131,7 +130,7 @@ Remove-Item Env:SCHEDULE_SQL_TEST
 .\.venv\Scripts\python.exe -m schedule_controller.verify
 ```
 
-The first migration and Nenad seed were validated against Azure SQL in rollback transactions before application. Unit coverage includes the 56/45 scenario, repeated triggers, duplicate seat prevention, unknown observations, category/currency boundaries, synthetic blocking, empty-table starts, full seat usage, capacity, daily preference fallback, DST, profile defaults, and buy-in feasibility. See [VALIDATION.md](VALIDATION.md) for the recorded result.
+The first migration and Nenad seed were validated against Azure SQL in rollback transactions before application. Unit coverage includes the 56/45 scenario, repeated triggers, duplicate seat prevention, unknown observations, category/currency boundaries, synthetic blocking, empty-table starts, full seat usage, capacity, daily preference fallback, DST, account provisioning, and buy-in feasibility. See [VALIDATION.md](VALIDATION.md) for the recorded result.
 
 ### Traffic pacing
 
