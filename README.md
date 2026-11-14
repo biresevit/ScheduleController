@@ -1,4 +1,38 @@
-# ScheduleController
+# ScheduleController | Distributed scheduling
+
+A Python service that translates weekly operating targets into coordinated work across multiple machines. Planning runs in Azure; local workers execute commands and report observed state.
+
+## Engineering highlights
+
+- Timezone-aware planning with daylight-saving transitions, capacity constraints, and gradual joins and departures.
+- Transactional commands, account leases, worker epoch fencing, heartbeat expiry, and restart reconciliation.
+- Idempotent hand-history ingestion, SQL reporting, and simulation tools.
+
+**Technology:** Python 3.11, Azure Functions, Azure SQL, Blob Storage, pytest.
+
+## Platform architecture
+
+```text
+PokerBackoffice -> Azure SQL <- ScheduleController (Azure Functions)
+                                     | commands / telemetry
+                                PokerController
+                                     | REST
+                                  PDecision
+                                     |
+                         simulator / DecisionMaking
+```
+
+[PokerBackoffice](https://github.com/biresevit/PokerBackoffice) | [ScheduleController](https://github.com/biresevit/ScheduleController) | [PokerController](https://github.com/biresevit/PokerController) | [PDecision](https://github.com/biresevit/PDecision-portfolio) | [simulator](https://github.com/biresevit/simulator-portfolio)
+
+## Product view
+
+![Scheduled targets and observed activity in PokerBackoffice](docs/images/operations-overview.png)
+
+The companion PokerBackoffice dashboard visualizes the output of this scheduling backend.
+
+## Setup and operations
+
+A full deployment requires configured infrastructure, platform accounts, and companion components. The following sections describe setup, validation, and operational requirements.
 
 **Deploying:** see `../PokerBackoffice/docs/deploy.md`. Files in `schedule_controller` ship in different places (scheduler function, backoffice bundle or PC release); its section 1 lists which.
 
