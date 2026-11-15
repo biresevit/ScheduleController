@@ -97,16 +97,24 @@ def mtt_progress(db, site_id) -> dict:
     """Registrations per MTT instance still to be planned: every entry that registered (open, or seated and since busted), with the
     plan's rebuy / add-on choices and the accounts (one registration per account and instance)."""
     progress = {}
+    rebuy_accounts, addon_accounts = set(), set()
     for r in db.rows("""SELECT e.TableId,e.BotAccountId,e.TournamentRebuy,e.TournamentAddon FROM scheduler.Entry e
             JOIN scheduler.LobbyTable l ON l.SiteId=e.SiteId AND l.TableId=e.TableId
             WHERE e.SiteId=? AND l.TableType='MTT' AND l.TournamentState<>'completed'
               AND l.StartUtc>=DATEADD(day,-2,SYSUTCDATETIME()) AND e.Status<>'failed'
               AND (e.IsOpen=1 OR e.SeatedUtc IS NOT NULL)""", site_id):
         p = progress.setdefault(r["TableId"], MttProgress())
-        p.registered += 1
-        p.rebuy += bool(r.get("TournamentRebuy"))
-        p.addon += bool(r.get("TournamentAddon"))
-        p.accounts.add(r["BotAccountId"])
+        account = r["BotAccountId"]
+        key = (r["TableId"], account)
+        if account not in p.accounts:
+            p.registered += 1
+            p.accounts.add(account)
+        if r.get("TournamentRebuy") and key not in rebuy_accounts:
+            p.rebuy += 1
+            rebuy_accounts.add(key)
+        if r.get("TournamentAddon") and key not in addon_accounts:
+            p.addon += 1
+            addon_accounts.add(key)
     return progress
 
 

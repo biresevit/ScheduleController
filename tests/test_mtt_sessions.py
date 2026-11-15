@@ -36,6 +36,23 @@ class DB:
         raise AssertionError(sql)
 
 
+def test_registered_bots_do_not_wake_on_a_full_machine():
+    class FullDB(DB):
+        def rows(self, sql, *args):
+            rows = super().rows(sql, *args)
+            if 'FROM scheduler.MachineAssignment' in sql:
+                for row in rows:
+                    row['Used'] = row['Capacity']
+            return rows
+
+    db = FullDB()
+    site = dict(SiteId=3, NextMttLoginUtc=None, MinJoinGapSeconds=20, MaxJoinGapSeconds=60, ConfigVersion=1)
+    def create(*args):
+        raise AssertionError('A full machine must not start another playing session')
+    assert wake_registrations(db, site, NOW, random.Random(1), create) == 0
+    assert not any('INSERT scheduler.Command' in sql for sql, args in db.writes)
+
+
 def test_return_creates_a_new_playing_session_and_resume_task_without_registering():
     db=DB();sessions=[]
     def create(*args):sessions.append(args);return 'new-session'

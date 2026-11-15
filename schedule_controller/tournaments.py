@@ -141,11 +141,12 @@ def _fresh(now: datetime, stamp: datetime, seconds: int) -> bool:
 
 
 def _options(fmt, now, accounts, machines, entries, heartbeat_seconds, capacity_entries, fitting_for, formats,
-             registered=None):
+             registered=None, registration_only=False):
     """(account, machine, fitting tournaments) for every account that may register now, on every PC it may use.
 
-    Accounts follow the ring rules (enabled, credentials, cooldown, session, table limit, one PC) and the account's
-    limit of open entries of this format; PCs must be ready, fresh and below capacity."""
+    Accounts follow the ring rules and the format's entry limit; PCs must be ready and fresh.
+    Registration-only MTTs park without taking a playing slot, so only those may bypass
+    the live account table limit and PC capacity. Their format limit and ownership still apply."""
     ready = {m.id: m for m in machines if m.enabled and m.ready and not m.maintenance and m.capacity > 0
              and _fresh(now, m.heartbeat, heartbeat_seconds)}
     account_count = Counter(e.account for e in entries if not e.parked)
@@ -160,7 +161,8 @@ def _options(fmt, now, accounts, machines, entries, heartbeat_seconds, capacity_
     options = []
     for a in accounts:
         if (not a.enabled or a.synthetic or not a.credentials_ready or a.requires_reconciliation or a.manual
-                or a.drain_for_update or len(owners[a.id]) > 1 or account_count[a.id] >= a.max_tables
+                or a.drain_for_update or len(owners[a.id]) > 1
+                or (not registration_only and account_count[a.id] >= a.max_tables)
                 or format_count[a.id] >= limit(a)
                 or a.eligible_after is not None and now < a.eligible_after.astimezone(timezone.utc)
                 or a.session_end is not None and now >= a.session_end.astimezone(timezone.utc)):
@@ -169,7 +171,8 @@ def _options(fmt, now, accounts, machines, entries, heartbeat_seconds, capacity_
         if not fitting:
             continue
         for m in ready.values():
-            if machine_count[m.id] >= m.capacity or owners[a.id] and m.id not in owners[a.id]:
+            if ((not registration_only and machine_count[m.id] >= m.capacity)
+                    or (owners[a.id] and m.id not in owners[a.id])):
                 continue
             options.append((a, m, fitting, machine_count[m.id] / m.capacity))
     return options
@@ -238,12 +241,19 @@ def plan_mtt_registrations(now: datetime, plans: dict, tournaments: list[Tournam
     formats = {t.id: t.format for t in tournaments}
     registered = {(e.account, e.table) for e in entries} | {(a, tid) for tid, p in progress.items() for a in p.accounts}
     for need, t, plan, done in behind:
+        from .mtt_sessions import waits_for_mtt
+        # A parked registration uses no playing slot. Capacity is checked when
+        # wake_registrations creates its playing session near the start.
+        registration_only = waits_for_mtt({'table_type': t.format, 'tournament_state': t.state,
+                                           'start': t.start}, now)
         def fitting(a, t=t, tiered=True):
             return [t] if (t.game in a.games or TOURNAMENTS_ONLY in a.games) and (not tiered or fits(t.buy_in, ranges.get(a.tier))) else []
-        options = _options("MTT", now, accounts, machines, entries, heartbeat_seconds, capacity_entries, fitting, formats, registered)
+        options = _options("MTT", now, accounts, machines, entries, heartbeat_seconds, capacity_entries, fitting, formats,
+                           registered, registration_only=registration_only)
         if not options:
             options = _options("MTT", now, accounts, machines, entries, heartbeat_seconds, capacity_entries,
-                               lambda a, t=t: fitting(a, t, False), formats, registered)
+                               lambda a, t=t: fitting(a, t, False), formats, registered,
+                               registration_only=registration_only)
         if not options:
             result.reasons.append(f"no_eligible_account:{t.id}")
             continue

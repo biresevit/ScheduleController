@@ -1,4 +1,5 @@
 import random
+import pytest
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -79,10 +80,11 @@ def mtt(name="Night Owl Freeroll 12/11", start=START, state="registering", buy_i
                       name=name, open=is_open, info=info or {})
 
 
-def run(now, plans, tournaments, accounts, progress=None, entries=(), next_time=None, rng=None):
+def run(now, plans, tournaments, accounts, progress=None, entries=(), next_time=None, rng=None, machines=None):
     for t in tournaments:  # observed just now
         object.__setattr__(t, "observed", now)
-    return plan_mtt_registrations(now, plans, tournaments, progress or {}, accounts, [Machine(1, 1, 50, now)],
+    return plan_mtt_registrations(now, plans, tournaments, progress or {}, accounts,
+                                  machines if machines is not None else [Machine(1, 1, 50, now)],
                                   list(entries), RANGES, next_time, 20, 60, 60, 300, rng or random.Random(1))
 
 
@@ -137,3 +139,49 @@ def test_account_mtt_limit_and_open_entries_still_apply():
     t9 = Tournament("T9", "MTT", Decimal("0"), 0, 3000, "registering", now, start=START + timedelta(days=1), name="X")
     plan = run(now, plans, [mtt(), t9], [account(1, max_mtt_entries=1)], entries=busy)
     assert not plan.actions
+
+
+@pytest.mark.parametrize('lead,allowed', [(60, True), (31, True), (30, False), (29, False)])
+@pytest.mark.parametrize('ring_account,capacity', [(1, 1), (2, 1), (1, 2)])
+def test_advance_registration_can_park_on_a_full_machine_and_full_account(lead, allowed, ring_account, capacity):
+    now = START - timedelta(minutes=lead)
+    plan = run(now, {'Night Owl Freeroll': MttPlan(10)}, [mtt()],
+               [account(1, max_tables=1)], entries=[Entry('ring', ring_account, 1, 'ring-table')],
+               machines=[Machine(1, 1, capacity, now)])
+    assert bool(plan.actions) is allowed
+
+
+def test_advance_registration_can_use_the_tier_fallback_on_a_full_machine():
+    now = START - timedelta(hours=1)
+    plan = run(now, {'Night Owl Freeroll': MttPlan(10)}, [mtt(buy_in='100')],
+               [account(1, 'low')], entries=[Entry('ring', 2, 1, 'ring-table')],
+               machines=[Machine(1, 1, 1, now)])
+    assert [(a.account, a.machine) for a in plan.actions] == [(1, 1)]
+
+
+@pytest.mark.parametrize('blocked', [
+    account(1, manual=True), account(1, enabled=False), account(1, credentials_ready=False),
+    account(1, requires_reconciliation=True), account(1, owner_machine=2),
+    account(1, games=frozenset({'PLO4'})),
+])
+def test_parking_does_not_bypass_account_safety_or_manual_ownership(blocked):
+    now = START - timedelta(hours=1)
+    assert not run(now, {'Night Owl Freeroll': MttPlan(10)}, [mtt()], [blocked]).actions
+
+
+def test_parked_registrations_still_obey_the_account_mtt_limit():
+    now = START - timedelta(hours=1)
+    entries = [Entry('waiting', 1, 1, 'T9', 'joining', parked=True)]
+    assert not run(now, {'Night Owl Freeroll': MttPlan(10)}, [mtt()],
+                   [account(1, max_mtt_entries=1)], entries=entries).actions
+
+
+@pytest.mark.parametrize('machine', [
+    Machine(1, 1, 1, START, ready=False), Machine(1, 1, 1, START, enabled=False),
+    Machine(1, 1, 1, START, maintenance=True), Machine(1, 1, 0, START),
+    Machine(1, 1, 1, START - timedelta(days=1)),
+])
+def test_parking_still_requires_an_available_machine(machine):
+    now = START - timedelta(hours=1)
+    assert not run(now, {'Night Owl Freeroll': MttPlan(10)}, [mtt()],
+                   [account(1)], machines=[machine]).actions
