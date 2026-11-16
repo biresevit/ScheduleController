@@ -30,7 +30,15 @@ PokerBackoffice -> Azure SQL <- ScheduleController (Azure Functions)
 
 ![Scheduled targets and observed activity in PokerBackoffice](docs/images/operations-overview.png)
 
-The companion PokerBackoffice dashboard visualizes the output of this scheduling backend.
+The companion PokerBackoffice dashboard visualizes the output of this scheduling backend: the scheduled target against what actually ran.
+
+The input is a weekly schedule of hour-by-hour targets, which the planner turns into join and leave commands for the PCs.
+
+![Weekly schedule: ring targets for each day of the week](docs/images/weekly-schedule.png)
+
+The same scheduler orders software updates on the PCs and tracks each machine until it is healthy and its traffic has recovered.
+
+![Past updates: per-PC status, progress, start and finish times](docs/images/rolling-update-status.png)
 
 ## Setup and operations
 
