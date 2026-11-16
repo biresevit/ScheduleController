@@ -40,7 +40,7 @@ A full deployment requires configured infrastructure, platform accounts, and com
 
 Python foundation for customer-scoped poker scheduling. The complete design is in [SPECIFICATION.md](SPECIFICATION.md).
 
-The first environment is **Nenad / Evenbet**, with eight verified demo accounts. The transactional planner is deployed as the Flex Consumption Function `poker-schedule-controller`; poker connections remain on the assigned PokerController machines.
+The first environment is one customer on one poker site, with eight verified demo accounts. The transactional planner is deployed as the Flex Consumption Function `poker-schedule-controller`; poker connections remain on the assigned PokerController machines.
 
 ## Implemented
 
@@ -51,17 +51,17 @@ The first environment is **Nenad / Evenbet**, with eight verified demo accounts.
 - SQL structures for future telemetry, leases, commands, outbox and daily time accounting. The presence of these tables does not imply their writers/consumers exist yet.
 - A 30-second Azure timer that plans joins/leaves transactionally under a per-site SQL lock.
 - A separate 30-second Azure ingestion timer that reads each new customer hand-history blob once, persists per-player invested/won/net amounts, records human counts and automatically backfills older hands. SQL leases, parser versions and unique result keys make retries idempotent.
-- A fenced local PokerController worker that claims due commands, publishes lobby/live telemetry, and performs the existing Evenbet/PDecision lifecycle.
+- A fenced local PokerController worker that claims due commands, publishes lobby/live telemetry, and performs the existing poker-site/PDecision lifecycle.
 
 ## Remaining implementation
 
 1. Durable secret/credential references instead of the current authorized demo-account convention.
 2. Coordinated in-session breaks and longer multi-account load testing.
-3. Cloud-side Evenbet lobby observation; currently lobby scanning is part of PokerController while planning is fully in Azure.
+3. Cloud-side lobby observation; currently lobby scanning is part of PokerController while planning is fully in Azure.
 
-On restart, the worker fences the stale machine epoch, logs in only affected accounts, proves every prior table seat against Evenbet, adopts seats that still exist and closes only confirmed-absent entries. The machine remains unavailable to the scheduler until reconciliation is complete.
+On restart, the worker fences the stale machine epoch, logs in only affected accounts, proves every prior table seat against the poker site, adopts seats that still exist and closes only confirmed-absent entries. The machine remains unavailable to the scheduler until reconciliation is complete.
 
-Nenad/Evenbet scheduling remains disabled until PDecision and the PokerController worker are online. Enabling a schedule without a ready machine creates no joins.
+Scheduling for the first environment remains disabled until PDecision and the PokerController worker are online. Enabling a schedule without a ready machine creates no joins.
 
 ## Local setup
 
@@ -87,7 +87,7 @@ Only these processes run on the poker machine:
 
 ```powershell
 # Start PDecision first, then:
-cd C:\Users\bires\projects\bot\PokerController
+cd <path to PokerController>
 .\.venv\Scripts\python.exe -m poker_controller.worker --output artifacts\azure-worker
 ```
 
@@ -105,9 +105,9 @@ Use `SCHEDULE_SQL_CONNECTION_STRING` for a native ODBC connection string or the 
 .\.venv\Scripts\python.exe -m schedule_controller.database --seed-nenad --machine-id 1 --apply
 ```
 
-The seed only reassigns the specifically selected active Evenbet/EvenBet machine when its current customer is `Internal (Nenad dev)` or already `Nenad`. Other customer/site registrations are rejected. Existing hand histories are not moved. PDecision reads the new registration at its next startup.
+The seed only reassigns the specifically selected active machine when its current customer is `Internal (Nenad dev)` or already `Nenad`. Other customer/site registrations are rejected. Existing hand histories are not moved. PDecision reads the new registration at its next startup.
 
-Nenad's site starts with scheduling disabled, no weekly targets, one disabled machine assignment capped at six entries, and disabled account policies awaiting worker provisioning. Monica stays an active existing dbo.BotAccount. The five `__schedule_demo_01` through `__schedule_demo_05` accounts are inactive in dbo.BotAccount and marked synthetic in scheduler.AccountPolicy. A SQL constraint prevents enabling synthetic policies or attaching credentials. They are usable only in explicit offline simulations.
+Nenad's site starts with scheduling disabled, no weekly targets, one disabled machine assignment capped at six entries, and disabled account policies awaiting worker provisioning. The existing demo account stays an active dbo.BotAccount. The five synthetic demo accounts are inactive in dbo.BotAccount and marked synthetic in scheduler.AccountPolicy. A SQL constraint prevents enabling synthetic policies or attaching credentials. They are usable only in explicit offline simulations.
 
 Migrations are immutable after application. Add `002_*.sql` for future schema changes. `scheduler.SetSchedule` atomically replaces a site's windows and rejects overlaps; use a configuration API with customer authorization before exposing it to workers/customers. Direct SQL access is for provisioning only.
 
@@ -134,6 +134,6 @@ The first migration and Nenad seed were validated against Azure SQL in rollback 
 
 ### Traffic pacing
 
-Nenad / Evenbet uses 45?285 second gaps for joins and leaves. The planner mixes short gaps and longer pauses using a beta distribution, and queues the next change only once the previous change is within one scheduler tick. Ten-entry increases or decreases typically take about 30 minutes; this is a stochastic target rather than a completion deadline. Availability, failed joins, cooldowns and finishing hands can extend it. Existing queued commands keep their due times. Other sites keep their configured gap limits.
+The first environment uses gaps of 45 to 285 seconds for joins and leaves. The planner mixes short gaps and longer pauses using a beta distribution, and queues the next change only once the previous change is within one scheduler tick. Ten-entry increases or decreases typically take about 30 minutes; this is a stochastic target rather than a completion deadline. Availability, failed joins, cooldowns and finishing hands can extend it. Existing queued commands keep their due times. Other sites keep their configured gap limits.
 
 The simulator uses the same gap distribution and 30-second scheduler ticks. Session-expiry departures also pass through the planner's pacing instead of leaving all tables at once.
