@@ -71,6 +71,8 @@ The first environment is one customer on one poker site, with eight verified dem
 
 On restart, the worker fences the stale machine epoch, logs in only affected accounts, proves every prior table seat against the poker site, adopts seats that still exist and closes only confirmed-absent entries. The machine remains unavailable to the scheduler until reconciliation is complete.
 
+Already registered MTTs are commitments: returning to play them bypasses account table, playtime, session and cooldown limits, and may exceed a machine's entry cap. New registrations and ring joins retain their normal limits. Machine readiness, maintenance and account ownership checks still apply. After restart reconciliation, an account with only parked registrations releases its old worker lease so the scheduler can log it back in for the tournament.
+
 Scheduling for the first environment remains disabled until PDecision and the PokerController worker are online. Enabling a schedule without a ready machine creates no joins.
 
 ## Local setup

@@ -6,6 +6,21 @@ import uuid
 LOGIN_LEAD = timedelta(minutes=30)
 
 
+def release_stale_idle_leases(db, site_id):
+    """A reconciled replacement worker proves an account with only parked entries is offline.
+
+    Parked registrations are commitments, not active poker connections. They must
+    not keep an earlier worker's reconciliation lease and block their own return.
+    Active entries and workers still reconciling retain their ownership fences.
+    """
+    return db.execute("""DELETE l FROM scheduler.AccountLease l
+        JOIN scheduler.MachineAssignment a ON a.SiteId=l.SiteId AND a.MachineId=l.MachineId
+        WHERE l.SiteId=? AND l.RequiresReconciliation=1 AND a.IsReady=1 AND a.WorkerEpoch<>l.WorkerEpoch
+          AND a.LastHeartbeatUtc>=DATEADD(second,-180,SYSUTCDATETIME())
+          AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e
+              WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1 AND e.IsParked=0)""",site_id).rowcount
+
+
 def waits_for_mtt(table, stamp):
     start = table.get('start')
     return (table.get('table_type') == 'MTT' and table.get('tournament_state') == 'registering'
@@ -42,7 +57,12 @@ def unregister_ended_sngs(db, site):
 
 
 def wake_registrations(db, site, stamp, rng, session_factory):
-    """Under the site lock: schedule at most one paced return, without another registration."""
+    """Under the site lock: return to an existing commitment, without another registration.
+
+    Account table/session/playtime limits and machine entry caps govern new
+    commitments. Already registered MTTs must be played even above those limits;
+    ownership, machine readiness and maintenance checks still apply.
+    """
     sid = site['SiteId']
     db.execute("""UPDATE e SET IsOpen=0,Status='closed',ClosedUtc=SYSUTCDATETIME()
         FROM scheduler.Entry e JOIN scheduler.LobbyTable l ON l.SiteId=e.SiteId AND l.TableId=e.TableId
@@ -67,9 +87,6 @@ def wake_registrations(db, site, stamp, rng, session_factory):
         ORDER BY l.StartUtc,e.CreatedUtc,e.EntryId""", sid, now)
     for row in rows:
         aid = row['BotAccountId']
-        active = db.one('SELECT COUNT(*) AS n FROM scheduler.Entry WHERE BotAccountId=? AND IsOpen=1 AND IsParked=0', aid)['n']
-        if active >= row['MaxTables']:
-            continue
         lease = db.one('SELECT * FROM scheduler.AccountLease WITH(UPDLOCK,HOLDLOCK) WHERE BotAccountId=?', aid)
         owner = row['SessionMachine'] or (lease and lease['MachineId'])
         machines = db.rows("""SELECT a.*,COALESCE(c.MaxEntries,a.MaxEntries) AS Capacity,
@@ -78,7 +95,7 @@ def wake_registrations(db, site, stamp, rng, session_factory):
             WHERE a.SiteId=? AND a.IsEnabled=1 AND a.IsReady=1 AND a.MaintenanceTaskId IS NULL
               AND COALESCE(c.IsEnabled,1)=1 AND a.LastHeartbeatUtc>=DATEADD(second,-180,SYSUTCDATETIME())
             ORDER BY a.MachineId""", sid)
-        machines = [m for m in machines if m['Used'] < m['Capacity'] and (owner is None or m['MachineId'] == owner)
+        machines = [m for m in machines if m['Capacity'] > 0 and (owner is None or m['MachineId'] == owner)
                     and (not lease or not lease['RequiresReconciliation']
                          and str(lease['WorkerEpoch']).lower() == str(m['WorkerEpoch']).lower())]
         if not machines:

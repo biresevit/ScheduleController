@@ -187,13 +187,10 @@ class CloudScheduler:
                     log.info("Joins paused on site %s: cancelled %s queued join(s)", site_id, cancelled)
             # A worker restart flags every lease on its machine for reconciliation, but only leases
             # with open entries get reconciled, and idle-lease cleanup only covers the current run.
-            # Once the new worker is ready, an earlier run's lease whose bot has no open entry cannot
-            # be holding a seat; without this it locks the bot out of all play indefinitely.
-            released = db.execute("""DELETE l FROM scheduler.AccountLease l
-                JOIN scheduler.MachineAssignment a ON a.SiteId=l.SiteId AND a.MachineId=l.MachineId
-                WHERE l.SiteId=? AND l.RequiresReconciliation=1 AND a.IsReady=1 AND a.WorkerEpoch<>l.WorkerEpoch
-                  AND NOT EXISTS(SELECT 1 FROM scheduler.Entry e WHERE e.BotAccountId=l.BotAccountId AND e.IsOpen=1)""",
-                site_id).rowcount
+            # Parked MTT registrations also hold no seats. Release their stale leases
+            # after the replacement worker has finished reconciling every active entry.
+            from .mtt_sessions import release_stale_idle_leases
+            released = release_stale_idle_leases(db,site_id)
             if released > 0:
                 log.info("Released %s stale lease(s) left by earlier worker runs", released)
             takeover = takes_over_seats(site)
