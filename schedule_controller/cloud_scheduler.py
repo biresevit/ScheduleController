@@ -351,7 +351,14 @@ class CloudScheduler:
                 next_join=aware(site["NextJoinUtc"]), next_leave=aware(site["NextLeaveUtc"]),
                 last_planned_at=aware(site["LastReconciledUtc"]))
             if "reconciliation_cooldown" in result.reasons:
-                return {"site_id": site_id, "target": target, "status": "cooldown", "actions": 0}
+                # Ring reconciliation has its own clock. A slightly early timer
+                # must not throw away an MTT's registration opportunities.
+                tournaments = {}
+                if site["SchedulingEnabled"] and not paused:
+                    tournaments = self._plan_tournaments(db, site, stamp, windows_by_format, tournament_accounts,
+                        tournament_machines, lobby_rows, policy_by_id, machine_by_id, rng, formats=("MTT",))
+                return {"site_id": site_id, "target": target, "status": "cooldown",
+                        "actions": sum(r["created"] for r in tournaments.values()), "tournaments": tournaments}
             for account, reason in result.manual_blocked.items():
                 log.info("Manual session for account %s cannot join: %s", account, reason)
             created = 0
@@ -389,8 +396,9 @@ class CloudScheduler:
             return {"site_id": site_id, "target": target, "status": "joins_paused" if paused else "planned", "actions": created,
                     "reasons": result.reasons, "deficits": result.remaining_deficits, "tournaments": tournament_results}
 
-    def _plan_tournaments(self, db, site, stamp, windows_by_format, accounts, machines, lobby_rows, policy_by_id, machine_by_id, rng):
-        """SNG and MTT registrations, each against its own weekly schedule and pacing."""
+    def _plan_tournaments(self, db, site, stamp, windows_by_format, accounts, machines, lobby_rows, policy_by_id, machine_by_id, rng,
+                          formats=("SNG", "MTT")):
+        """SNG windows and MTT plans have independent pacing, under the site lock."""
         site_id = site["SiteId"]
         ranges = {r["Tier"]: (r["TournamentMinBuyIn"], r["TournamentMaxBuyIn"]) if r.get("TournamentMinBuyIn") is not None else None
                   for r in db.rows("SELECT * FROM scheduler.StakeBand WHERE SiteId=?", site_id)}
@@ -405,6 +413,23 @@ class CloudScheduler:
         freshness = max(site["TableFreshnessSeconds"], 3 * (site.get("LobbyRefreshSeconds") or 60))
         results = {}
         for fmt, column in (("SNG", "NextSngUtc"), ("MTT", "NextMttUtc")):
+            if fmt not in formats:
+                continue
+            if fmt == "MTT":
+                # Persisted initial commands provide an independent batch clock.
+                # Exclude manual registrations and wake-ups; neither consumes a
+                # scheduler batch. The site lock prevents overlapping planners.
+                recent = db.one("""SELECT MAX(CreatedUtc) AS LastPlannedUtc FROM scheduler.Command
+                    WHERE SiteId=? AND Kind='join' AND CreatedUtc>=DATEADD(minute,-1,SYSUTCDATETIME())
+                      AND JSON_VALUE(PayloadJson,'$.format')='MTT'
+                      AND JSON_VALUE(PayloadJson,'$.manual') IS NULL
+                      AND JSON_VALUE(PayloadJson,'$.resume_registration') IS NULL""", site_id)
+                last = aware(recent["LastPlannedUtc"])
+                # Allow small timer/transaction jitter without losing every
+                # other tick; the batch itself spans only 24 seconds.
+                if last is not None and stamp < last + timedelta(seconds=25):
+                    results[fmt] = {"target": len(plans), "created": 0, "reasons": ["batch_cooldown"]}
+                    continue
             target = target_at(windows_by_format.get(fmt, []), stamp, site["TimeZone"]) if fmt == "SNG" else None
             # Re-read open entries so a registration planned just before counts toward this one.
             rows = db.rows(f"""SELECT e.*,CASE WHEN {MTT_REGISTRATION_WAITING} THEN 1 ELSE 0 END AS Waiting
@@ -416,9 +441,16 @@ class CloudScheduler:
                     aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
                     site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding)
             else:
+                rate_limited = db.one("""SELECT COUNT(*) AS n FROM scheduler.Command WHERE SiteId=? AND Kind='join'
+                    AND CreatedUtc>=DATEADD(minute,-30,SYSUTCDATETIME()) AND UpdatedUtc>=DATEADD(minute,-5,SYSUTCDATETIME())
+                    AND ResultText LIKE '%RATE[_]LIMIT%'""", site_id)["n"]
+                if rate_limited and aware(site.get(column)) is not None and stamp < aware(site[column]):
+                    results[fmt] = {"target": len(plans), "created": 0, "reasons": ["rate_limit_backoff"]}
+                    continue
                 plan = plan_mtt_registrations(stamp, plans, tournaments, mtt_progress(db, site_id), accounts, machines,
                     entries, ranges, aware(site.get(column)), site["MinJoinGapSeconds"], site["MaxJoinGapSeconds"],
-                    site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding)
+                    site["HeartbeatTimeoutSeconds"], freshness, rng, excluded, capacity_entries=holding,
+                    max_actions=1 if rate_limited else 5)
                 target = len(plans)
             created = 0
             for action in plan.actions:
@@ -427,7 +459,7 @@ class CloudScheduler:
                 row=next(t for t in lobby_rows if t['TableId']==action.tournament)
                 from .mtt_sessions import waits_for_mtt
                 registration_only=waits_for_mtt({'table_type':fmt,'tournament_state':row.get('TournamentState'),
-                                               'start':aware(row.get('StartUtc'))},stamp)
+                                               'start':aware(row.get('StartUtc'))},action.not_before)
                 extra = {"format": fmt, "tournament_id": tournament_id(action.tournament),'registration_only':registration_only}
                 if action.rebuy is not None:
                     extra.update(rebuy=action.rebuy, addon=action.addon)

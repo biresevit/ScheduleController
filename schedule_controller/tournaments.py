@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import random
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -204,19 +204,19 @@ class MttProgress:
     accounts: set = field(default_factory=set)
 
 
-def plan_mtt_registrations(now: datetime, plans: dict, tournaments: list[Tournament], progress: dict,
+def _plan_mtt_registration(now: datetime, plans: dict, tournaments: list[Tournament], progress: dict,
                            accounts: list[Account], machines: list[Machine], entries: list[Entry], ranges: dict,
                            next_time: datetime | None, min_gap: int, max_gap: int, heartbeat_seconds: int,
                            freshness_seconds: int, rng: random.Random, excluded=(),
                            capacity_entries: list[Entry] | None = None) -> TournamentPlan:
-    """Plan at most one MTT registration from the per-MTT plans (mtt_plans).
+    """Select one MTT registration for the batch planner.
 
     plans: series name -> MttPlan. progress: lobby TableId -> MttProgress.
-    The MTT furthest behind its plan goes first (then the earliest start). Registrations are paced by the site's
-    join gap while on plan; an MTT two or more behind registers at once (one per scheduler tick).
+    Deadline pressure decides priority. Registrations retain the normal site gap
+    while on plan; an MTT two or more behind can catch up immediately.
     Accounts whose tier buy-in range fits the MTT are preferred; the others may still play it, as the operator
     chose this MTT and its number of bots."""
-    from .mtt_plans import desired, open_for, series_name, take
+    from .mtt_plans import desired, open_for, series_name, take, split, registration_window, EARLY_STOP
     result = TournamentPlan(next_time=next_time)
     behind = []
     for t in tournaments:
@@ -234,8 +234,19 @@ def plan_mtt_registrations(now: datetime, plans: dict, tournaments: list[Tournam
     if not behind:
         result.reasons.append("on_plan")
         return result
-    behind.sort(key=lambda x: (-x[0], x[1].start, x[1].id))
-    if behind[0][0] < 2 and next_time is not None and now < next_time.astimezone(timezone.utc):
+    def urgency(item):
+        need, tournament, plan, done = item
+        early, _ = split(plan, tournament.info.get("late_reg") is True)
+        if now < tournament.start:
+            deadline = tournament.start - EARLY_STOP
+            remaining = early - done.registered
+        else:
+            deadline = registration_window(plan, tournament.start, tournament.info)[1]
+            remaining = plan.total - done.registered
+        seconds = max(1, (deadline - now).total_seconds())
+        return (-remaining / seconds, deadline, -need, tournament.id)
+    behind.sort(key=urgency)
+    if max(item[0] for item in behind) < 2 and next_time is not None and now < next_time.astimezone(timezone.utc):
         result.reasons.append("paced")
         return result
     formats = {t.id: t.format for t in tournaments}
@@ -265,4 +276,61 @@ def plan_mtt_registrations(now: datetime, plans: dict, tournaments: list[Tournam
         result.actions.append(Registration(chosen, machine.id, t.id, due, rebuy=rebuy, addon=addon))
         result.next_time = due + timedelta(seconds=rng.uniform(min_gap, max(min_gap, max_gap)))
         return result
+    return result
+
+
+# Keep each batch within one 30-second scheduler interval. The PC workers execute
+# the commands at their staggered due times rather than logging every bot in at once.
+MTT_BATCH_SIZE = 5
+MTT_BATCH_GAP_SECONDS = 6
+
+
+def plan_mtt_registrations(now: datetime, plans: dict, tournaments: list[Tournament], progress: dict,
+                           accounts: list[Account], machines: list[Machine], entries: list[Entry], ranges: dict,
+                           next_time: datetime | None, min_gap: int, max_gap: int, heartbeat_seconds: int,
+                           freshness_seconds: int, rng: random.Random, excluded=(),
+                           capacity_entries: list[Entry] | None = None, max_actions: int = MTT_BATCH_SIZE) -> TournamentPlan:
+    """Catch up with a bounded batch, prioritizing required registrations per second
+    until the early/late deadline. Reserve every choice in memory before choosing
+    another: pending commands consume target, account limits, ownership and capacity.
+    On-plan registrations retain the site's normal min/max gap.
+    """
+    from .mtt_sessions import waits_for_mtt
+    from .mtt_plans import desired, series_name
+    result = TournamentPlan(next_time=next_time)
+    progress = {tid: replace(p, accounts=set(p.accounts)) for tid, p in progress.items()}
+    accounts, entries = list(accounts), list(entries)
+    holding = list(entries if capacity_entries is None else capacity_entries)
+    by_id = {t.id: t for t in tournaments}
+    catchup = False
+    for index in range(max(0, min(max_actions, MTT_BATCH_SIZE))):
+        if index and not catchup:
+            break
+        due = now + timedelta(seconds=index * MTT_BATCH_GAP_SECONDS)
+        step = _plan_mtt_registration(due, plans, tournaments, progress, accounts, machines, entries, ranges,
+                                     None if index else result.next_time, min_gap, max_gap, heartbeat_seconds,
+                                     freshness_seconds, rng, excluded, capacity_entries=holding)
+        if not step.actions:
+            if not result.actions:
+                result.reasons = step.reasons
+            break
+        action = step.actions[0]
+        result.actions.append(action)
+        result.next_time = step.next_time
+        tournament = by_id[action.tournament]
+        if index == 0:
+            count = progress.get(tournament.id, MttProgress()).registered
+            catchup = desired(plans[series_name(tournament.name)], tournament.start, now, tournament.info) - count >= 2
+        parked = waits_for_mtt({'table_type': 'MTT', 'tournament_state': tournament.state,
+                               'start': tournament.start}, due)
+        reservation = Entry(f'batch-{index}', action.account, action.machine, action.tournament, 'reserved', parked=parked)
+        entries.append(reservation)
+        if not parked:
+            holding.append(reservation)
+        accounts = [replace(a, owner_machine=action.machine) if a.id == action.account else a for a in accounts]
+        done = progress.setdefault(action.tournament, MttProgress())
+        done.registered += 1
+        done.accounts.add(action.account)
+        done.rebuy += int(bool(action.rebuy))
+        done.addon += int(bool(action.addon))
     return result

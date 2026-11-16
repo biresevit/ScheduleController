@@ -92,7 +92,7 @@ def test_registers_by_the_plan_of_the_series_and_never_without_one():
     now = START - timedelta(hours=1)
     plans = {"Night Owl Freeroll": MttPlan(10, rebuy=10, addon=0)}
     plan = run(now, plans, [mtt(), mtt("Other MTT", i=2)], [account(1), account(2)])
-    assert [(a.tournament, a.rebuy, a.addon) for a in plan.actions] == [("T1", True, False)]
+    assert [(a.tournament, a.rebuy, a.addon) for a in plan.actions] == [("T1", True, False)] * 2
     assert run(now, {}, [mtt()], [account(1)]).reasons == ["on_plan"]
 
 
@@ -120,7 +120,7 @@ def test_tier_buy_in_range_is_preferred_but_not_required():
     now = START - timedelta(minutes=5)
     plans = {"Main": MttPlan(2)}
     t = mtt("Main", buy_in="100")
-    assert [a.account for a in run(now, plans, [t], [account(1, "low"), account(2, "high")]).actions] == [2]
+    assert [a.account for a in run(now, plans, [t], [account(1, "low"), account(2, "high")]).actions] == [2, 1]
     assert [a.account for a in run(now, plans, [t], [account(1, "low")]).actions] == [1]
 
 
@@ -185,3 +185,99 @@ def test_parking_still_requires_an_available_machine(machine):
     now = START - timedelta(hours=1)
     assert not run(now, {'Night Owl Freeroll': MttPlan(10)}, [mtt()],
                    [account(1)], machines=[machine]).actions
+
+
+def test_catchup_batch_is_bounded_staggered_and_does_not_mutate_inputs():
+    now = START - timedelta(minutes=5)
+    progress = {"T1": MttProgress()}
+    accounts = [account(i) for i in range(20)]
+    plan = run(now, {"Night Owl Freeroll": MttPlan(100)}, [mtt()], accounts, progress)
+    assert len(plan.actions) == 5
+    assert len({a.account for a in plan.actions}) == 5
+    assert [int((a.not_before - now).total_seconds()) for a in plan.actions] == [0, 6, 12, 18, 24]
+    assert progress["T1"].registered == 0 and not progress["T1"].accounts
+    assert all(a.owner_machine is None for a in accounts)
+
+
+def test_batch_counts_pending_places_and_preserves_rebuy_addon_quotas():
+    now = START - timedelta(minutes=3)
+    progress = {"T1": MttProgress(registered=7, rebuy=2, addon=1, accounts=set(range(7)))}
+    plan = run(now, {"Night Owl Freeroll": MttPlan(10, rebuy=4, addon=2)}, [mtt()],
+               [account(i) for i in range(20)], progress)
+    # Pending reservations already contribute seven places; only three remain.
+    assert len(plan.actions) == 3
+    assert all(a.account not in set(range(7)) for a in plan.actions)
+    assert sum(a.rebuy for a in plan.actions) == 2
+    assert sum(a.addon for a in plan.actions) == 1
+
+
+def test_deadline_pressure_beats_the_largest_raw_shortfall():
+    now = START - timedelta(minutes=5)
+    plans = {"Urgent": MttPlan(3), "Big": MttPlan(100)}
+    ts = [mtt("Urgent", start=START - timedelta(minutes=2)), mtt("Big", start=START + timedelta(hours=1), i=2)]
+    plan = run(now, plans, ts, [account(i) for i in range(20)])
+    assert plan.actions[0].tournament == "T1"
+    assert any(a.tournament == "T2" for a in plan.actions)
+
+
+def test_batch_rechecks_live_machine_capacity():
+    now = START - timedelta(minutes=5)
+    plan = run(now, {"Night Owl Freeroll": MttPlan(100)}, [mtt()],
+               [account(i) for i in range(20)], machines=[Machine(1, 1, 2, now)])
+    assert len(plan.actions) == 2
+
+
+def test_batch_pins_account_ownership_and_rechecks_format_limit():
+    now = START - timedelta(hours=1)
+    ts = [mtt("One"), mtt("Two", i=2), mtt("Three", i=3)]
+    plan = run(now, {t.name: MttPlan(100) for t in ts}, ts,
+               [account(1, max_mtt_entries=2)],
+               machines=[Machine(1, 1, 50, now), Machine(2, 1, 50, now)])
+    assert len(plan.actions) == 2
+    assert len({a.tournament for a in plan.actions}) == 2
+    assert len({a.machine for a in plan.actions}) == 1
+
+
+def test_batch_never_queues_after_registration_closes():
+    now = START - timedelta(minutes=2, seconds=10)
+    plan = run(now, {"Night Owl Freeroll": MttPlan(100)}, [mtt()], [account(i) for i in range(20)])
+    assert len(plan.actions) == 2
+    assert all(a.not_before < START - timedelta(minutes=2) for a in plan.actions)
+
+
+def test_batch_does_not_exceed_early_share_before_late_registration():
+    now = START - timedelta(minutes=3)
+    plan = run(now, {"Night Owl Freeroll": MttPlan(10, early_percent=30)}, [mtt(info=LATE)],
+               [account(i) for i in range(20)])
+    assert len(plan.actions) == 3
+
+def test_overlapping_sunday_sized_plans_finish_with_registration_failures():
+    from dataclasses import replace
+    plans = {"Basso": MttPlan(120, early_percent=60),
+             "Alto": MttPlan(60, early_percent=60),
+             "Main": MttPlan(105, early_percent=90)}
+    tournaments = [mtt(name, i=i, info={"late_reg": True})
+                   for i, name in enumerate(plans, 1)]
+    accounts = [account(i, max_mtt_entries=3) for i in range(500)]
+    progress, entries, next_time = {}, [], None
+    rng = random.Random(17)
+    begin = START - timedelta(hours=2)
+    attempts = 0
+    for tick in range(351):  # two early hours, then 55 minutes (including the retry margin)
+        now = begin + timedelta(seconds=tick * 30)
+        current = [replace(t, observed=now, state='running' if now >= START else 'registering')
+                   for t in tournaments]
+        batch = plan_mtt_registrations(now, plans, current, progress, accounts,
+                                      [Machine(1, 1, 1000, now)], entries, RANGES, next_time,
+                                      45, 285, 60, 300, rng)
+        next_time = batch.next_time
+        for action in batch.actions:
+            attempts += 1
+            if attempts % 5 == 0:  # 20% of initial attempts fail and need replacement
+                continue
+            p = progress.setdefault(action.tournament, MttProgress())
+            assert action.account not in p.accounts
+            p.registered += 1
+            p.accounts.add(action.account)
+            entries.append(Entry(str(attempts), action.account, action.machine, action.tournament, 'joining'))
+    assert {t.name: progress[t.id].registered for t in tournaments} == {name: p.total for name, p in plans.items()}
