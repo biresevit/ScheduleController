@@ -13,6 +13,69 @@ from schedule_controller import pilot as pilot_module
 from schedule_controller import pilot_repository
 from schedule_controller.pilot import Pilot, WorkerFenced
 from schedule_controller.pilot_repository import Repository
+import pyodbc
+
+
+@pytest.mark.parametrize('operation',['refresh','initial_publish','publish','claim'])
+@pytest.mark.parametrize('state',['HYT00','08S01'])
+def test_temporary_sql_failures_keep_ring_and_mtt_clients_running(operation,state,monkeypatch,tmp_path):
+    monkeypatch.setattr(pilot_module,'DATABASE_RETRY_SECONDS',0.01)
+    monkeypatch.setattr(pilot_module,'HEARTBEAT_SECONDS',0.01)
+    class Lock:
+        def __init__(self,*args): pass
+        def acquire(self): return False
+        def release(self): pass
+    monkeypatch.setattr(pilot_module,'WorkerLock',Lock)
+    monkeypatch.setattr('schedule_controller.chat_worker.run_chat',lambda p:asyncio.sleep(3600))
+    monkeypatch.setattr('schedule_controller.manual_worker.run_manual',lambda p:asyncio.sleep(3600))
+
+    async def scenario():
+        stop=asyncio.Event()
+        p=bare_pilot();p.args=SimpleNamespace(seconds=0,stop_event=stop,leave_on_exit=False)
+        p.output=tmp_path;p.started=False;p.config={'site':{'LobbyRefreshSeconds':3600}}
+        p.configuration=AsyncMock();p.reconcile_cloud_entries=AsyncMock()
+        p.decision=SimpleNamespace(require_hand_history=AsyncMock(),close=AsyncMock())
+        p.run_live_views=lambda:asyncio.sleep(3600);p.flush_metrics=AsyncMock()
+        a=client('andrew',ring=('r1',),tournament=('t1',));p.clients={1:a}
+        calls={'refresh':0,'publish':0,'claim':0};failed=False;playing=[]
+        async def poker():
+            while not stop.is_set():
+                playing.append(1);await asyncio.sleep(0.001)
+        bot=asyncio.create_task(poker())
+        def step(kind):
+            nonlocal failed
+            calls[kind]+=1
+            # Fail the second publish to cover the periodic heartbeat, as well
+            # as failures on the first refresh and first command claim.
+            target='publish' if operation=='initial_publish' else operation
+            if kind==target and not failed and calls[kind]>=(2 if operation=='publish' else 1):
+                failed=True
+                raise pyodbc.OperationalError(state,'Temporary database outage')
+        async def refresh():step('refresh')
+        async def publish():
+            step('publish');p.last_heartbeat=time.monotonic()
+        def claim(limit):
+            step('claim');return []
+        # Check successful progress after the failure before requesting shutdown.
+        async def monitor():
+            target='publish' if operation=='initial_publish' else operation
+            while not failed or calls[target]<(3 if operation=='publish' else 2):
+                await asyncio.sleep(0.001)
+            a.close.assert_not_awaited();a.remove.assert_not_awaited()
+            p.decision.close.assert_not_awaited()
+            assert p.fenced is None and playing
+            stop.set()
+        p.refresh=refresh;p.publish=publish
+        p.repo=SimpleNamespace(start_cloud_worker=lambda *a:[],finish_cloud_worker_reconciliation=lambda:None,
+                               claim_due=claim,stop_cloud_worker=lambda:None)
+        watching=asyncio.create_task(monitor())
+        await asyncio.wait_for(p.run_cloud_worker(),5)
+        await watching;await bot
+        assert p.reconcile_cloud_entries.await_count==1  # no restart or seat reconciliation
+        a.close.assert_awaited_once()  # only the requested shutdown closes it
+        a.remove.assert_not_awaited()
+    monkeypatch.setattr(Pilot,'platform',None,raising=False)
+    asyncio.run(scenario())
 
 
 def client(name, ring=(), tournament=()):
@@ -109,10 +172,12 @@ def test_a_fenced_worker_publishes_nothing():
     asyncio.run(scenario())
 
 
-def test_a_worker_stuck_on_the_database_stops_leaves_and_raises_for_a_restart(monkeypatch, tmp_path):
+@pytest.mark.parametrize('database_reply',['hung','timeout'])
+def test_a_worker_stuck_on_the_database_stops_leaves_and_raises_for_a_restart(monkeypatch, tmp_path,database_reply):
     monkeypatch.setattr(pilot_module, 'FENCE_SECONDS', 0.4)
     monkeypatch.setattr(pilot_module, 'WATCH_SECONDS', 0.05)
     monkeypatch.setattr(pilot_module, 'HEARTBEAT_SECONDS', 0.1)
+    monkeypatch.setattr(pilot_module, 'DATABASE_RETRY_SECONDS', 0.01)
     class Lock:
         def __init__(self, *a): pass
         def acquire(self): return False
@@ -142,6 +207,8 @@ def test_a_worker_stuck_on_the_database_stops_leaves_and_raises_for_a_restart(mo
             publishes.append(ready)
             if len(publishes) == 1:
                 p.last_heartbeat = time.monotonic(); return
+            if database_reply=='timeout':
+                raise pyodbc.OperationalError('HYT00','Query timeout expired')
             await asyncio.Event().wait()  # the database call that never returns
         p.publish = publish
         with pytest.raises(WorkerFenced, match='No heartbeat reached the database'):

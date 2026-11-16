@@ -11,6 +11,24 @@ import time
 log=logging.getLogger(__name__)
 
 
+def is_transient_database_error(error):
+    """Recognize SQL transport/timeouts without treating poker/network errors as SQL failures.
+
+    This classifies errors for the worker loop, not for replaying transactions or
+    poker actions. A failed repository transaction discards its SQL connection.
+    """
+    import pyodbc
+    if not isinstance(error,pyodbc.Error) or not error.args:
+        return False
+    state=str(error.args[0])
+    if state in {'HYT00','HYT01','40001'} or state.startswith('08'):
+        return True
+    # Azure SQL throttling/failover and SQL Server lock timeouts.
+    text=' '.join(str(arg) for arg in error.args)
+    return state in {'42000','HY000'} and any(
+        f'({code})' in text for code in (1222,40197,40501,40613,10928,10929,49918,49919,49920))
+
+
 def retry_deadlocks(function):
     @wraps(function)
     def run(*args,**kwargs):

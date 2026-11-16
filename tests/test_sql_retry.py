@@ -1,6 +1,28 @@
 from contextlib import contextmanager
 import pytest
 from schedule_controller.sql_retry import retry_deadlocks
+from schedule_controller.sql_retry import is_transient_database_error
+import pyodbc
+
+
+@pytest.mark.parametrize('state,message,expected',[
+    ('HYT00','Query timeout expired',True),
+    ('HYT01','Login timeout expired',True),
+    ('08S01','Communication link failure',True),
+    ('40001','Deadlock victim (1205)',True),
+    ('42000','Database unavailable (40613)',True),
+    ('HY000','Lock request timeout (1222)',True),
+    ('42000','Invalid object name (208)',False),
+    ('23000','Duplicate key (2627)',False),
+    ('28000','Login failed (18456)',False),
+])
+def test_transient_sql_error_classification(state,message,expected):
+    assert is_transient_database_error(pyodbc.OperationalError(state,message)) is expected
+
+
+def test_non_sql_failures_are_never_classified_as_database_outages():
+    assert not is_transient_database_error(RuntimeError('HYT00','Query timeout expired'))
+    assert not is_transient_database_error(ConnectionError('Poker socket disconnected'))
 
 
 def test_deadlock_retries_the_whole_transaction_after_rollback(monkeypatch):

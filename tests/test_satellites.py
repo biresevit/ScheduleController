@@ -3,11 +3,17 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+import pytest
 
 from schedule_controller.pilot import Pilot
 from schedule_controller.satellites import is_satellite, satellite_target
 
 NOW = datetime(2026, 11, 13, 20, 31, tzinfo=timezone.utc)
+
+
+@pytest.fixture(autouse=True)
+def fixed_clock(monkeypatch):
+    monkeypatch.setattr('schedule_controller.pilot.now',lambda:NOW)
 
 
 def row(id, name, start, state="registering", kind="MTT"):

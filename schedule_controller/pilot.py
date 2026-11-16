@@ -29,6 +29,7 @@ from .planner import Account,Entry,Machine,Settings,Table,plan
 from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
 from .join_failures import LIMIT_REASON,LIMIT_DESCRIPTION,failure_description
+from .sql_retry import is_transient_database_error
 from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,remember_buy_ins,tournament_id
 from .bluffpoker_tournaments import BluffPokerTournaments,lobby_rows as bluffpoker_tournament_rows
 
@@ -46,6 +47,7 @@ FENCE_SECONDS=120
 # The worker loop publishes (its heartbeat) at least this often, whatever the lobby refresh interval.
 HEARTBEAT_SECONDS=30
 WATCH_SECONDS=5
+DATABASE_RETRY_SECONDS=2
 # A fenced worker's last tries to leave its ring tables: the current hand first, then at once.
 FENCE_FINISH_SECONDS=60
 FENCE_LEAVE_SECONDS=15
@@ -1416,40 +1418,51 @@ class Pilot:
             recovery=await asyncio.to_thread(self.repo.start_cloud_worker,gone) if gone else                 await asyncio.to_thread(self.repo.start_cloud_worker)
             await self.reconcile_cloud_entries(recovery)
             await asyncio.to_thread(self.repo.finish_cloud_worker_reconciliation)
+            self.last_heartbeat=time.monotonic()  # reconciliation just committed a fresh database heartbeat
             self.started=True
             self.args.ready=True  # read by run_sites: a run that got ready restarts quickly after a failure
             log.info('Cloud worker ready after reconciling %s prior entries; entry capacity is enforced by the Azure scheduler',len(recovery))
-            await self.refresh();await self.publish()
             watch_task=asyncio.create_task(self.watch_heartbeat(asyncio.current_task()))
             from .chat_worker import run_chat
             chat_task=asyncio.create_task(run_chat(self))
             from .manual_worker import run_manual
             manual_task=asyncio.create_task(run_manual(self))
             live_task=asyncio.create_task(self.run_live_views())
-            next_refresh=time.monotonic()+self.config['site']['LobbyRefreshSeconds']
+            next_refresh=0.0
             next_claim=next_telemetry=0.0;next_metrics=time.monotonic()+METRICS_SECONDS
             while (not self.args.seconds or now()<self.end) and not self.stopping():
                 tick=time.monotonic()
-                if tick>=next_refresh:
-                    await self.refresh();await self.publish()
-                    next_refresh=tick+self.config['site']['LobbyRefreshSeconds']
-                elif tick-self.last_heartbeat>=HEARTBEAT_SECONDS:
-                    await self.publish()
-                if tick>=next_claim:
-                    claimed=await asyncio.to_thread(self.repo.claim_due,10)
-                    for row in claimed:
-                        self.accept_claim(row)
-                    next_claim=tick+1
-                if tick>=next_telemetry and getattr(self.args,'telemetry_provider',None):
-                    try:
-                        metrics=await asyncio.to_thread(self.args.telemetry_provider)
-                        await asyncio.to_thread(self.repo.publish_machine_telemetry,metrics)
-                    except Exception:
-                        log.exception('Could not publish machine resource telemetry')
-                    next_telemetry=tick+300
-                if tick>=next_metrics:
-                    await self.flush_metrics()
-                    next_metrics=tick+METRICS_SECONDS
+                try:
+                    if tick>=next_refresh:
+                        await self.refresh();await self.publish()
+                        next_refresh=tick+self.config['site']['LobbyRefreshSeconds']
+                    elif tick-self.last_heartbeat>=HEARTBEAT_SECONDS:
+                        await self.publish()
+                    if tick>=next_claim:
+                        claimed=await asyncio.to_thread(self.repo.claim_due,10)
+                        for row in claimed:
+                            self.accept_claim(row)
+                        next_claim=tick+1
+                    if tick>=next_telemetry and getattr(self.args,'telemetry_provider',None):
+                        try:
+                            metrics=await asyncio.to_thread(self.args.telemetry_provider)
+                            await asyncio.to_thread(self.repo.publish_machine_telemetry,metrics)
+                        except Exception:
+                            log.exception('Could not publish machine resource telemetry')
+                        next_telemetry=tick+300
+                    if tick>=next_metrics:
+                        await self.flush_metrics()
+                        next_metrics=tick+METRICS_SECONDS
+                except Exception as exc:
+                    if not is_transient_database_error(exc):raise
+                    # Repository failures discard their SQL connection. Continue on a fresh
+                    # one without closing poker clients or replaying any poker sends.
+                    # Only a successful publish renews last_heartbeat: the watchdog still
+                    # fences a prolonged outage before Azure expires the worker's ownership.
+                    log.warning('Temporary SQL failure (%s); keeping poker connections open and retrying in %s s',
+                                exc.args[0],DATABASE_RETRY_SECONDS)
+                    await asyncio.sleep(DATABASE_RETRY_SECONDS)
+                    continue
                 await asyncio.sleep(.25)
         except asyncio.CancelledError:
             if getattr(self,'fenced',None) is None:raise

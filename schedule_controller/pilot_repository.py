@@ -248,8 +248,8 @@ CONNECTION_IDLE_SECONDS=240   # below Azure SQL's 30-minute idle cut, so a reuse
 CONNECTION_MAX_AGE_SECONDS=1800
 # pyodbc's connect timeout covers only the login; without a query timeout a statement blocked on the server waited
 # forever, and the worker loop with it. Below the worker's FENCE_SECONDS (pilot.py), so a stuck statement fails and
-# the worker restarts and reconciles its seats before its own watchdog has to stop it.
-QUERY_TIMEOUT_SECONDS=90
+# the worker can retry on a fresh connection several times before its watchdog stops it.
+QUERY_TIMEOUT_SECONDS=30
 
 
 def _open_connection():
