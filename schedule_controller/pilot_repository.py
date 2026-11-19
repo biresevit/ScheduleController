@@ -586,6 +586,57 @@ class Repository(ChatRepository,ManualRepository):
                 metrics.get('poker_controller_version'),metrics.get('pdecision_version'))
             db.execute("DELETE scheduler.MachineTelemetry WHERE MachineId=:machine AND SampledUtc<DATEADD(day,-90,SYSUTCDATETIME())")
 
+    def publish_account_diagnostic(self,account_id,available_native,outcome,source='periodic',wallets=None):
+        if outcome not in ('balance_observed','balance_shape_unverified','balance_read_failed','authentication_unavailable'):
+            raise ValueError('Invalid diagnostic outcome')
+        if source not in ('periodic','logout'):
+            raise ValueError('Invalid diagnostic source')
+        if (available_native is not None or wallets is not None)!=(outcome=='balance_observed'):
+            raise ValueError('Diagnostic amount and outcome disagree')
+        if wallets is not None:
+            if not isinstance(wallets,list) or not 1<=len(wallets)<=16:raise ValueError('Invalid wallets')
+            seen=set()
+            for w in wallets:
+                if not isinstance(w,dict) or set(w)!={'money_type','available_native'}:raise ValueError('Invalid wallet fields')
+                kind,amount=w['money_type'],w['available_native']
+                if (kind is not None and type(kind) is not int) or kind in seen or type(amount) is not int or not 0<=amount<=2**63-1:raise ValueError('Invalid wallet value')
+                seen.add(kind)
+        wallets_json=json.dumps(wallets) if wallets is not None else None
+        if available_native is not None and (type(available_native) is not int or not 0<=available_native<=2**63-1 or outcome!='balance_observed'):
+            raise ValueError('Invalid diagnostic balance')
+        with self.transaction() as db:
+            db.execute("""IF OBJECT_ID(N'scheduler.AccountDiagnosticSnapshot') IS NOT NULL
+                BEGIN
+                DECLARE @account int=?,@epoch uniqueidentifier=?,@amount bigint=?,@outcome varchar(40)=?,@source varchar(16)=?,@wallets nvarchar(2000)=?;
+                IF EXISTS(SELECT 1 FROM scheduler.MachineAssignment a WITH(UPDLOCK,HOLDLOCK)
+                    WHERE a.SiteId=:site AND a.MachineId=:machine AND a.WorkerEpoch=@epoch)
+                AND (EXISTS(SELECT 1 FROM scheduler.AccountLease l WITH(UPDLOCK,HOLDLOCK)
+                    WHERE l.SiteId=:site AND l.MachineId=:machine AND l.BotAccountId=@account
+                    AND l.WorkerEpoch=@epoch AND l.LeaseUntilUtc>SYSUTCDATETIME())
+                    OR (@source='logout' AND NOT EXISTS(SELECT 1 FROM scheduler.AccountLease l WITH(UPDLOCK,HOLDLOCK)
+                        WHERE l.BotAccountId=@account AND l.LeaseUntilUtc>SYSUTCDATETIME())
+                        AND EXISTS(SELECT 1 FROM scheduler.AccountSession s WHERE s.SiteId=:site
+                            AND s.MachineId=:machine AND s.WorkerEpoch=@epoch AND s.BotAccountId=@account
+                            AND (s.IsOpen=1 OR s.ActualEndUtc>=DATEADD(minute,-2,SYSUTCDATETIME())))
+                        AND NOT EXISTS(SELECT 1 FROM scheduler.AccountSession s WHERE s.BotAccountId=@account
+                            AND s.IsOpen=1 AND (s.MachineId<>:machine OR s.WorkerEpoch<>@epoch))))
+                BEGIN
+                UPDATE scheduler.AccountDiagnosticSnapshot WITH(UPDLOCK,HOLDLOCK)
+                    SET MachineId=CASE WHEN @outcome='balance_observed' THEN :machine ELSE MachineId END,
+                    WorkerEpoch=CASE WHEN @outcome='balance_observed' THEN @epoch ELSE WorkerEpoch END,
+                    ObservedUtc=CASE WHEN @outcome='balance_observed' THEN SYSUTCDATETIME() ELSE ObservedUtc END,
+                    AvailableNative=CASE WHEN @outcome='balance_observed' THEN @amount ELSE AvailableNative END,
+                    WalletsJson=CASE WHEN @outcome='balance_observed' THEN @wallets ELSE WalletsJson END,
+                    Outcome=@outcome,LastAttemptUtc=SYSUTCDATETIME(),
+                    SnapshotSource=CASE WHEN @outcome='balance_observed' THEN @source ELSE SnapshotSource END,
+                    CurrencyCode=CASE WHEN @outcome='balance_observed' THEN (SELECT CurrencyCode FROM scheduler.Site WHERE SiteId=:site) ELSE CurrencyCode END
+                    WHERE SiteId=:site AND BotAccountId=@account;
+                IF @@ROWCOUNT=0 INSERT scheduler.AccountDiagnosticSnapshot
+                    (SiteId,BotAccountId,MachineId,WorkerEpoch,ObservedUtc,AvailableNative,CurrencyCode,Outcome,SnapshotSource,LastAttemptUtc,WalletsJson)
+                    SELECT :site,@account,:machine,@epoch,CASE WHEN @outcome='balance_observed' THEN SYSUTCDATETIME() END,
+                        @amount,CurrencyCode,@outcome,@source,SYSUTCDATETIME(),@wallets FROM scheduler.Site WHERE SiteId=:site;
+                END; END""",account_id,self.epoch,available_native,outcome,source,wallets_json)
+
     @retry_deadlocks
     def prepare_schedule(self,start,end,target,high_only):
         from zoneinfo import ZoneInfo
