@@ -46,6 +46,7 @@ def main():
             "reporting.HandPlayerResult":"SELECT,INSERT,UPDATE,DELETE",
             "scheduler.Site":"SELECT,UPDATE","scheduler.StakeBand":"SELECT","scheduler.ScheduleWindow":"SELECT","scheduler.MttPlan":"SELECT",
             "scheduler.AccountPolicy":"SELECT","scheduler.AccountDay":"SELECT","scheduler.MachineAssignment":"SELECT",
+            "scheduler.AccountDiagnosticSnapshot":"SELECT,INSERT,UPDATE",
             "scheduler.LobbyTable":"SELECT","scheduler.TableSeat":"SELECT","scheduler.AccountLease":"SELECT,INSERT,UPDATE,DELETE",
             "scheduler.AccountSession":"SELECT,INSERT,UPDATE","scheduler.Entry":"SELECT,INSERT,UPDATE",
             "scheduler.Command":"SELECT,INSERT,UPDATE","scheduler.Outbox":"SELECT,INSERT,UPDATE"}

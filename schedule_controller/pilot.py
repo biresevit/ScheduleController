@@ -146,6 +146,7 @@ class Session:
     def __init__(self,policy,decision,rng=None,repo=None,site=None):
         self.policy=policy
         self.repo=repo
+        self.diagnostic_enabled=bool((site or {}).get('AccountDiagnosticsEnabled'))
         self.platform=platform_id((site or {}).get('Platform'))
         self.endpoint=(site or {}).get('EndpointUrl')
         # BluffPoker's site-wide client values, stored with the site; the PC then needs no bluffpoker.json
@@ -198,6 +199,9 @@ class Session:
         await self.client.open()
         self.pump=asyncio.create_task(self.receive())
         if purpose=='play task':self.breaker=asyncio.create_task(self.run_breaks())
+        from .account_diagnostics import enabled,monitor
+        if purpose=='play task' and self.repo and enabled(self):
+            self.diagnostic_monitor=asyncio.create_task(monitor(self))
         log.info('Login confirmed for %s: %s',purpose,self.policy['Username'])
 
     def next_break_after(self):
@@ -634,7 +638,7 @@ class Session:
         for t in self.workers.values(): t.cancel()
         for t in self.rit_tasks: t.cancel()
         for t in self.bust_tasks: t.cancel()
-        extra=[t for t in (self.pump,getattr(self,'breaker',None)) if t]
+        extra=[t for t in (self.pump,getattr(self,'breaker',None),getattr(self,'diagnostic_monitor',None)) if t]
         for t in extra: t.cancel()
         await asyncio.gather(*self.workers.values(),*self.rit_tasks,*self.bust_tasks,*extra,return_exceptions=True)
         await self.client.close()
@@ -799,6 +803,8 @@ class Pilot:
             session=self.clients.pop(aid,None)
             if not session:
                 return False
+            from .account_diagnostics import before_logout
+            await before_logout(session)
             await session.close()
         log.info('Logout confirmed after final table: %s',self.policies[aid]['Username'])
         return True
