@@ -21,6 +21,7 @@ def test_evenbet_vendor_balances_update_keeps_wallets_separate():
     assert enabled(SimpleNamespace(diagnostic_enabled=True))
     assert wallets(EVENBET,{'cashInfoList':[{'mt':'1','ma':'12000'}]})==[{'money_type':1,'available_native':12000}]
     assert wallets(EVENBET,{'cashInfoList':[{'mt':'1','ma':'12000.00'}]})==[{'money_type':1,'available_native':12000}]
+    assert wallets(EVENBET,{'cashInfoList':[{'mt':1},{'mt':2,'ma':12000}]})==[{'money_type':1,'available_native':0},{'money_type':2,'available_native':12000}]
 
 
 def test_bluff_diagnostic_read_never_reauthenticates():
@@ -116,7 +117,7 @@ def test_final_snapshot_waits_for_inflight_periodic_sql(monkeypatch):
         writes.append(source)
     async def run():
         session=SimpleNamespace(repo=SimpleNamespace(publish_account_diagnostic=publish),policy={'BotAccountId':7})
-        session.diagnostic_monitor=asyncio.create_task(monitor(session))
+        session.diagnostic_monitor=asyncio.create_task(monitor(session,initial_delay=0))
         assert await asyncio.to_thread(started.wait,3)
         final=asyncio.create_task(before_logout(session))
         await asyncio.sleep(.02)
