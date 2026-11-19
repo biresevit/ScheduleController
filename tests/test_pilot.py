@@ -186,6 +186,33 @@ def test_lobby_refresh_uses_one_temporary_login_then_logs_out(monkeypatch):
     assert p.clients=={}
 
 
+def test_expired_rest_credentials_do_not_prevent_a_fresh_lobby_observer(monkeypatch):
+    import schedule_controller.pilot as module
+    events=[]
+    expired=_observer('expired-account',ConnectionError())
+    expired.client.hub=SimpleNamespace(failed='CREDENTIAL_EXPIRED')
+
+    class FreshSession:
+        def __init__(self,policy,decision,rng,repo=None,site=None):
+            self.policy=policy;self.failures={};self.ready=asyncio.Event();self.ready.set();self.observed={}
+            self.client=SimpleNamespace(connection=SimpleNamespace(failure=None),tables={},states={},
+                state_versions={},player_id=20,list_tables=AsyncMock(return_value=[]))
+        async def open(self,purpose):events.append(('open',purpose))
+        async def close(self):events.append(('close',))
+
+    monkeypatch.setattr(module,'Session',FreshSession)
+    p=Pilot.__new__(Pilot)
+    p.clients={1:expired};p.entries={};p.info={};p.tables=[{'id':'stale'}];p.seats={}
+    p.config={'site':{'Platform':'BluffPokerPlatform'}}
+    p.policies={2:{'Username':'fresh-account','BotAccountId':2}};p.decision=object();p.rng=random.Random(1)
+    p.repo=SimpleNamespace(machine_enabled=lambda:True,claim_observer=lambda:2,
+                           release_observer=lambda account:events.append(('release',account)))
+    asyncio.run(p.refresh())
+    assert events==[('open','lobby scan'),('close',),('release',2)]
+    expired.client.list_tables.assert_not_awaited()
+    assert p.tables==[]
+
+
 def test_idle_pc_does_not_log_in_another_machines_owned_account(monkeypatch):
     import schedule_controller.pilot as module
     p=Pilot.__new__(Pilot)
