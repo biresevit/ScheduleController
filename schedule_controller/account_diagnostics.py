@@ -32,7 +32,10 @@ def wallets(platform,response):
     result=[];seen=set()
     for row in rows:
         if not isinstance(row,dict):return None
-        kind,amount=wire_integer(row.get('mt')),wire_integer(row.get('ma'))
+        # The vendor CashInfoData constructor defaults omitted integer fields to
+        # zero. The live server omits ma on a zero wallet; this is observed wire
+        # data, not an estimated initial balance.
+        kind,amount=wire_integer(row.get('mt',0)),wire_integer(row.get('ma',0))
         if type(kind) is not int or kind in seen or type(amount) is not int or not 0<=amount<=2**63-1:return None
         seen.add(kind);result.append({'money_type':kind,'available_native':amount})
     return result
@@ -103,7 +106,10 @@ async def before_logout(session):
     await capture(session,'logout')
 
 
-async def monitor(session):
+async def monitor(session,initial_delay=15):
+    # Login precedes lease adoption during restart reconciliation. Let that
+    # ownership transaction settle before the first optional snapshot.
+    await asyncio.sleep(initial_delay)
     while True:
         await capture(session)
         await asyncio.sleep(300)
