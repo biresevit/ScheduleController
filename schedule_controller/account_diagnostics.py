@@ -13,7 +13,7 @@ log=logging.getLogger(__name__)
 
 def wire_integer(value):
     if type(value) is int:return value
-    if isinstance(value,str) and re.fullmatch(r'[0-9]{1,19}',value):return int(value)
+    if isinstance(value,str) and re.fullmatch(r'-?[0-9]{1,19}(?:\.0+)?',value):return int(value.split('.')[0])
     return None
 
 
@@ -61,7 +61,11 @@ async def sample(session):
     session.diagnostic_wallets=wallets(session.platform,response)
     if session.diagnostic_wallets is None:
         # Types/field names only: never write response values, tokens or account identities.
-        shape={str(k)[:40]:type(v).__name__ for k,v in list(response.items())[:20]} if isinstance(response,dict) else type(response).__name__
+        def types(value,depth=0):
+            if depth<3 and isinstance(value,dict):return {str(k)[:40]:types(v,depth+1) for k,v in list(value.items())[:20]}
+            if depth<3 and isinstance(value,list):return [types(v,depth+1) for v in value[:2]]
+            return type(value).__name__
+        shape=types(response)
         log.warning('Wallet response shape unverified (platform %s): %s',session.platform,shape)
     amount = session.diagnostic_wallets[0]['available_native'] if session.diagnostic_wallets and len(session.diagnostic_wallets)==1 else None
     return amount, 'balance_observed' if session.diagnostic_wallets else 'balance_shape_unverified'
