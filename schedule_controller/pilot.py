@@ -129,6 +129,13 @@ def rate_limited(exc):
     return getattr(exc,'status',None)==429 or 'RATE_LIMIT' in str(getattr(exc,'code','') or exc)
 
 
+def lobby_observer_usable(session):
+    # BluffPoker REST credentials can be terminally refused while its WebSocket still looks healthy.
+    # Such a client must not suppress the lease-protected temporary observer login on an idle PC.
+    return not (session.failures or session.client.connection.failure or
+                getattr(getattr(session.client,'hub',None),'failed',None))
+
+
 def observed_ring_table(table):
     """Ring tables published to the lobby (Live Tables): NLH, PLO4 and PLO5, no-limit or pot-limit. The scheduler
     decides separately which of them bots join (planner: NLH and PLO4 only)."""
@@ -816,9 +823,9 @@ class Pilot:
         temporary=None
         last_error=None
         # A single account socket must never be a controller-wide dependency.
-        candidates=sorted(self.clients.values(),key=lambda c: bool(c.failures or c.client.connection.failure))
+        candidates=sorted(self.clients.values(),key=lambda c: not lobby_observer_usable(c))
         # A disabled PC logs no account in just to scan the lobby; seated accounts still read their own tables.
-        if not any(not c.failures and not c.client.connection.failure for c in candidates) and                 await asyncio.to_thread(getattr(self.repo,'machine_enabled',lambda:True)):
+        if not any(lobby_observer_usable(c) for c in candidates) and                 await asyncio.to_thread(getattr(self.repo,'machine_enabled',lambda:True)):
             scan_account=await asyncio.to_thread(self.repo.claim_observer)
             if scan_account is not None and scan_account not in self.policies:
                 await asyncio.to_thread(self.repo.release_observer,scan_account)
@@ -834,7 +841,7 @@ class Pilot:
         for candidate in candidates:
             try:
                 await candidate.ready.wait()
-                if candidate.failures or candidate.client.connection.failure:
+                if not lobby_observer_usable(candidate):
                     continue
                 await candidate.client.list_tables()
                 lobby=list(candidate.client.tables.values())
