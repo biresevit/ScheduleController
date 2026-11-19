@@ -5,7 +5,16 @@ EvenBet wire fields follow the vendor's BalancesUpdate cashInfoList converter.
 """
 import asyncio
 import os
+import logging
+import re
 from poker_controller.sites import BLUFFPOKER,EVENBET
+log=logging.getLogger(__name__)
+
+
+def wire_integer(value):
+    if type(value) is int:return value
+    if isinstance(value,str) and re.fullmatch(r'[0-9]{1,19}',value):return int(value)
+    return None
 
 
 def enabled(session=None):
@@ -23,7 +32,7 @@ def wallets(platform,response):
     result=[];seen=set()
     for row in rows:
         if not isinstance(row,dict):return None
-        kind,amount=row.get('mt'),row.get('ma')
+        kind,amount=wire_integer(row.get('mt')),wire_integer(row.get('ma'))
         if type(kind) is not int or kind in seen or type(amount) is not int or not 0<=amount<=2**63-1:return None
         seen.add(kind);result.append({'money_type':kind,'available_native':amount})
     return result
@@ -50,6 +59,10 @@ async def sample(session):
         # Existing WebSocket request has no login/reconnect path.
         response = await asyncio.wait_for(client.connection.request('GetBalance'), 8)
     session.diagnostic_wallets=wallets(session.platform,response)
+    if session.diagnostic_wallets is None:
+        # Types/field names only: never write response values, tokens or account identities.
+        shape={str(k)[:40]:type(v).__name__ for k,v in list(response.items())[:20]} if isinstance(response,dict) else type(response).__name__
+        log.warning('Wallet response shape unverified (platform %s): %s',session.platform,shape)
     amount = session.diagnostic_wallets[0]['available_native'] if session.diagnostic_wallets and len(session.diagnostic_wallets)==1 else None
     return amount, 'balance_observed' if session.diagnostic_wallets else 'balance_shape_unverified'
 
@@ -72,8 +85,8 @@ async def capture(session, source='periodic'):
     except asyncio.CancelledError:
         await asyncio.gather(write_task,return_exceptions=True)
         raise
-    except Exception:
-        pass  # Optional observability must never interrupt a poker session.
+    except Exception as error:
+        log.warning('Wallet snapshot persistence failed (%s)',type(error).__name__)
 
 
 async def before_logout(session):
