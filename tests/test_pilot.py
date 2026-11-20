@@ -525,3 +525,25 @@ def test_decision_metrics_are_flushed_in_one_batch_and_kept_when_the_write_fails
     m.decision(2,2,300);p.repo=SimpleNamespace(publish_decision_metrics=fail)
     asyncio.run(p.flush_metrics())
     rows,_=m.drain();assert rows[0]['decisions']==1  # kept for the next batch
+
+
+def test_restart_adoption_accepts_only_definitive_bluffpoker_closed_table():
+    import pytest
+    from poker_controller.bluffpoker import BluffPokerError
+    from poker_controller.sites import BLUFFPOKER,EVENBET
+    for platform,error,absent in [
+        (BLUFFPOKER,BluffPokerError('TABLE_CLOSED',status=404),True),
+        (BLUFFPOKER,BluffPokerError('TABLE_CLOSED',status=500,uncertain=True),False),
+        (BLUFFPOKER,BluffPokerError('TABLE_CLOSED',status=404,uncertain=True),False),
+        (BLUFFPOKER,BluffPokerError('AUTH_FAILED',status=404),False),
+        (EVENBET,BluffPokerError('TABLE_CLOSED',status=404),False),
+    ]:
+        session=Session.__new__(Session);session.platform=platform
+        session.client=SimpleNamespace(tables={},states={42:{'s':[]}},join=AsyncMock(side_effect=error))
+        if absent:
+            assert asyncio.run(session.adopt(42,{'i':42})) is None
+            assert 42 not in session.client.tables and 42 not in session.client.states
+        else:
+            with pytest.raises(BluffPokerError) as caught:asyncio.run(session.adopt(42,{'i':42}))
+            assert caught.value is error
+            assert 42 in session.client.tables and 42 in session.client.states

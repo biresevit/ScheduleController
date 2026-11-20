@@ -584,7 +584,19 @@ class Session:
     async def adopt(self,tid,info):
         """Attach workers to a seat proven to exist after a controller restart."""
         self.client.tables[tid]=info
-        await self.client.join(tid)
+        try:
+            await self.client.join(tid)
+        except ProtocolError as exc:
+            # A definitive closed-table response proves this ring seat cannot
+            # survive. Other refusals and uncertain network failures do not.
+            from poker_controller.bluffpoker import BluffPokerError
+            if not (getattr(self,'platform',None)==BLUFFPOKER and isinstance(exc,BluffPokerError)
+                    and exc.code=='TABLE_CLOSED' and exc.status==404 and not exc.uncertain):
+                raise
+            self.client.tables.pop(tid,None)
+            self.client.states.pop(tid,None)
+            log.info('Restart reconciliation confirmed closed BluffPoker table')
+            return None
         return await self.resume_seat(tid)
 
     async def resume_seat(self,tid):
