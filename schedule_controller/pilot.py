@@ -30,6 +30,7 @@ from .rules import Band,Window,target_at,choose_buy_in
 from .pilot_repository import Repository,NAMES
 from .join_failures import LIMIT_REASON,LIMIT_DESCRIPTION,failure_description
 from .sql_retry import is_transient_database_error
+from .worker_diagnostics import phase as diagnostic_phase, heartbeat_stall
 from .tournament_worker import TOPICS as TOURNAMENT_TOPICS,TournamentPlay,lobby_rows as tournament_lobby_rows,remember_buy_ins,tournament_id
 from .bluffpoker_tournaments import BluffPokerTournaments,lobby_rows as bluffpoker_tournament_rows
 
@@ -1431,8 +1432,10 @@ class Pilot:
         # Azure owns session lifetimes here: a session outlives its tables and the scheduler
         # closes it at its planned end. The worker must not end sessions when tables close.
         self.cloud=True
-        await self.configuration()
-        await self.decision.require_hand_history(self.platform)
+        with diagnostic_phase(self,'startup_configuration'):
+            await self.configuration()
+        with diagnostic_phase(self,'startup_decision'):
+            await self.decision.require_hand_history(self.platform)
         self.end=now()+timedelta(days=3650) if not self.args.seconds else now()+timedelta(seconds=self.args.seconds)
         chat_task=manual_task=live_task=watch_task=None
         try:
@@ -1440,9 +1443,10 @@ class Pilot:
             # used to block its replacement for 90 s, and BluffPoker gives up a disconnected seat after ~29 s.
             self.worker_lock=WorkerLock(getattr(self.args,'machine_id',None),getattr(self.args,'site_id',None))
             gone=self.worker_lock.acquire()
-            recovery=await asyncio.to_thread(self.repo.start_cloud_worker,gone) if gone else                 await asyncio.to_thread(self.repo.start_cloud_worker)
-            await self.reconcile_cloud_entries(recovery)
-            await asyncio.to_thread(self.repo.finish_cloud_worker_reconciliation)
+            with diagnostic_phase(self,'startup_reconciliation'):
+                recovery=await asyncio.to_thread(self.repo.start_cloud_worker,gone) if gone else                 await asyncio.to_thread(self.repo.start_cloud_worker)
+                await self.reconcile_cloud_entries(recovery)
+                await asyncio.to_thread(self.repo.finish_cloud_worker_reconciliation)
             self.last_heartbeat=time.monotonic()  # reconciliation just committed a fresh database heartbeat
             self.started=True
             self.args.ready=True  # read by run_sites: a run that got ready restarts quickly after a failure
@@ -1459,24 +1463,27 @@ class Pilot:
                 tick=time.monotonic()
                 try:
                     if tick>=next_refresh:
-                        await self.refresh();await self.publish()
+                        with diagnostic_phase(self,'refresh'):await self.refresh()
+                        with diagnostic_phase(self,'publish'):await self.publish()
                         next_refresh=tick+self.config['site']['LobbyRefreshSeconds']
                     elif tick-self.last_heartbeat>=HEARTBEAT_SECONDS:
-                        await self.publish()
+                        with diagnostic_phase(self,'publish'):await self.publish()
                     if tick>=next_claim:
-                        claimed=await asyncio.to_thread(self.repo.claim_due,10)
+                        with diagnostic_phase(self,'claim'):
+                            claimed=await asyncio.to_thread(self.repo.claim_due,10)
                         for row in claimed:
                             self.accept_claim(row)
                         next_claim=tick+1
                     if tick>=next_telemetry and getattr(self.args,'telemetry_provider',None):
                         try:
-                            metrics=await asyncio.to_thread(self.args.telemetry_provider)
-                            await asyncio.to_thread(self.repo.publish_machine_telemetry,metrics)
+                            with diagnostic_phase(self,'resource_telemetry'):
+                                metrics=await asyncio.to_thread(self.args.telemetry_provider)
+                                await asyncio.to_thread(self.repo.publish_machine_telemetry,metrics)
                         except Exception:
                             log.exception('Could not publish machine resource telemetry')
                         next_telemetry=tick+300
                     if tick>=next_metrics:
-                        await self.flush_metrics()
+                        with diagnostic_phase(self,'decision_metrics'):await self.flush_metrics()
                         next_metrics=tick+METRICS_SECONDS
                 except Exception as exc:
                     if not is_transient_database_error(exc):raise
@@ -1496,19 +1503,23 @@ class Pilot:
             raise WorkerFenced(f'No heartbeat reached the database for {self.fenced:.0f} s') from None
         finally:
             if watch_task:
-                watch_task.cancel()
-                await asyncio.gather(watch_task,return_exceptions=True)
+                with diagnostic_phase(self,'cleanup_watchdog'):
+                    watch_task.cancel()
+                    await asyncio.gather(watch_task,return_exceptions=True)
             if live_task:
-                live_task.cancel()
-                await asyncio.gather(live_task,return_exceptions=True)
+                with diagnostic_phase(self,'cleanup_live_views'):
+                    live_task.cancel()
+                    await asyncio.gather(live_task,return_exceptions=True)
             if manual_task:
-                manual_task.cancel()
-                await asyncio.gather(manual_task,return_exceptions=True)
+                with diagnostic_phase(self,'cleanup_manual'):
+                    manual_task.cancel()
+                    await asyncio.gather(manual_task,return_exceptions=True)
             if chat_task:
-                chat_task.cancel()
-                await asyncio.gather(chat_task,return_exceptions=True)
+                with diagnostic_phase(self,'cleanup_chat'):
+                    chat_task.cancel()
+                    await asyncio.gather(chat_task,return_exceptions=True)
             if self.started and getattr(self,'fenced',None) is not None:
-                await self.stop_fenced()
+                with diagnostic_phase(self,'cleanup_fenced'):await self.stop_fenced()
             elif self.started:
                 try: await asyncio.wait_for(self.flush_metrics(),15)
                 except Exception: log.exception('Could not write the last decision metrics')
@@ -1526,9 +1537,10 @@ class Pilot:
                     except Exception: log.exception('Final cloud-worker telemetry failed')
                 else:
                     log.info('Preserving active poker seats for restart reconciliation')
-            for c in list(self.clients.values()): await c.close()
+            with diagnostic_phase(self,'cleanup_clients'):
+                for c in list(self.clients.values()): await c.close()
             self.clients.clear()
-            await self.decision.close()
+            with diagnostic_phase(self,'cleanup_decision'):await self.decision.close()
             log.info('Cloud worker stopped. Status: %s',self.output/'status.json')
             if getattr(self,'worker_lock',None):self.worker_lock.release()
 
@@ -1545,10 +1557,12 @@ class Pilot:
         publish_lock, and every later publish and leave waits behind it) went on playing seats nobody sees."""
         fence=fence or FENCE_SECONDS;every=every or WATCH_SECONDS
         while True:
+            before=time.monotonic()
             await asyncio.sleep(every)
             silent=time.monotonic()-self.last_heartbeat
             if silent>=fence:
                 self.fenced=silent
+                heartbeat_stall(self,main,silent,time.monotonic()-before-every)
                 log.error('No heartbeat reached the database for %.0f s; the scheduler expires this PC at 180 s and '
                           'stops counting its seats. Stopping this worker.',silent)
                 main.cancel()
