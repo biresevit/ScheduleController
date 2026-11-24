@@ -6,6 +6,15 @@
 
 A Python service that translates weekly operating targets into coordinated work across multiple machines. Planning runs in Azure; local workers execute commands and report observed state.
 
+The optional Azure `human_seat_history_tick` timer samples anonymous ring human-seat
+counts once a minute from the existing lobby observations, independently of
+scheduling and PC releases. Apply PokerBackoffice migration
+`sql/021_human_seat_history.sql` before setting `HUMAN_SEAT_HISTORY_ENABLED=enabled`.
+Stale or incomplete observations remain unknown. These counts support the
+Overview and Monitoring charts; they do not identify unique people or establish
+whether a solver was used. Tournament human counts are not available from lobby
+registration totals.
+
 ## Engineering highlights
 
 - Timezone-aware planning with daylight-saving transitions, capacity constraints, and gradual joins and departures.
